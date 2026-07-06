@@ -1,0 +1,50 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ML weights & training outputs
+*.pt
+*.pth
+*.onnx
+runs/
+ANetV1/runs/
+wandb/
+mlruns/
+
+# Dataset blobs (host on Hugging Face; keep yaml/README in git)
+datasets/suas-synth-50k/images/
+datasets/suas-synth-50k/labels/
+datasets/suas-synth-50k/previews/
+datasets/suas-synth-50k/**/*.cache
+datasets/**/*.zip
+datasets/VisDrone/
+datasets/gen-assets/
+
+# Ultralytics / HF caches
+.cache/
+*.cache
+
+# IDE & local tooling
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.cursor/
+
+# Logs
+*.log
+
+# Env & secrets
+.env
+.env.*

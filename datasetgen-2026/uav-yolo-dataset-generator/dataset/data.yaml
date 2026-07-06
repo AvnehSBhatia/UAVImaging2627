@@ -1,0 +1,7 @@
+# YOLO dataset configuration
+train: /Users/elijb/Developer/datasetgen-2026/uav-yolo-dataset-generator/dataset/images/train
+val: /Users/elijb/Developer/datasetgen-2026/uav-yolo-dataset-generator/dataset/images/val
+test: /Users/elijb/Developer/datasetgen-2026/uav-yolo-dataset-generator/dataset/images/test
+
+nc: 2  # number of classes
+names: ['mannequin', 'tent']  # class names

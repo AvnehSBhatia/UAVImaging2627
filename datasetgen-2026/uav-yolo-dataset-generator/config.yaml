@@ -1,0 +1,56 @@
+project:
+  random_seed: 42
+
+input:
+  runway_background_dir: input/backgrounds/runway
+  mannequin_dir: input/objects/mannequin
+  tent_dir: input/objects/tent
+  mannequin_mask_dir: input/masks/mannequin
+  tent_mask_dir: input/masks/tent
+
+output:
+  dataset_dir: dataset
+  preview_dir: output/generated_preview
+  logs_dir: output/logs
+
+dataset:
+  total_images: 1000
+  train_ratio: 0.8
+  val_ratio: 0.15
+  test_ratio: 0.05
+  image_width: 1280
+  image_height: 720
+  save_preview_count: 25
+
+classes:
+  - mannequin
+  - tent
+
+objects:
+  min_objects_per_image: 1
+  max_objects_per_image: 3
+
+  class_probability:
+    mannequin: 0.7
+    tent: 0.3
+
+  # Object width as percentage of final image width.
+  # For UAV imagery, targets should usually be small.
+  mannequin_width_ratio: [0.045, 0.11]
+  tent_width_ratio: [0.06, 0.15]
+
+  # Legacy fallback if class-specific values are missing
+  min_object_width_ratio: 0.045
+  max_object_width_ratio: 0.15
+
+  max_overlap_iou: 0.25
+  min_visible_bbox_area_px: 64
+
+augmentation:
+  rotation_degrees: [-180, 180]
+  scale_jitter: [0.8, 1.2]
+  brightness: [0.75, 1.25]
+  contrast: [0.8, 1.2]
+  blur_probability: 0.15
+  shadow_probability: 0.35
+  perspective_probability: 0.2

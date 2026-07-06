@@ -1,0 +1,83 @@
+# gen2 — photorealistic SUAS synthetic dataset generator configuration
+project:
+  seed: 20260705
+  out_dir: /Users/avneh/Code/UAVImaging2627/datasets/suas-synth-50k
+  asset_root: /Users/avneh/Code/UAVImaging2627/datasets/gen-assets
+  workers: 10
+
+dataset:
+  total_images: 50000
+  splits: { train: 0.90, val: 0.07, test: 0.03 }
+  image_width: 1920
+  image_height: 1080
+  preview_count: 40
+  # Ultralytics guidance: 0-10% background-only images to cut false positives
+  background_only_ratio: 0.08
+
+classes: [mannequin, tent]
+
+scene:
+  # scene-type mix (SUAS search area: runway + surrounding field/forest)
+  background_bucket_weights: { runway: 0.30, grass: 0.34, forest: 0.22, dirt: 0.14 }
+  # per object-frame: rules say ONE mannequin and ONE tent scattered in the search
+  # boundary, but train with variety; counts per image (weights)
+  mannequin_count_weights: { 0: 0.18, 1: 0.62, 2: 0.20 }
+  tent_count_weights: { 0: 0.22, 1: 0.66, 2: 0.12 }
+  # sun
+  sun_elevations: [20, 35, 50, 65]
+  overcast_prob: 0.22          # overcast: use el=65 renders, shadow opacity ~0
+  shadow_opacity: [0.30, 0.60] # sunny range; >0.6 reads as pitch-black paint
+  # GSD / altitude model: 150 ft AGL, GSD jitter reflects camera/lens variation
+  target_gsd_m: [0.013, 0.024]
+  altitude_jitter: [0.90, 1.12] # +-~10% altitude wander around 150 ft
+
+objects:
+  mannequin_len_m: [1.60, 1.92]  # asset meta carries its own body_len; jitter on top
+  tent_scale_jitter: [0.92, 1.10]
+  yaw_full_random: true
+  # occlusion per rules: "surrounded/covered by bushes/trees/vehicles/etc."
+  occlusion_prob: 0.55           # chance an object gets deliberate partial occlusion
+  occlusion_coverage: [0.10, 0.55]
+  min_visibility: 0.25           # drop label if less visible than this
+  min_bbox_px: 9
+  # clutter scattered near objects (debris field)
+  clutter_near_object: { min: 0, max: 3 }
+  clutter_anywhere: { min: 0, max: 2 }
+
+harmonize:
+  reinhard_strength: [0.50, 0.75]  # damped LAB transfer
+  local_context_scale: 2.5         # bg stats window = this x bbox size
+  # blend-mode ensemble (Dwibedi et al.: randomize; never Poisson-only)
+  # seamless/Poisson removed: washes out small low-texture nadir objects into
+  # unlabeled ghosts (confirmed in pilot; consistent with Dwibedi et al.)
+  blend_weights: { feather: 0.75, feather_wide: 0.20, none: 0.05 }
+  feather_px: [0.8, 2.2]
+  feather_wide_px: [2.5, 4.5]
+
+sensor:
+  # fidelity tiers: hi-fi (clean) vs grainy (full ISP degradation chain)
+  tier_weights: { hifi: 0.45, grainy: 0.55 }
+  hifi:
+    jpeg_q: [86, 96]
+    noise_lum_sigma: [0.0, 0.006]
+    motion_blur_px: [0, 1]
+    defocus_px: [0, 0.6]
+    vignette: [0.0, 0.12]
+  grainy:
+    jpeg_q: [45, 85]
+    noise_lum_sigma: [0.008, 0.040]   # linear-domain shot+read noise scale
+    motion_blur_px: [0, 4]
+    defocus_px: [0, 1.5]
+    vignette: [0.05, 0.28]
+    bayer_roundtrip_prob: 0.5
+    chroma_aberration_px: [0.0, 1.6]
+  wb_shift: [0.94, 1.06]     # per-channel white-balance gain jitter
+  exposure_ev: [-0.5, 0.5]
+  unsharp_amount: [0.0, 0.7]
+
+augment:
+  rot90: true
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  # large-scale jitter via crop-zoom (Ghiasi et al.: whole-image jitter dominates)
+  crop_zoom: [1.0, 1.30]

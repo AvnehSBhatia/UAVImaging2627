@@ -1,0 +1,11 @@
+# Repo-root deps for ANetV1 + datasetgen-2026/gen2.
+# Install PyTorch separately for your platform (MPS/CUDA/CPU):
+#   https://pytorch.org/get-started/locally/
+
+numpy>=2.0
+pillow>=10.0
+pyyaml>=6.0
+opencv-python>=4.8
+ultralytics>=8.4
+open-clip-torch>=2.24
+huggingface_hub>=0.20

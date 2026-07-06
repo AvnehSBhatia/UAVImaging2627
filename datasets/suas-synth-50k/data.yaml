@@ -1,0 +1,6 @@
+path: /Users/avneh/Code/UAVImaging2627/datasets/suas-synth-50k
+train: images/train
+val: images/val
+test: images/test
+nc: 2
+names: ['mannequin', 'tent']

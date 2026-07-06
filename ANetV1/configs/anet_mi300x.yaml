@@ -1,0 +1,52 @@
+# ANetV1 training config for AMD MI300X (ROCm; presents as torch device "cuda").
+# 192GB HBM3 + CDNA3: no activation-memory pressure, so no checkpointing, full
+# epochs, bf16 autocast (fp32 dynamic range — the fp16 NaN seen on MPS can't recur).
+# $DATA_ROOT is expanded by anet.config.load_config; export it before running.
+
+data:
+  root: $DATA_ROOT
+  coverage_thresh: 0.3
+  # VisDrone person boxes dominate mannequin counts (dataset README) —
+  # downweight vd_* images in the sampler
+  vd_weight: 0.4
+  mannequin_weight: 4.0
+  tent_weight: 2.0
+
+train:
+  epochs: 30
+  # batch 64: activations ~1.2-1.5GB/img under bf16 autograd -> ~80-95GB of 192GB
+  # (comfortable headroom for MIOpen workspaces). 300 steps/epoch, 9k steps total.
+  batch_size: 64
+  accum_steps: 1
+  use_checkpoint: false          # recompute is pure waste with 192GB HBM
+  amp: bf16
+  samples_per_epoch: null        # full 19,185-image pass per epoch
+  early_stop_patience: 6         # stop when val mannequin recall stalls 6 epochs
+  # lr: sqrt scaling for Adam-family (linear scaling is an SGD rule):
+  # 3e-3 @ eff.16 (D30) x sqrt(64/16) = 6e-3. If you push batch to 128, use 8.5e-3.
+  lr: 6.0e-3
+  warmup_steps: 300              # 1 epoch linear ramp — large batch + init-sensitive gates
+  focal_gamma: 2.0
+  class_alpha: [1.0, 8.0, 4.0]   # [background, mannequin, tent]
+  l2_score_reg: 1.0e-4           # cosine-frequency bound (D24)
+  l1_kernel_reg: 1.0e-4          # sparse pyramid kernels (D24)
+  num_workers: 16                # ~50ms/img JPEG decode; 16 workers ≈ 320 img/s feed
+  checkpoint_dir: runs/anet
+
+distill:
+  teacher_cache: runs/teacher_cache
+  kl_weight: 0.7
+  temperature: 2.0
+  checkpoint_dir: runs/anet_distill
+
+yolo:
+  weights: yolo26n.pt            # falls back to yolo11n.pt if unavailable
+  imgsz: 960                     # spec comparison point (ARCHITECTURE §10); 640 was an MPS concession
+  epochs: 60
+  patience: 10                   # ultralytics native early stop on fitness
+  # 64 == ultralytics nominal batch (nbs): loss/weight-decay scaling is exactly
+  # its calibrated default, no hidden rescale. Nano model at 960px: ~20-30GB.
+  batch: 64
+  workers: 16
+  amp: true                      # CUDA amp is the well-trodden ultralytics path
+  project: runs/yolo
