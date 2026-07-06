@@ -13,13 +13,9 @@
 #   DATA_ROOT        dataset dir (default: <repo>/datasets/suas-synth-50k)
 #   DATA_SRC         rsync source (user@host:/path) or .tar.gz URL to fetch the
 #                    dataset from if DATA_ROOT does not exist
-#   TORCH_INDEX_URL  ONLY if torch is NOT preinstalled: pip index to install it
-#                    from. Default assumes the box's ROCm torch (e.g. ROCm 7.2)
-#                    is already installed and must not be touched.
-#   VENV             virtualenv path   (default: <repo>/.venv-rocm; created with
-#                    --system-site-packages so it sees the preinstalled torch)
+#   PYTHON           python binary (default: python3; box must have ROCm torch)
 #   FORCE=1          rerun all stages (default: completed stages are skipped)
-#   FORCE_STAGE=x    rerun one stage: deps|data|smoke|yolo|anet|teacher|distill|eval
+#   FORCE_STAGE=x    rerun one stage: data|smoke|yolo|anet|teacher|distill|eval
 #
 # Stages are checkpointed in runs/.stages/ — the script is safe to rerun after
 # any failure; it resumes at the first incomplete stage. All output tees to
@@ -33,8 +29,6 @@ REPO_ROOT="$(dirname "$ANET_DIR")"
 
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/datasets/suas-synth-50k}"
 DATA_SRC="${DATA_SRC:-}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"   # unset = require the preinstalled ROCm torch
-VENV="${VENV:-$REPO_ROOT/.venv-rocm}"
 CONFIG="$ANET_DIR/configs/anet_mi300x.yaml"
 YOLO_BEST="$ANET_DIR/runs/yolo/baseline/weights/best.pt"
 STAGE_DIR="$ANET_DIR/runs/.stages"
@@ -45,7 +39,7 @@ export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"   # skip exhaustive conv tuning on first calls
 export PYTHONUNBUFFERED=1
 
-PY="$VENV/bin/python"
+PY="${PYTHON:-python3}"
 
 say()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -61,39 +55,6 @@ stage() {
     say "stage: $name"
     ( "$@" ) 2>&1 | tee "$LOG_DIR/$name.log"
     touch "$marker"
-}
-
-# ---------------------------------------------------------------- deps -------
-provision_deps() {
-    command -v rocm-smi >/dev/null 2>&1 && rocm-smi --showproductname || \
-        echo "rocm-smi not found (ok inside some containers) — trusting torch probe below"
-    # --system-site-packages: reuse the box's preinstalled ROCm torch/torchvision
-    [[ -d "$VENV" ]] || python3 -m venv --system-site-packages "$VENV"
-    "$VENV/bin/pip" install --upgrade pip
-
-    if ! "$PY" -c "import torch" 2>/dev/null; then
-        [[ -n "$TORCH_INDEX_URL" ]] || die "no torch visible in $VENV.
-  This box should have ROCm torch preinstalled (system python). Either point
-  VENV at an env that has it, or set TORCH_INDEX_URL=<rocm wheel index> to install."
-        "$VENV/bin/pip" install --index-url "$TORCH_INDEX_URL" torch torchvision
-    fi
-    # torchvision must exist BEFORE installing ultralytics: if pip has to
-    # resolve it, it grabs a CUDA/cpu wheel from PyPI and shadows the ROCm torch
-    "$PY" -c "import torchvision" 2>/dev/null || die \
-        "torchvision missing but torch present — install the ROCm 7.2 torchvision
-  build matching your torch (same source as the preinstalled torch), then rerun."
-    "$VENV/bin/pip" install ultralytics numpy pillow pyyaml
-    "$PY" - <<'EOF'
-import torch, torchvision
-assert torch.cuda.is_available(), "torch.cuda unavailable — ROCm runtime/driver problem?"
-hip = getattr(torch.version, "hip", None)
-assert hip, f"torch {torch.__version__} is not a ROCm build (hip={hip}) — a PyPI wheel shadowed it"
-name = torch.cuda.get_device_name(0)
-print(f"torch {torch.__version__} (hip {hip}) | torchvision {torchvision.__version__} | {name}")
-if "MI300" not in name:
-    print(f"WARNING: expected MI300X, got '{name}' — continuing anyway")
-EOF
-    "$VENV/bin/pip" freeze > "$LOG_DIR/pip-freeze.txt"
 }
 
 # ---------------------------------------------------------------- data -------
@@ -145,8 +106,7 @@ run_eval()    { "$PY" scripts/evaluate_all.py --config "$CONFIG" \
                     --out runs/comparison.json; }
 
 # ---------------------------------------------------------------- main -------
-say "ANetV1 MI300X pipeline | repo=$REPO_ROOT | data=$DATA_ROOT"
-stage deps    provision_deps
+say "ANetV1 MI300X pipeline | repo=$REPO_ROOT | data=$DATA_ROOT | python=$PY"
 stage data    provision_data
 stage smoke   run_smoke
 stage yolo    run_yolo
