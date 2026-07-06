@@ -37,6 +37,8 @@ mkdir -p "$STAGE_DIR" "$LOG_DIR"
 
 export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"   # skip exhaustive conv tuning on first calls
+export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
+export NNPACK_DISABLE=1
 export ANET_SMOKE_SKIP_CPU="${ANET_SMOKE_SKIP_CPU:-1}"  # MI300X: skip 40s CPU path, cuda is the target
 export PYTHONUNBUFFERED=1
 

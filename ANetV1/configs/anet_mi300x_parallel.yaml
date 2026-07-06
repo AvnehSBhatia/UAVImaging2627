@@ -1,0 +1,43 @@
+# ANetV1 on MI300X while YOLO trains in another terminal (shared GPU).
+# batch 32: ~40-50GB — leaves headroom with YOLO at ~30-45GB on 196GB HBM.
+# After YOLO finishes, re-run with anet_mi300x.yaml (batch 64) if you want full speed.
+
+data:
+  root: $DATA_ROOT
+  coverage_thresh: 0.3
+  vd_weight: 0.4
+  mannequin_weight: 4.0
+  tent_weight: 2.0
+
+train:
+  epochs: 30
+  batch_size: 32
+  accum_steps: 2              # effective 64, same optimizer noise as batch-64 run
+  use_checkpoint: false
+  amp: bf16
+  samples_per_epoch: null
+  early_stop_patience: 6
+  lr: 4.2e-3                   # 6e-3 * sqrt(32/64)
+  warmup_steps: 300
+  focal_gamma: 2.0
+  class_alpha: [1.0, 8.0, 4.0]
+  l2_score_reg: 1.0e-4
+  l1_kernel_reg: 1.0e-4
+  num_workers: 8               # half workers — YOLO already uses 16
+  checkpoint_dir: runs/anet
+
+distill:
+  teacher_cache: runs/teacher_cache
+  kl_weight: 0.7
+  temperature: 2.0
+  checkpoint_dir: runs/anet_distill
+
+yolo:
+  weights: yolo26n.pt
+  imgsz: 960
+  epochs: 60
+  patience: 10
+  batch: 64
+  workers: 16
+  amp: true
+  project: runs/yolo
