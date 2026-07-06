@@ -1,4 +1,5 @@
 import csv
+import math
 import time
 from pathlib import Path
 
@@ -126,7 +127,8 @@ class Trainer:
     def train(self):
         accum = self.cfg.train.accum_steps
         patience = getattr(self.cfg.train, "early_stop_patience", 0) or 0
-        stale = 0
+        clip = getattr(self.cfg.train, "grad_clip", 0.0) or 0.0
+        stale, nan_streak = 0, 0
         n_batches = len(self.train_loader)
         log_path = self.out_dir / "log.csv"
         with open(log_path, "w", newline="") as f:
@@ -151,16 +153,35 @@ class Trainer:
                 with self._autocast():
                     loss = self._loss(batch) / accum
                 self.scaler.scale(loss).backward()
+                lv = loss.item() * accum
                 if step == 0:
                     print(
-                        f"epoch {epoch}: first step loss={loss.item() * accum:.4f} "
+                        f"epoch {epoch}: first step loss={lv:.4f} "
                         f"(MIOpen may be slow for ~1-2 min on first CUDA ops)",
                         flush=True,
                     )
-                running, n = running + loss.item() * accum, n + 1
+                if not math.isfinite(lv):
+                    # drop the poisoned accumulation window; a persistent NaN
+                    # means diverged weights — die fast, don't train garbage
+                    nan_streak += 1
+                    self.opt.zero_grad()
+                    if nan_streak == 1 or nan_streak % 10 == 0:
+                        print(f"epoch {epoch} step {step}: non-finite loss "
+                              f"(streak {nan_streak}) — skipping step", flush=True)
+                    if nan_streak >= 25:
+                        raise RuntimeError(
+                            "non-finite loss for 25 consecutive steps — model has "
+                            "diverged; lower lr / check amp before rerunning")
+                    continue
+                nan_streak = 0
+                running, n = running + lv, n + 1
                 if step > 0 and (step + 1) % 100 == 0:
                     print(f"epoch {epoch}: {step + 1}/{n_batches} steps", flush=True)
                 if (step + 1) % accum == 0:
+                    if clip:
+                        if self.scaler.is_enabled():
+                            self.scaler.unscale_(self.opt)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
                     self.scaler.step(self.opt)
                     self.scaler.update()
                     self.opt.zero_grad()
@@ -173,10 +194,12 @@ class Trainer:
                 csv.writer(f).writerow(row)
             print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={key:.3f} "
                   f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
-                  f"({row[-1]}s)")
+                  f"lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
             state = getattr(self.model, "_orig_mod", self.model).state_dict()
             torch.save(state, self.out_dir / "last.pt")
-            if key > self.best:
+            # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
+            # -1.0 sentinel, which is how a NaN model got saved as best once)
+            if math.isfinite(row[1]) and key > self.best:
                 self.best, stale = key, 0
                 torch.save(state, self.out_dir / "best.pt")
             else:

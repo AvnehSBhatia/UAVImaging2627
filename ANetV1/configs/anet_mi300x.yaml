@@ -22,10 +22,12 @@ train:
   amp: bf16
   samples_per_epoch: null        # full 19,185-image pass per epoch
   early_stop_patience: 6         # stop when val mannequin recall stalls 6 epochs
-  # lr: sqrt scaling for Adam-family (linear scaling is an SGD rule):
-  # 3e-3 @ eff.16 (D30) x sqrt(64/16) = 6e-3. If you push batch to 128, use 8.5e-3.
-  lr: 6.0e-3
+  # lr: sqrt-scaled would be 6e-3 (3e-3 @ eff.16 x sqrt(4)), but the first 6e-3
+  # run NaN'd right after warmup and the 3e-3 baseline was never validated —
+  # 4e-3 until one full run survives; raise toward 6e-3 after that if loss is smooth.
+  lr: 4.0e-3
   warmup_steps: 300              # 1 epoch linear ramp — large batch + init-sensitive gates
+  grad_clip: 1.0                 # oscillatory cosine gates: clip spikes instead of diverging
   focal_gamma: 2.0
   class_alpha: [1.0, 8.0, 4.0]   # [background, mannequin, tent]
   l2_score_reg: 1.0e-4           # cosine-frequency bound (D24)

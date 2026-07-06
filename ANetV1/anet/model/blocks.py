@@ -72,9 +72,12 @@ class ManualBatchNorm(nn.Module):
         xf = x.float()
         if self.training:
             mean = xf.mean(dims)
-            # E[x^2]-E[x]^2 instead of .var(): identical for unbiased=False, and
-            # avoids the Welford reduction that inductor-MPS miscompiles (torch 2.12)
-            var = (xf * xf).mean(dims) - mean * mean
+            # two-pass variance: non-negative by construction. E[x^2]-E[x]^2
+            # cancels catastrophically once inputs are bf16-rounded (~0.4% rel
+            # err) — near-constant channels went var<-1e-5 -> rsqrt=NaN on
+            # MI300X. Also still avoids the Welford kernel inductor-MPS
+            # miscompiles (torch 2.12).
+            var = (xf - mean.reshape(shape)).square().mean(dims)
             with torch.no_grad():
                 n = x.numel() / x.shape[1 if x.dim() == 4 else -1]
                 self.running_mean.lerp_(mean, self.momentum)
