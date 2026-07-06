@@ -31,6 +31,34 @@ class Trainer:
         self.cfg = cfg
         self.distill = distill
         self.device = pick_device()
+
+        # Worker processes are forked lazily on the FIRST loader iteration, which is
+        # after model.to(cuda) has initialized the CUDA/HIP + OpenMP runtimes in the
+        # parent. On ROCm, fork() then copies already-locked native mutexes into the
+        # child, which deadlocks in C — Ctrl+C can't interrupt it (needs kill -9).
+        # Forcing "spawn" starts each worker as a fresh interpreter, so there is no
+        # inherited GPU/threading state and the deadlock class is impossible.
+        n_samples = getattr(cfg.train, "samples_per_epoch", None) or len(train_ds)
+        sampler = WeightedRandomSampler(
+            train_ds.sample_weights(), num_samples=n_samples, replacement=True
+        )
+        nw = cfg.train.num_workers
+        common = dict(
+            batch_size=cfg.train.batch_size,
+            num_workers=nw,
+            persistent_workers=nw > 0,
+            pin_memory=self.device.type == "cuda",
+        )
+        if nw > 0:
+            mp_ctx = getattr(cfg.train, "mp_context", None)
+            if mp_ctx is None and self.device.type == "cuda":
+                mp_ctx = "spawn"
+            if mp_ctx:
+                common["multiprocessing_context"] = mp_ctx
+            common["prefetch_factor"] = getattr(cfg.train, "prefetch_factor", 2)
+        self.train_loader = DataLoader(train_ds, sampler=sampler, drop_last=True, **common)
+        self.val_loader = DataLoader(val_ds, shuffle=False, **common)
+
         self.model = model.to(self.device)
 
         # hard allocator cap: fail loudly instead of swap-freezing the machine
@@ -49,21 +77,6 @@ class Trainer:
         )
         if getattr(cfg.train, "compile", False):
             self.model = torch.compile(self.model)
-
-        # replacement=True means an "epoch" is just a checkpoint/eval cadence;
-        # samples_per_epoch shortens it without changing the sample distribution
-        n_samples = getattr(cfg.train, "samples_per_epoch", None) or len(train_ds)
-        sampler = WeightedRandomSampler(
-            train_ds.sample_weights(), num_samples=n_samples, replacement=True
-        )
-        common = dict(
-            batch_size=cfg.train.batch_size,
-            num_workers=cfg.train.num_workers,
-            persistent_workers=cfg.train.num_workers > 0,
-            pin_memory=self.device.type == "cuda",
-        )
-        self.train_loader = DataLoader(train_ds, sampler=sampler, drop_last=True, **common)
-        self.val_loader = DataLoader(val_ds, shuffle=False, **common)
 
         self.opt = torch.optim.AdamW(
             self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0
@@ -114,19 +127,39 @@ class Trainer:
         accum = self.cfg.train.accum_steps
         patience = getattr(self.cfg.train, "early_stop_patience", 0) or 0
         stale = 0
+        n_batches = len(self.train_loader)
         log_path = self.out_dir / "log.csv"
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "mannequin_recall",
                                     "tent_recall", "fp_per_image", "seconds"])
+        print(
+            f"train: device={self.device} batches/epoch={n_batches} "
+            f"accum={accum} amp={self.amp_dtype or 'off'} "
+            f"workers={self.cfg.train.num_workers}",
+            flush=True,
+        )
         for epoch in range(self.cfg.train.epochs):
             self.model.train()
             t0, running, n = time.time(), 0.0, 0
             self.opt.zero_grad()
+            if epoch == 0 and self.cfg.train.num_workers > 0:
+                print(f"epoch 0: spawning {self.cfg.train.num_workers} dataloader "
+                      "workers + fetching first batch...", flush=True)
             for step, batch in enumerate(self.train_loader):
+                if step == 0:
+                    print(f"epoch {epoch}: first batch loaded, forward...", flush=True)
                 with self._autocast():
                     loss = self._loss(batch) / accum
                 self.scaler.scale(loss).backward()
+                if step == 0:
+                    print(
+                        f"epoch {epoch}: first step loss={loss.item() * accum:.4f} "
+                        f"(MIOpen may be slow for ~1-2 min on first CUDA ops)",
+                        flush=True,
+                    )
                 running, n = running + loss.item() * accum, n + 1
+                if step > 0 and (step + 1) % 100 == 0:
+                    print(f"epoch {epoch}: {step + 1}/{n_batches} steps", flush=True)
                 if (step + 1) % accum == 0:
                     self.scaler.step(self.opt)
                     self.scaler.update()
@@ -154,6 +187,8 @@ class Trainer:
                     break
             if self.device.type == "mps":
                 torch.mps.empty_cache()  # release train-shape reservations before eval shapes re-cache
+            elif self.device.type == "cuda":
+                torch.cuda.empty_cache()  # return cached blocks; keeps reserved from creeping up
 
     @torch.no_grad()
     def evaluate(self, loader):

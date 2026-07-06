@@ -12,6 +12,16 @@ os.environ.setdefault("PYTORCH_MPS_PREFER_METAL", "1")
 os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6")
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0")
 
+# CUDA/ROCm reserved-memory growth mitigation: mosaic produces variable instance
+# counts, so the caching allocator's high-water mark keeps climbing across epochs
+# (looks like a leak). expandable_segments lets the allocator return blocks to the
+# driver instead of fragmenting; garbage_collection_threshold triggers reclaim
+# before OOM. Set on both keys — ROCm torch honors PYTORCH_HIP_ALLOC_CONF and
+# aliases the CUDA name. Must be set before torch imports/initializes the backend.
+_alloc = "expandable_segments:True,garbage_collection_threshold:0.8"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _alloc)
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", _alloc)
+
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -52,6 +62,22 @@ def _mps_log(trainer):
     print(f"[mps] epoch {trainer.epoch + 1} driver_allocated={gb:.2f} GB")
 
 
+def _cuda_epoch_reclaim(trainer):
+    """Return cached blocks to the driver each epoch and log reserved vs allocated
+    so a real leak (allocated climbing) is distinguishable from allocator caching
+    (only reserved high). CUDA == ROCm here (MI300X)."""
+    if trainer.device.type != "cuda":
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    print(f"[cuda] epoch {trainer.epoch + 1} allocated={alloc:.1f}G "
+          f"reserved={reserved:.1f}G peak_alloc={peak:.1f}G", flush=True)
+    torch.cuda.reset_peak_memory_stats()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(Path(__file__).parents[1] / "configs/anet.yaml"))
@@ -70,6 +96,8 @@ def main():
     if device == "mps":  # leak mitigations only needed (and only valid) on MPS
         model.add_callback("on_train_batch_end", _mps_periodic)
         model.add_callback("on_fit_epoch_end", _mps_log)
+    elif device == 0:  # CUDA/ROCm: reclaim + memory visibility each epoch
+        model.add_callback("on_fit_epoch_end", _cuda_epoch_reclaim)
 
     anet_root = Path(__file__).resolve().parents[1]
     project = anet_root / cfg.yolo.project

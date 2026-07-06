@@ -23,7 +23,7 @@ train:
   class_alpha: [1.0, 8.0, 4.0]
   l2_score_reg: 1.0e-4
   l1_kernel_reg: 1.0e-4
-  num_workers: 8               # half workers — YOLO already uses 16
+  num_workers: 4               # keep low while YOLO uses 16 (CPU + fork safety)
   checkpoint_dir: runs/anet
 
 distill:

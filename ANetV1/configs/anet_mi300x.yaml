@@ -45,8 +45,13 @@ yolo:
   epochs: 60
   patience: 10                   # ultralytics native early stop on fitness
   # 64 == ultralytics nominal batch (nbs): loss/weight-decay scaling is exactly
-  # its calibrated default, no hidden rescale. Nano model at 960px: ~20-30GB.
+  # its calibrated default, no hidden rescale. If GPU reserved mem keeps climbing
+  # toward the 196GB VF ceiling, drop to 48/32 (ultralytics auto-accumulates to nbs
+  # so the effective optimizer step is unchanged) — that halves activation memory.
   batch: 64
-  workers: 16
+  # 8, not 16: DataLoader prefetches prefetch_factor(2) x workers batches, so 16
+  # workers x 2 x 64 imgs at 960px pinned ~= tens of GB of *host* RAM. 8 workers
+  # keeps the MI300X fed (JPEG decode >> nano-model step time) at half the RAM.
+  workers: 8
   amp: true                      # CUDA amp is the well-trodden ultralytics path
   project: runs/yolo

@@ -41,6 +41,12 @@ export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
 export ANET_SMOKE_SKIP_CPU="${ANET_SMOKE_SKIP_CPU:-1}"  # MI300X: skip 40s CPU path, cuda is the target
 export PYTHONUNBUFFERED=1
+# Curb ROCm reserved-memory growth (mosaic high-water mark + fragmentation) so YOLO
+# doesn't creep toward the VF ceiling across epochs. ROCm honors the HIP key and
+# aliases the CUDA one; set both. Must be exported before any torch process starts.
+_ALLOC="expandable_segments:True,garbage_collection_threshold:0.8"
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-$_ALLOC}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$_ALLOC}"
 
 # Container images usually preinstall ROCm torch in /opt/venv, not system python3.
 if [[ -z "${PYTHON:-}" && -x /opt/venv/bin/python3 ]]; then
