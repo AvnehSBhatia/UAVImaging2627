@@ -37,9 +37,15 @@ mkdir -p "$STAGE_DIR" "$LOG_DIR"
 
 export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"   # skip exhaustive conv tuning on first calls
+export ANET_SMOKE_SKIP_CPU="${ANET_SMOKE_SKIP_CPU:-1}"  # MI300X: skip 40s CPU path, cuda is the target
 export PYTHONUNBUFFERED=1
 
-PY="${PYTHON:-python3}"
+# Container images usually preinstall ROCm torch in /opt/venv, not system python3.
+if [[ -z "${PYTHON:-}" && -x /opt/venv/bin/python3 ]]; then
+    PY=/opt/venv/bin/python3
+else
+    PY="${PYTHON:-python3}"
+fi
 
 say()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }

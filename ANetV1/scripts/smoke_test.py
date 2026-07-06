@@ -1,5 +1,6 @@
 """Param-count assert + forward/backward on CPU and MPS + dataset sanity."""
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,16 @@ from anet import ANetV1  # noqa: E402
 
 
 def run_device(model, device):
+    label = str(device)
+    if device.type == "cuda":
+        hip = getattr(torch.version, "hip", None)
+        if hip:
+            label = f"{device} (ROCm hip {hip})"
+        print(f"  {label}: fwd+bwd starting (first call may autotune MIOpen — looks hung, ~30-60s)...",
+              flush=True)
+    else:
+        print(f"  {device}: fwd+bwd...", flush=True)
+
     model = model.to(device)
     x = torch.rand(2, 3, 540, 960, device=device)
     t0 = time.time()
@@ -22,25 +33,33 @@ def run_device(model, device):
         torch.mps.synchronize()
     elif device.type == "cuda":
         torch.cuda.synchronize()
-    print(f"  {device}: out {tuple(cells.shape)} fwd+bwd {time.time() - t0:.2f}s")
+    elapsed = time.time() - t0
+    extra = ""
+    if device.type == "cuda":
+        mib = torch.cuda.max_memory_allocated(device) / 2**20
+        extra = f" | peak vram {mib:.0f} MiB"
+    print(f"  {device}: out {tuple(cells.shape)} fwd+bwd {elapsed:.2f}s{extra}", flush=True)
     model.zero_grad(set_to_none=True)
 
 
 def main():
-    model = ANetV1()
+    # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
+    model = ANetV1(use_checkpoint=False)
     n = sum(p.numel() for p in model.parameters())
     print(f"ANetV1 params: {n:,}")
     assert 15_000 < n < 19_000, "param count off spec (~17k, ARCHITECTURE.md §5)"
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 
     model.train()
-    run_device(model, torch.device("cpu"))
+    skip_cpu = os.environ.get("ANET_SMOKE_SKIP_CPU", "").lower() in ("1", "true", "yes")
+    if not skip_cpu:
+        run_device(model, torch.device("cpu"))
     if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
         run_device(model, torch.device("cuda"))
     elif torch.backends.mps.is_available():
         run_device(model, torch.device("mps"))
 
-    import os
     root = Path(os.environ.get("ANET_DATA_ROOT")
                 or Path(__file__).parents[2] / "datasets/suas-synth-50k")
     if root.is_dir():

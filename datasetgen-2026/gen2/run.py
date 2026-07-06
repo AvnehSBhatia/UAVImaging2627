@@ -73,7 +73,7 @@ def _generate_one(args: tuple[int, int, str]) -> dict:
 
 def write_data_yaml(out_dir: Path, classes: list[str]) -> None:
     (out_dir / "data.yaml").write_text(
-        f"path: {out_dir}\n"
+        "path: .\n"
         "train: images/train\nval: images/val\ntest: images/test\n"
         f"nc: {len(classes)}\n"
         f"names: {classes}\n"
