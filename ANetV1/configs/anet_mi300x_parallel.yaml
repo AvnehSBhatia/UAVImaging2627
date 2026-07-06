@@ -17,8 +17,13 @@ train:
   amp: bf16
   samples_per_epoch: null
   early_stop_patience: 6
-  lr: 4.2e-3                   # 6e-3 * sqrt(32/64)
+  # note: effective batch is still 64 (32 x accum 2), so lr should NOT be scaled
+  # down from the batch-64 value — match anet_mi300x.yaml (4e-3 until a run
+  # survives; the first bf16 run NaN'd at ~this lr, suspect was the BN variance
+  # bug fixed in blocks.py, but stay conservative)
+  lr: 4.0e-3
   warmup_steps: 300
+  grad_clip: 1.0               # clip gate-loss spikes instead of diverging
   focal_gamma: 2.0
   class_alpha: [1.0, 8.0, 4.0]
   l2_score_reg: 1.0e-4
