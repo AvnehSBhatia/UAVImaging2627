@@ -29,8 +29,11 @@ class RegionHead(nn.Module):
         loc = (self.local_gate(ln).unsqueeze(-1) * ln).mean(2)  # (B, W, d)
         gn = self.ctx_bn(gtoks.reshape(-1, c)).reshape(gtoks.shape)
         ctx = (self.ctx_gate(gn).unsqueeze(-1) * gn).mean(1)  # (B, d)
-        h = torch.cat([loc, ctx.unsqueeze(1).expand(-1, w, -1)], -1)
-        h = torch.tanh(F.silu(self.fc1(h)))  # SiLU -> Tanh (D20)
+        # fc1(cat[loc, ctx]) as split matmuls + broadcast add: same math, but
+        # Expand(ctx to W windows)+Concat forced a CPU partition in the CoreML EP
+        h = loc @ self.fc1.weight[:, :c].t() + \
+            (ctx @ self.fc1.weight[:, c:].t() + self.fc1.bias).unsqueeze(1)
+        h = torch.tanh(F.silu(h))  # SiLU -> Tanh (D20)
         return self.fc2(h)
 
     def reg_l2(self):

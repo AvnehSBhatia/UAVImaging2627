@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def quat_mul(a, b):
@@ -42,8 +43,10 @@ class DualQuaternionRGB(nn.Module):
         return r, t
 
     def forward(self, img):  # (B,3,H,W)
+        # einsum("ij,bjhw->bihw") as a 1x1 conv: identical math, and the ORT
+        # CoreML EP has no Einsum builder (einsum forced a CPU partition)
         r, t = self.matrix()
-        return torch.einsum("ij,bjhw->bihw", r, img) + t.view(1, 3, 1, 1)
+        return F.conv2d(img, r.reshape(3, 3, 1, 1), t)
 
 
 class ManualBatchNorm(nn.Module):
@@ -145,7 +148,8 @@ class CosineGate(nn.Module):
         self.phi = nn.Parameter(torch.tensor(math.pi / 2))  # alive-at-init (D6)
 
     def forward(self, x):  # (..., T, dim) -> (..., T)
-        s = torch.einsum("...tc,kc->...kt", x, self.V)
+        # matmul instead of einsum (no CoreML Einsum builder); same math
+        s = torch.matmul(x, self.V.t()).transpose(-1, -2)  # (..., 3, T)
         s1, s2, s3 = s.unbind(-2)
         return torch.sigmoid(bounded_cos_score(s1, s2, s3, self.phi))
 

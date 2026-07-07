@@ -116,7 +116,8 @@ class ANetV1(nn.Module):
 
     def _map_dense(self, feat):  # (B,feat,540,960) -> (B,hidden,53,95)
         b = feat.shape[0]
-        out = None
+        ph, pw = self.nh // 2 + 1, self.nw // 2 + 1  # padded phase grid 27x48
+        es = []
         for oy, ox in self.PHASES:
             hp = ((self.IMG_H - oy) // self.WIN) * self.WIN
             wp = ((self.IMG_W - ox) // self.WIN) * self.WIN
@@ -128,10 +129,13 @@ class ANetV1(nn.Module):
                 1,
             )
             e = self._ckpt(self.encoder.forward_dense, x)  # (B,16,hp/20,wp/20)
-            if out is None:
-                out = e.new_zeros(b, e.shape[1], self.nh, self.nw)
-            out[:, :, oy // self.STRIDE :: 2, ox // self.STRIDE :: 2] = e
-        return out
+            es.append(F.pad(e, (0, pw - e.shape[-1], 0, ph - e.shape[-2])))
+        # interleave the four stride-2 phase grids with pixel_shuffle instead of
+        # strided scatter: identical placement (phase (oy,ox) -> out[oy/10::2,
+        # ox/10::2]), but ScatterND forced CPU partitions in the CoreML EP; the
+        # padded row/col land at index 53/95 and are cropped off
+        m = F.pixel_shuffle(torch.stack(es, 2).flatten(1, 2), 2)
+        return m[:, :, : self.nh, : self.nw]
 
     def _map_windowed(self, feat):  # reference path
         b = feat.shape[0]
@@ -166,13 +170,16 @@ class ANetV1(nn.Module):
         return l2, l1
 
     @torch.no_grad()
-    def export_onnx(self, path, opset=17):
-        """Deploy-form export for the Hailo DFC compile spike. Quaternion and
-        blur sigmas evaluate to constants when traced; BN folding is the DFC's job."""
+    def export_onnx(self, path, opset=18, batch=1):
+        """Deploy-form export: Hailo DFC compile spike + fast local inference via
+        ONNX Runtime (see scripts/export_onnx.py, anet/onnxrt.py). Quaternion and
+        blur sigmas evaluate to constants when traced; BN folding is the DFC's job.
+        opset 18 is the torch-2.12 dynamo exporter's native target (17 forces a
+        version-converter pass that fails on Resize)."""
         self.eval()
         prev = self.use_checkpoint
         self.use_checkpoint = False
-        dummy = torch.zeros(1, 3, self.IMG_H, self.IMG_W)
+        dummy = torch.zeros(batch, 3, self.IMG_H, self.IMG_W)
         torch.onnx.export(
             self, dummy, path, opset_version=opset,
             input_names=["frame"], output_names=["cells"],

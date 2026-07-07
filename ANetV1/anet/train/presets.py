@@ -22,9 +22,11 @@ IS_CUDA = torch.cuda.is_available()
 def anet_cfg(**overrides):
     train = dict(
         epochs=30,
-        # effective batch 64 on CUDA (32x2), 16 on Mac (4x4)
-        batch_size=32 if IS_CUDA else 4,
-        accum_steps=2 if IS_CUDA else 4,
+        # effective batch 64 on CUDA (64x1), 16 on Mac (4x4). The model is
+        # launch-bound on the MI300X, so a bigger single batch is ~free per step
+        # and halves the passes/epoch vs 32x2 — same lr, same dynamics, ~2x faster.
+        batch_size=64 if IS_CUDA else 4,
+        accum_steps=1 if IS_CUDA else 4,
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
@@ -35,9 +37,18 @@ def anet_cfg(**overrides):
         samples_per_epoch=None if IS_CUDA else 6000,
         early_stop_patience=6,
         early_stop_min_epochs=10,
+        select_tent_weight=0.5,       # best.pt = argmax(mannequin + 0.5*tent), not mannequin alone
         mps_memory_frac=0.5,          # Mac: error instead of swap-freezing
         focal_gamma=2.0,
         class_alpha=[1.0, 8.0, 4.0],  # [background, mannequin, tent]
+        # Tversky term (FP/FN-aware). focal is ~0.05 here, Tversky is ~0.3-0.6, so
+        # weight 0.1 makes it a corrective, not the dominant term. alpha>beta =>
+        # punish false positives harder (the fp/img knob). Raise weight or alpha to
+        # cut FP; expect a small recall cost. Set weight 0 to disable.
+        tversky_weight=0.1,
+        tversky_alpha=0.7,            # FP penalty
+        tversky_beta=0.3,             # FN penalty
+        init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
         num_workers=8 if IS_CUDA else 2,

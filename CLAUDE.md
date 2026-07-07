@@ -32,6 +32,9 @@ python scripts/evaluate_all.py \
   --yolo runs/yolo/baseline/weights/best.pt \
   --anet runs/anet/best.pt \
   --anet-distill runs/anet_distill/best.pt
+
+# fast local inference: self-contained ONNX + CoreML EP (~2.5x faster than eager MPS)
+python scripts/export_onnx.py --ckpt runs/anet/best.pt --bench   # then use anet.onnxrt.OnnxANet
 ```
 
 Training runs on Apple Silicon MPS; if MPS hits an unsupported op, set `PYTORCH_ENABLE_MPS_FALLBACK=1`. Hyperparameters live in `ANetV1/configs/anet.yaml`.

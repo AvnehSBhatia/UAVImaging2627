@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from .losses import distill_kl, focal_loss
+from .losses import distill_kl, focal_loss, tversky_loss
 from .metrics import CellConfusion, ObjectMetrics
 
 
@@ -115,12 +115,21 @@ class Trainer:
 
     def _loss(self, batch):
         cells = self.model(batch["image"].to(self.device, non_blocking=True))
-        loss = focal_loss(
-            cells, batch["grid"].to(self.device, non_blocking=True),
-            gamma=self.cfg.train.focal_gamma, alpha=tuple(self.cfg.train.class_alpha),
-        )
+        grid = batch["grid"].to(self.device, non_blocking=True)
+        # hard-label objective: focal (per-cell hard-example mining) + Tversky
+        # (set-level FP/FN control — the precision knob for fp/img)
+        hard = focal_loss(cells, grid, gamma=self.cfg.train.focal_gamma,
+                          alpha=tuple(self.cfg.train.class_alpha))
+        tw = getattr(self.cfg.train, "tversky_weight", 0.0) or 0.0
+        if tw:
+            hard = hard + tw * tversky_loss(
+                cells, grid,
+                alpha=getattr(self.cfg.train, "tversky_alpha", 0.7),
+                beta=getattr(self.cfg.train, "tversky_beta", 0.3),
+            )
+        loss = hard
         if self.distill:
-            loss = (1.0 - self.cfg.distill.kl_weight) * loss + \
+            loss = (1.0 - self.cfg.distill.kl_weight) * hard + \
                 self.cfg.distill.kl_weight * distill_kl(
                     cells, batch["teacher"].to(self.device),
                     temperature=self.cfg.distill.temperature,
@@ -160,11 +169,9 @@ class Trainer:
                 self.scaler.scale(loss).backward()
                 lv = loss.item() * accum
                 if step == 0:
-                    print(
-                        f"epoch {epoch}: first step loss={lv:.4f} "
-                        f"(MIOpen may be slow for ~1-2 min on first CUDA ops)",
-                        flush=True,
-                    )
+                    note = (" (MIOpen autotune, ~1-2 min first CUDA ops)"
+                            if epoch == 0 and self.device.type == "cuda" else "")
+                    print(f"epoch {epoch}: first step loss={lv:.4f}{note}", flush=True)
                 if not math.isfinite(lv):
                     # drop the poisoned accumulation window; a persistent NaN
                     # means diverged weights — die fast, don't train garbage
@@ -192,23 +199,26 @@ class Trainer:
                     self.opt.zero_grad()
                     self.sched.step()
             stats = self.evaluate(self.val_loader)
-            # select/early-stop on SYNTHETIC mannequin recall (the mission metric,
-            # ARCHITECTURE §10) — overall recall is ~94% VisDrone boxes, which
-            # pinned the key at 0.000 and made epoch-0 weights "best" once
-            key = stats["mannequin_recall_synthetic"]
-            if math.isnan(key):
-                key = stats["mannequin_recall"]
+            # SYNTHETIC mannequin recall is the mission metric (ARCH §10; overall
+            # recall is ~94% VisDrone and pinned at 0), but selecting on it alone
+            # saved a mannequin-maximal/tent-dead checkpoint (ep5 over-prediction).
+            # Select on mannequin + w*tent so best.pt tracks a deployable model.
+            mann = stats["mannequin_recall_synthetic"]
+            if math.isnan(mann):
+                mann = stats["mannequin_recall"]
+            tent_w = getattr(self.cfg.train, "select_tent_weight", 0.5)
+            key = mann + tent_w * stats["tent_recall"]
             row = [epoch, running / max(n, 1), stats["mannequin_recall"],
                    stats["mannequin_recall_synthetic"], stats["tent_recall"],
                    stats["fp_per_image"], round(time.time() - t0)]
             with open(log_path, "a", newline="") as f:
                 csv.writer(f).writerow(row)
             mc = stats["cells"]["mannequin"]
-            print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={key:.3f} "
+            print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={mann:.3f} "
                   f"(synth {stats['mannequin_recall_synthetic']:.3f}, "
                   f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
                   f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
-                  f"lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
+                  f"sel={key:.3f} lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
             state = getattr(self.model, "_orig_mod", self.model).state_dict()
             torch.save(state, self.out_dir / "last.pt")
             # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
@@ -225,8 +235,8 @@ class Trainer:
                     break
             if self.device.type == "mps":
                 torch.mps.empty_cache()  # release train-shape reservations before eval shapes re-cache
-            elif self.device.type == "cuda":
-                torch.cuda.empty_cache()  # return cached blocks; keeps reserved from creeping up
+            # NOTE: no cuda.empty_cache() — on a 192GB GPU there's no pressure and
+            # it hands blocks back to the driver, stalling the next epoch's first steps
 
     @torch.no_grad()
     def evaluate(self, loader):

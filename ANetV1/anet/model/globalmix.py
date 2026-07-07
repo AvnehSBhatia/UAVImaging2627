@@ -19,7 +19,7 @@ class GlobalCosineMix(nn.Module):
         self.token_dim = token_dim
 
     def forward(self, states):  # (B, 3, 256) -> (B, 16, 18)
-        s = torch.einsum("bik,jk->bij", states, self.U)  # s[b,i,j] = U_j . v_i
+        s = torch.matmul(states, self.U.t())  # s[b,i,j] = U_j . v_i (einsum-free, D34)
         s1, s2, s3 = s[..., 0], s[..., 1], s[..., 2]
         # w_i = sum_j s1_j * cos(pi*tanh(s2_j * s3_i) + phi)  — cross-vector weave
         arg = torch.tanh(s2.unsqueeze(-1) * s3.unsqueeze(-2))  # (B, j, i)
