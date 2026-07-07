@@ -133,7 +133,8 @@ class Trainer:
         log_path = self.out_dir / "log.csv"
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["epoch", "train_loss", "mannequin_recall",
-                                    "tent_recall", "fp_per_image", "seconds"])
+                                    "mannequin_recall_synthetic", "tent_recall",
+                                    "fp_per_image", "seconds"])
         print(
             f"train: device={self.device} batches/epoch={n_batches} "
             f"accum={accum} amp={self.amp_dtype or 'off'} "
@@ -187,12 +188,19 @@ class Trainer:
                     self.opt.zero_grad()
                     self.sched.step()
             stats = self.evaluate(self.val_loader)
-            key = stats["mannequin_recall"]
+            # select/early-stop on SYNTHETIC mannequin recall (the mission metric,
+            # ARCHITECTURE §10) — overall recall is ~94% VisDrone boxes, which
+            # pinned the key at 0.000 and made epoch-0 weights "best" once
+            key = stats["mannequin_recall_synthetic"]
+            if math.isnan(key):
+                key = stats["mannequin_recall"]
             row = [epoch, running / max(n, 1), stats["mannequin_recall"],
-                   stats["tent_recall"], stats["fp_per_image"], round(time.time() - t0)]
+                   stats["mannequin_recall_synthetic"], stats["tent_recall"],
+                   stats["fp_per_image"], round(time.time() - t0)]
             with open(log_path, "a", newline="") as f:
                 csv.writer(f).writerow(row)
             print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={key:.3f} "
+                  f"(synth {stats['mannequin_recall_synthetic']:.3f}) "
                   f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
                   f"lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
             state = getattr(self.model, "_orig_mod", self.model).state_dict()
@@ -204,8 +212,9 @@ class Trainer:
                 torch.save(state, self.out_dir / "best.pt")
             else:
                 stale += 1
-                if patience and stale >= patience:
-                    print(f"early stop at epoch {epoch}: mannequin_recall stuck at "
+                min_ep = getattr(self.cfg.train, "early_stop_min_epochs", 0) or 0
+                if patience and stale >= patience and epoch + 1 >= min_ep:
+                    print(f"early stop at epoch {epoch}: selection metric stuck at "
                           f"{self.best:.3f} for {patience} epochs")
                     break
             if self.device.type == "mps":

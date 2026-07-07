@@ -17,6 +17,7 @@ train:
   amp: bf16
   samples_per_epoch: null
   early_stop_patience: 6
+  early_stop_min_epochs: 10
   # note: effective batch is still 64 (32 x accum 2), so lr should NOT be scaled
   # down from the batch-64 value — match anet_mi300x.yaml (4e-3 until a run
   # survives; the first bf16 run NaN'd at ~this lr, suspect was the BN variance

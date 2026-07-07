@@ -21,7 +21,8 @@ train:
   use_checkpoint: false          # recompute is pure waste with 192GB HBM
   amp: bf16
   samples_per_epoch: null        # full 19,185-image pass per epoch
-  early_stop_patience: 6         # stop when val mannequin recall stalls 6 epochs
+  early_stop_patience: 6         # stop when synthetic mannequin recall stalls 6 epochs
+  early_stop_min_epochs: 10      # small-object recall emerges late; don't kill early runs
   # lr: sqrt-scaled would be 6e-3 (3e-3 @ eff.16 x sqrt(4)), but the first 6e-3
   # run NaN'd right after warmup and the 3e-3 baseline was never validated —
   # 4e-3 until one full run survives; raise toward 6e-3 after that if loss is smooth.
