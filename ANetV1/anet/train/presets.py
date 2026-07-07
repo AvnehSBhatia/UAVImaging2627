@@ -22,11 +22,11 @@ IS_CUDA = torch.cuda.is_available()
 def anet_cfg(**overrides):
     train = dict(
         epochs=30,
-        # effective batch 64 on CUDA (64x1), 16 on Mac (4x4). The model is
-        # launch-bound on the MI300X, so a bigger single batch is ~free per step
-        # and halves the passes/epoch vs 32x2 — same lr, same dynamics, ~2x faster.
-        batch_size=64 if IS_CUDA else 4,
-        accum_steps=1 if IS_CUDA else 4,
+        # effective batch 64 on CUDA (32x2), 16 on Mac (4x4). NB: activations are
+        # ~2.5GB/image under autograd (edge_dq/hidden24), so single-batch 64 OOMs
+        # the 192GB card (~160GB) — 32 is the ceiling. accum 2 keeps effective 64.
+        batch_size=32 if IS_CUDA else 4,
+        accum_steps=2 if IS_CUDA else 4,
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,

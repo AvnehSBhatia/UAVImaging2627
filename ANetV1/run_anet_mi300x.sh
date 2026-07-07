@@ -26,6 +26,7 @@ export PYTHONUNBUFFERED=1
 _ALLOC="expandable_segments:True,garbage_collection_threshold:0.8"
 export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-$_ALLOC}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$_ALLOC}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-$_ALLOC}"  # unified name (newer torch/ROCm)
 
 if [[ -z "${PYTHON:-}" && -x /opt/venv/bin/python3 ]]; then
     PY=/opt/venv/bin/python3
