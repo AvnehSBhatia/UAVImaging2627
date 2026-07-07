@@ -44,8 +44,8 @@ def main():
     conf = np.zeros((3, 3), np.int64)          # gt x pred cells
     logit_sum = torch.zeros(3, 3, dtype=torch.float64)  # gt -> mean logits
     logit_n = torch.zeros(3, dtype=torch.float64)
-    m_prob_at_gt = []                           # softmax P(mannequin) at GT mannequin cells
-    m_rank_at_gt = np.zeros(3, np.int64)        # which class wins at GT mannequin cells
+    prob_at_gt = {1: [], 2: []}                 # softmax P(cls) at that class's GT cells
+    rank_at_gt = {1: np.zeros(3, np.int64), 2: np.zeros(3, np.int64)}  # winner at GT cells
 
     with torch.no_grad():
         for batch in loader:
@@ -61,12 +61,13 @@ def main():
                     logit_n[g] += mask.sum()
             idxs = (gt.reshape(-1) * 3 + pred.reshape(-1)).numpy()
             conf += np.bincount(idxs, minlength=9).reshape(3, 3)
-            mmask = gt == 1
-            if mmask.any():
-                m_prob_at_gt.append(probs.permute(0, 2, 3, 1)[mmask][:, 1])
-                winners = pred[mmask]
-                for k in range(3):
-                    m_rank_at_gt[k] += int((winners == k).sum())
+            for cls in (1, 2):
+                m = gt == cls
+                if m.any():
+                    prob_at_gt[cls].append(probs.permute(0, 2, 3, 1)[m][:, cls])
+                    win = pred[m]
+                    for k in range(3):
+                        rank_at_gt[cls][k] += int((win == k).sum())
 
     print("\ncell confusion (rows=GT, cols=pred):")
     print(f"{'':>12}" + "".join(f"{c:>12}" for c in CLS))
@@ -79,16 +80,19 @@ def main():
             m = (logit_sum[g] / logit_n[g]).tolist()
             print(f"  GT {CLS[g]:>10}: bg={m[0]:+.2f} mannequin={m[1]:+.2f} tent={m[2]:+.2f}")
 
-    if m_prob_at_gt:
-        p = torch.cat(m_prob_at_gt)
-        q = torch.quantile(p, torch.tensor([0.5, 0.9, 0.99, 1.0]))
-        print(f"\nP(mannequin) at {len(p):,} GT mannequin cells: "
-              f"median={q[0]:.4f} p90={q[1]:.4f} p99={q[2]:.4f} max={q[3]:.4f}")
-        print(f"winner at GT mannequin cells: bg={m_rank_at_gt[0]:,} "
-              f"mannequin={m_rank_at_gt[1]:,} tent={m_rank_at_gt[2]:,}")
-        total_pred_m = int(conf[:, 1].sum())
-        print(f"\nverdict: model predicts {total_pred_m:,} mannequin cells anywhere "
-              f"({'TRUE COLLAPSE — class never wins argmax' if total_pred_m == 0 else 'not collapsed — loses at GT sites'})")
+    print()
+    for cls in (1, 2):
+        name = CLS[cls]
+        if prob_at_gt[cls]:
+            p = torch.cat(prob_at_gt[cls])
+            q = torch.quantile(p, torch.tensor([0.5, 0.9, 0.99, 1.0]))
+            r = rank_at_gt[cls]
+            total_pred = int(conf[:, cls].sum())
+            print(f"P({name}) at {len(p):,} GT {name} cells: "
+                  f"median={q[0]:.4f} p90={q[1]:.4f} p99={q[2]:.4f} max={q[3]:.4f}")
+            print(f"  winner at those cells: bg={r[0]:,} mannequin={r[1]:,} tent={r[2]:,}")
+            print(f"  verdict: predicts {total_pred:,} {name} cells anywhere -> "
+                  f"{'TRUE COLLAPSE (never wins argmax)' if total_pred == 0 else 'not collapsed'}\n")
 
 
 if __name__ == "__main__":

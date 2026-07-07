@@ -78,7 +78,7 @@ def main():
         sd = torch.load(args.ckpt, map_location=device)
         model = ANetV1.from_state_dict(sd, use_checkpoint=False).to(device)
         model.eval()
-        hidden = model.encoder.hidden
+        hidden = f"{model.encoder.hidden} stem={model.stem}"
 
     ds = SUASCells(cfg.data.root, "val", coverage_thresh=cfg.data.coverage_thresh)
     idx = [i for i in range(len(ds)) if not ds.is_visdrone(i)][: args.n]
