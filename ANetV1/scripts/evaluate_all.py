@@ -34,9 +34,7 @@ def _sync(device):
 
 def latency_anet(ckpt, device, n=50, throughput_batch=16):
     """Median batch-1 latency (ms) + throughput (img/s) at a service batch size."""
-    model = ANetV1(use_checkpoint=False).to(device)
-    model.load_state_dict(torch.load(ckpt, map_location=device))
-    model.eval()
+    model = _load_anet(ckpt, device)
     out = {}
     with torch.no_grad():
         for b, key in ((1, "latency_ms_b1"), (throughput_batch, "throughput_img_s")):
@@ -70,10 +68,17 @@ def latency_yolo(weights, ds, cfg, n=50):
             "params": sum(p.numel() for p in model.model.parameters())}
 
 
-def eval_anet(ckpt, ds, device):
-    model = ANetV1(use_checkpoint=False).to(device)
-    model.load_state_dict(torch.load(ckpt, map_location=device))
+def _load_anet(ckpt, device):
+    sd = torch.load(ckpt, map_location=device)
+    hidden = sd["encoder.mlp.0.weight"].shape[0]  # infer width from checkpoint
+    model = ANetV1(use_checkpoint=False, hidden=hidden).to(device)
+    model.load_state_dict(sd)
     model.eval()
+    return model
+
+
+def eval_anet(ckpt, ds, device):
+    model = _load_anet(ckpt, device)
     cells_m, obj_m = CellConfusion(), ObjectMetrics()
     loader = DataLoader(ds, batch_size=4, num_workers=4)
     with torch.no_grad():

@@ -9,12 +9,12 @@ class GlobalCosineMix(nn.Module):
     block runs on the Pi CPU in exact fp32 at deploy (771 params, KB tensors).
     256 splits into 16 tokens x 16-d (D18)."""
 
-    def __init__(self, dim=256, n_tokens=16, token_dim=16):
+    def __init__(self, dim=256, n_tokens=16, token_dim=16, pad_to=18):
         super().__init__()
-        assert n_tokens * token_dim == dim
+        assert n_tokens * token_dim == dim and pad_to > token_dim
         self.U = nn.Parameter(torch.randn(3, dim) * 0.05)
         self.phi = nn.Parameter(torch.tensor(math.pi / 2))
-        self.pad = nn.Parameter(torch.zeros(2))  # 16-d tokens -> 18-d (D19 head dim)
+        self.pad = nn.Parameter(torch.zeros(pad_to - token_dim))  # tokens -> head dim
         self.n_tokens = n_tokens
         self.token_dim = token_dim
 
@@ -27,7 +27,7 @@ class GlobalCosineMix(nn.Module):
         g = torch.softmax(w, -1)
         mixed = (g.unsqueeze(-1) * states).sum(1)  # (B, 256)
         toks = mixed.reshape(-1, self.n_tokens, self.token_dim)
-        pad = self.pad.expand(toks.shape[0], self.n_tokens, 2)
+        pad = self.pad.expand(toks.shape[0], self.n_tokens, -1)
         return torch.cat([toks, pad], -1)
 
     def reg_l2(self):

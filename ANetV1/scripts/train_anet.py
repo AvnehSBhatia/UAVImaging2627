@@ -31,7 +31,8 @@ def main():
     cfg = load_config(args.config)
 
     train_ds, val_ds = build_datasets(cfg)
-    model = ANetV1(use_checkpoint=getattr(cfg.train, "use_checkpoint", True))
+    model = ANetV1(use_checkpoint=getattr(cfg.train, "use_checkpoint", True),
+                   hidden=getattr(cfg.train, "hidden", 16))
     n_params = sum(p.numel() for p in model.parameters())
     print(f"ANetV1: {n_params:,} params | train {len(train_ds)} | val {len(val_ds)}")
     Trainer(model, train_ds, val_ds, cfg).train()

@@ -24,7 +24,8 @@ def main():
         raise FileNotFoundError(f"{teacher_dir} — run cache_teacher.py first")
 
     train_ds, val_ds = build_datasets(cfg, teacher_dir=teacher_dir)
-    model = ANetV1(use_checkpoint=getattr(cfg.train, "use_checkpoint", True))
+    model = ANetV1(use_checkpoint=getattr(cfg.train, "use_checkpoint", True),
+                   hidden=getattr(cfg.train, "hidden", 16))
     Trainer(model, train_ds, val_ds, cfg, distill=True).train()
 
 

@@ -1,0 +1,97 @@
+"""Why is a class at zero recall? Loads a checkpoint, runs synthetic val, and
+reports per-class logit statistics, prediction counts, and near-miss analysis.
+
+  python scripts/diagnose.py --ckpt runs/anet/last.pt [--config configs/anet_mi300x.yaml] [--n 200]
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Subset
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from anet import ANetV1  # noqa: E402
+from anet.config import load_config  # noqa: E402
+from anet.data.dataset import SUASCells  # noqa: E402
+from anet.train.trainer import pick_device  # noqa: E402
+
+CLS = ("background", "mannequin", "tent")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--config", default=str(Path(__file__).parents[1] / "configs/anet_mi300x.yaml"))
+    ap.add_argument("--n", type=int, default=200, help="synthetic val images to scan")
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+    device = pick_device()
+
+    sd = torch.load(args.ckpt, map_location=device)
+    hidden = sd["encoder.mlp.0.weight"].shape[0]
+    model = ANetV1(use_checkpoint=False, hidden=hidden).to(device)
+    model.load_state_dict(sd)
+    model.eval()
+    print(f"ckpt {args.ckpt} | hidden={hidden} | "
+          f"params={sum(p.numel() for p in model.parameters()):,} | device={device}")
+
+    ds = SUASCells(cfg.data.root, "val", coverage_thresh=cfg.data.coverage_thresh)
+    idx = [i for i in range(len(ds)) if not ds.is_visdrone(i)][: args.n]
+    loader = DataLoader(Subset(ds, idx), batch_size=8, num_workers=2)
+
+    conf = np.zeros((3, 3), np.int64)          # gt x pred cells
+    logit_sum = torch.zeros(3, 3, dtype=torch.float64)  # gt -> mean logits
+    logit_n = torch.zeros(3, dtype=torch.float64)
+    m_prob_at_gt = []                           # softmax P(mannequin) at GT mannequin cells
+    m_rank_at_gt = np.zeros(3, np.int64)        # which class wins at GT mannequin cells
+
+    with torch.no_grad():
+        for batch in loader:
+            logits = model(batch["image"].to(device)).float().cpu()  # (B,3,54,96)
+            pred = logits.argmax(1)
+            gt = batch["grid"]
+            probs = torch.softmax(logits, 1)
+            for g in range(3):
+                mask = gt == g
+                if mask.any():
+                    sel = logits.permute(0, 2, 3, 1)[mask]  # (n,3)
+                    logit_sum[g] += sel.double().sum(0)
+                    logit_n[g] += mask.sum()
+            idxs = (gt.reshape(-1) * 3 + pred.reshape(-1)).numpy()
+            conf += np.bincount(idxs, minlength=9).reshape(3, 3)
+            mmask = gt == 1
+            if mmask.any():
+                m_prob_at_gt.append(probs.permute(0, 2, 3, 1)[mmask][:, 1])
+                winners = pred[mmask]
+                for k in range(3):
+                    m_rank_at_gt[k] += int((winners == k).sum())
+
+    print("\ncell confusion (rows=GT, cols=pred):")
+    print(f"{'':>12}" + "".join(f"{c:>12}" for c in CLS))
+    for g in range(3):
+        print(f"{CLS[g]:>12}" + "".join(f"{conf[g, k]:>12,}" for k in range(3)))
+
+    print("\nmean logits by GT cell class (what the head outputs there):")
+    for g in range(3):
+        if logit_n[g]:
+            m = (logit_sum[g] / logit_n[g]).tolist()
+            print(f"  GT {CLS[g]:>10}: bg={m[0]:+.2f} mannequin={m[1]:+.2f} tent={m[2]:+.2f}")
+
+    if m_prob_at_gt:
+        p = torch.cat(m_prob_at_gt)
+        q = torch.quantile(p, torch.tensor([0.5, 0.9, 0.99, 1.0]))
+        print(f"\nP(mannequin) at {len(p):,} GT mannequin cells: "
+              f"median={q[0]:.4f} p90={q[1]:.4f} p99={q[2]:.4f} max={q[3]:.4f}")
+        print(f"winner at GT mannequin cells: bg={m_rank_at_gt[0]:,} "
+              f"mannequin={m_rank_at_gt[1]:,} tent={m_rank_at_gt[2]:,}")
+        total_pred_m = int(conf[:, 1].sum())
+        print(f"\nverdict: model predicts {total_pred_m:,} mannequin cells anywhere "
+              f"({'TRUE COLLAPSE — class never wins argmax' if total_pred_m == 0 else 'not collapsed — loses at GT sites'})")
+
+
+if __name__ == "__main__":
+    main()

@@ -33,6 +33,10 @@ class CellConfusion:
             out[CLASS_NAMES[k]] = {
                 "precision": p, "recall": r,
                 "f1": 2 * p * r / max(p + r, 1e-9),
+                # raw counts: distinguishes "class never predicted anywhere"
+                # (pred_cells==0, true collapse) from "predicted in wrong places"
+                "pred_cells": int(self.mat[:, k].sum()),
+                "gt_cells": int(self.mat[k, :].sum()),
             }
         return out
 

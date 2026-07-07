@@ -26,7 +26,7 @@ class ANetV1(nn.Module):
     WIN, STRIDE = 20, 10
     PHASES = ((0, 0), (0, 10), (10, 0), (10, 10))
 
-    def __init__(self, use_checkpoint=True, dense=True):
+    def __init__(self, use_checkpoint=True, dense=True, hidden=16):
         super().__init__()
         self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
         self.nw = (self.IMG_W - self.WIN) // self.STRIDE + 1  # 95
@@ -34,12 +34,16 @@ class ANetV1(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.dense = dense
 
+        # hidden=16 is the 17k spec model; hidden=24 is the pre-registered
+        # capacity mitigation (ARCHITECTURE §8 risk 2, ~24k params with the
+        # Path-B ripple). d = embedding + global (x,y) coords, 18 at spec.
+        d = hidden + 2
         self.quat = DualQuaternionRGB()
-        self.encoder = WindowEncoder()
-        self.pools = nn.ModuleList([ScalarKernelPool(18, k) for k in (3, 7, 11)])
-        self.globals_ = nn.ModuleList([GatedGlobalPool() for _ in range(3)])  # unshared (D28)
-        self.mix = GlobalCosineMix()
-        self.head = RegionHead()
+        self.encoder = WindowEncoder(hidden)
+        self.pools = nn.ModuleList([ScalarKernelPool(d, k) for k in (3, 7, 11)])
+        self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
+        self.mix = GlobalCosineMix(pad_to=d)
+        self.head = RegionHead(dim=d)
 
         # window-relative pixel coords, row-major to match F.unfold token order
         r = torch.arange(self.WIN, dtype=torch.float32)

@@ -203,8 +203,10 @@ class Trainer:
                    stats["fp_per_image"], round(time.time() - t0)]
             with open(log_path, "a", newline="") as f:
                 csv.writer(f).writerow(row)
+            mc = stats["cells"]["mannequin"]
             print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={key:.3f} "
-                  f"(synth {stats['mannequin_recall_synthetic']:.3f}) "
+                  f"(synth {stats['mannequin_recall_synthetic']:.3f}, "
+                  f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
                   f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
                   f"lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
             state = getattr(self.model, "_orig_mod", self.model).state_dict()

@@ -19,6 +19,9 @@ train:
   batch_size: 64
   accum_steps: 1
   use_checkpoint: false          # recompute is pure waste with 192GB HBM
+  # hidden: 24                   # UNCOMMENT if synthetic mannequin recall is still
+  #                              # 0 at epoch ~10: pre-registered capacity bump
+  #                              # (ARCHITECTURE §8 risk 2) — 24-d embeddings, ~24k params
   amp: bf16
   samples_per_epoch: null        # full 19,185-image pass per epoch
   early_stop_patience: 6         # stop when synthetic mannequin recall stalls 6 epochs
