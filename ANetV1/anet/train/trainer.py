@@ -66,8 +66,12 @@ class Trainer:
         frac = getattr(cfg.train, "mps_memory_frac", None)
         if frac and self.device.type == "mps":
             torch.mps.set_per_process_memory_fraction(float(frac))
-        if self.device.type == "cuda":
-            torch.backends.cudnn.benchmark = True  # fixed shapes; MIOpen/cuDNN autotune
+        # benchmark=True on ROCm forces an exhaustive MIOpen search per unique
+        # conv shape — measured ~27 min of "hang" in epoch 0 for zero steady-state
+        # gain (tiny launch-bound convs). MIOPEN_FIND_MODE=FAST does the right
+        # thing instead. Opt back in via cudnn_benchmark: true (NVIDIA, fat convs).
+        if self.device.type == "cuda" and getattr(cfg.train, "cudnn_benchmark", False):
+            torch.backends.cudnn.benchmark = True
 
         # amp: "fp16" | "bf16" | none — MPS/CUDA only (D30).
         # fp16 measured NaN on this model at batch 8; leave off unless re-validated.
