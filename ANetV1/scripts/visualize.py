@@ -102,6 +102,15 @@ def components(mask):  # bool (H,W) -> [(r0,c0,r1,c1)] connected-component boxes
     return out
 
 
+def prob_overlay(base_rgb, prob2d, color, alpha=0.85):  # blend a prob map onto the frame
+    a = np.asarray(base_rgb, np.float32)
+    p = prob2d.detach().cpu().float().numpy() if torch.is_tensor(prob2d) else prob2d
+    pm = np.asarray(Image.fromarray((np.clip(p, 0, 1) * 255).astype(np.uint8))
+                    .resize((a.shape[1], a.shape[0]), Image.BILINEAR), np.float32)[..., None] / 255
+    out = a * (1 - alpha * pm) + np.asarray(color, np.float32) * (alpha * pm)
+    return Image.fromarray(out.astype(np.uint8), "RGB")
+
+
 def overlay(base_rgb, gt_boxes, pred_grid):
     im = base_rgb.copy()
     d = ImageDraw.Draw(im)
@@ -175,11 +184,17 @@ def main():
             chw_to_rgb(feat[0, off:off + 3]).save(d / f"01_stem_{name}.png")
         montage(m16[0].cpu().numpy()).save(d / "02_embedding_montage.png")
         heat(m16[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "02_embedding_mag.png")
+        # Path A carries the 2 (x,y) coord channels (ramps 0..1) after the hidden
+        # feature channels — exclude them or their gradient swamps the norm.
+        h = model.encoder.hidden
         for mp, k in zip(maps, (3, 7, 11)):
-            heat(mp[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / f"03_pathA_k{k}.png")
+            heat(mp[0, :h].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / f"03_pathA_k{k}.png")
         for c in range(3):
             heat(cells[c], signed=True, size=(CANVAS_W, CANVAS_H)).save(d / f"04_logit_{CLS[c]}.png")
             heat(probs[c], size=(CANVAS_W, CANVAS_H)).save(d / f"05_prob_{CLS[c]}.png")
+        # prob blended onto the frame — localization against the real image
+        prob_overlay(base, probs[1], BOX_COLOR[1]).save(d / "05_prob_mannequin_overlay.png")
+        prob_overlay(base, probs[2], BOX_COLOR[2]).save(d / "05_prob_tent_overlay.png")
         ov = overlay(base, s["boxes"].numpy(), pred)
         ov.save(d / "06_overlay.png")
         overlays.append(ov)
