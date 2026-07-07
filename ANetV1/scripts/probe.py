@@ -55,6 +55,9 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--n", type=int, default=300, help="synthetic val images")
     ap.add_argument("--steps", type=int, default=600)
+    ap.add_argument("--per-image-z", action="store_true",
+                    help="z-score each image's windows against that image's own "
+                         "stats (tests mannequin-as-local-outlier; global z is default)")
     args = ap.parse_args()
     cfg = anet_cfg()
     device = pick_device()
@@ -71,9 +74,14 @@ def main():
 
     X, Y = [], []
     for batch in loader:
-        X.append(window_features(model, batch["image"].to(device)).cpu().flatten(0, 1))
+        f = window_features(model, batch["image"].to(device))  # (B, W, d)
+        if args.per_image_z:
+            f = (f - f.mean(1, keepdim=True)) / f.std(1, keepdim=True).clamp_min(1e-6)
+        X.append(f.cpu().flatten(0, 1))
         Y.append(window_labels(batch["grid"]).flatten())
     X, Y = torch.cat(X), torch.cat(Y)
+    if args.per_image_z:
+        print("per-image z-scoring: ON (each window relative to its own image)")
     d = X.shape[1]
     counts = torch.bincount(Y, minlength=3)
     print(f"ckpt {args.ckpt} | hidden={hidden} | {len(Y):,} windows "
@@ -106,10 +114,14 @@ def main():
         fp = int(((pred == k) & (yt != k)).sum())
         r = tp / max(tp + fn, 1)
         p = tp / max(tp + fp, 1)
-        print(f"  {name:>9}: recall={r:.3f} precision={p:.3f} "
-              f"(tp={tp:,} fn={fn:,} fp={fp:,})")
-    print("\nread: mannequin recall >~0.5 -> signal EXISTS in embeddings, head is "
-          "losing it; <~0.2 -> encoder never separates mannequin from clutter")
+        flag = (tp + fp) / max(len(yt), 1)  # a random classifier's recall == its flag rate
+        lift = r / max(flag, 1e-9)
+        print(f"  {name:>9}: recall={r:.3f} @ flag rate {flag:.3f} -> lift x{lift:.2f} "
+              f"(random = x1.00) precision={p:.3f} (tp={tp:,} fn={fn:,} fp={fp:,})")
+    print("\nread (use a LATE checkpoint; tent is the control — it reaches ~0.8 object "
+          "recall, so its lift shows what 'signal present' looks like):\n"
+          "  mannequin lift ~ tent lift  -> encoder carries it; head/global-mix loses it\n"
+          "  mannequin lift ~ x1, tent high -> encoder never separates mannequin from clutter")
 
 
 if __name__ == "__main__":
