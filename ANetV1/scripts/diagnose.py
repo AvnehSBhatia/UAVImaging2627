@@ -31,11 +31,10 @@ def main():
     device = pick_device()
 
     sd = torch.load(args.ckpt, map_location=device)
-    hidden = sd["encoder.mlp.0.weight"].shape[0]
-    model = ANetV1(use_checkpoint=False, hidden=hidden).to(device)
-    model.load_state_dict(sd)
+    model = ANetV1.from_state_dict(sd, use_checkpoint=False).to(device)
     model.eval()
-    print(f"ckpt {args.ckpt} | hidden={hidden} | "
+    hidden = model.encoder.hidden
+    print(f"ckpt {args.ckpt} | hidden={hidden} stem={model.stem} | "
           f"params={sum(p.numel() for p in model.parameters()):,} | device={device}")
 
     ds = SUASCells(cfg.data.root, "val", coverage_thresh=cfg.data.coverage_thresh)

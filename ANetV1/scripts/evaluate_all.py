@@ -70,9 +70,7 @@ def latency_yolo(weights, ds, cfg, n=50):
 
 def _load_anet(ckpt, device):
     sd = torch.load(ckpt, map_location=device)
-    hidden = sd["encoder.mlp.0.weight"].shape[0]  # infer width from checkpoint
-    model = ANetV1(use_checkpoint=False, hidden=hidden).to(device)
-    model.load_state_dict(sd)
+    model = ANetV1.from_state_dict(sd, use_checkpoint=False).to(device)  # width/stem from ckpt
     model.eval()
     return model
 

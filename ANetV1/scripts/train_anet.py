@@ -38,9 +38,10 @@ def build_datasets(cfg, teacher_dir=None):
 
 def main():
     train_ds, val_ds = build_datasets(cfg)
-    model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden)
+    model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
+                   stem=cfg.train.stem)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"ANetV1: {n_params:,} params (hidden={cfg.train.hidden}) | "
+    print(f"ANetV1: {n_params:,} params (hidden={cfg.train.hidden}, stem={cfg.train.stem}) | "
           f"train {len(train_ds)} | val {len(val_ds)} | data {cfg.data.root}")
     Trainer(model, train_ds, val_ds, cfg).train()
 

@@ -48,7 +48,7 @@ class MixRound(nn.Module):
         t = t.reshape(b, nh, nw, self.GRID, self.GRID).permute(0, 1, 3, 2, 4)
         return t.reshape(b, 1, h, w)
 
-    def forward(self, x):  # (N, 400, 5)
+    def forward(self, x):  # (N, 400, dim)
         n, t, c = x.shape
         xn = self.bn(x.reshape(-1, c)).reshape(n, t, c)
         s = torch.einsum("ntc,kc->nkt", xn, self.V)
@@ -59,9 +59,9 @@ class MixRound(nn.Module):
         rgb = F.silu(x[..., :3] + pooled[:, None, :3])
         return torch.cat([rgb, x[..., 3:]], -1)
 
-    def forward_dense(self, x):  # (B, 5, H, W), H/W multiples of 20 — same math
+    def forward_dense(self, x):  # (B, dim, H, W), H/W multiples of 20 — same math
         xn = self.bn(x)
-        s = F.conv2d(xn, self.V.reshape(3, 5, 1, 1))
+        s = F.conv2d(xn, self.V.reshape(3, -1, 1, 1))
         s1 = self._blur_dense(s[:, 0:1])
         s2 = self._blur_dense(s[:, 1:2])
         gate = torch.sigmoid(bounded_cos_score(s1, s2, s[:, 2:3], self.phi))
@@ -75,19 +75,22 @@ class MixRound(nn.Module):
 
 
 class WindowEncoder(nn.Module):
-    """Shared 20x20 window encoder: 400 (r,g,b,u,v) tokens -> 16-d embedding."""
+    """Shared 20x20 window encoder: 400 (r,g,b,hp1..hp3,u,v) tokens -> embedding.
+    in_dim=8 at spec: 3 quat-RGB + 3 high-pass texture channels (D32) + (u,v).
+    The non-RGB channels pass through the mixing rounds frozen."""
 
-    def __init__(self, hidden=16):
+    def __init__(self, hidden=16, in_dim=8):
         super().__init__()
         self.hidden = hidden
-        self.rounds = nn.ModuleList([MixRound() for _ in range(3)])
+        self.in_dim = in_dim
+        self.rounds = nn.ModuleList([MixRound(dim=in_dim) for _ in range(3)])
         self.mlp = nn.Sequential(
-            nn.Linear(5, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU()
+            nn.Linear(in_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU()
         )
         self.bn = ManualBatchNorm(hidden)
         self.gate = CosineGate(hidden)
 
-    def forward(self, x):  # (N, 400, 5) -> (N, hidden)
+    def forward(self, x):  # (N, 400, in_dim) -> (N, hidden)
         for r in self.rounds:
             x = r(x)
         h = self.mlp(x)
@@ -95,12 +98,12 @@ class WindowEncoder(nn.Module):
         hn = self.bn(h.reshape(-1, c)).reshape(n, t, c)
         return (self.gate(hn).unsqueeze(-1) * h).mean(1)
 
-    def forward_dense(self, x):  # (B, 5, H, W) -> (B, hidden, H/20, W/20)
+    def forward_dense(self, x):  # (B, in_dim, H, W) -> (B, hidden, H/20, W/20)
         for r in self.rounds:
             x = r.forward_dense(x)
         # per-token MLP == 1x1 convs with the shared Linear weights
         fc1, fc2 = self.mlp[0], self.mlp[2]
-        h = F.silu(F.conv2d(x, fc1.weight.reshape(self.hidden, 5, 1, 1), fc1.bias))
+        h = F.silu(F.conv2d(x, fc1.weight.reshape(self.hidden, self.in_dim, 1, 1), fc1.bias))
         h = F.silu(F.conv2d(h, fc2.weight.reshape(self.hidden, self.hidden, 1, 1), fc2.bias))
         hn = self.bn(h)
         s = F.conv2d(hn, self.gate.V.reshape(3, self.hidden, 1, 1))

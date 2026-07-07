@@ -74,16 +74,19 @@ At the chosen **960×540** input: typical mannequin ≈ 49×13 px, worst case �
 ```
 960×540×3 frame  (bilinear downscale of 1920×1080 capture)
 │
-├─ STAGE 0 · windowing: 20×20 windows, stride 10 → 53 rows × 95 cols = 5,035 windows
-│     pixel tokens: (r, g, b, u, v)   u,v = window-relative coords ∈ (0,1)
+├─ STAGE 0 · stem + windowing:
+│     EdgeDQ stem (D33, default): raw ∥ DQ→7×7 vert-Sobel ∥ DQ→7×7 horiz-Sobel,
+│       each group re-framed by its own dual-quaternion transform → 9 channels
+│       (ablation variant "highpass", D32: DQ-RGB + depthwise 3×3 high-pass → 6 ch)
+│     → 20×20 windows, stride 10 → 53 rows × 95 cols = 5,035 windows
+│     pixel tokens: (r, g, b, e₁…e₆, u, v)   u,v = window-relative coords ∈ (0,1)
 │
 ├─ STAGE 1 · window encoder (shared weights, 5,035×):
-│     dual-quaternion RGB transform (baked to 3×3 conv + bias at export)
-│     → 3 × mixing round:
-│         BN → 3 shared dim-5 dots → Gaussian-blur s1,s2 maps (learned σ)
+│     3 × mixing round:
+│         BN → 3 shared dim-11 dots → Gaussian-blur s1,s2 maps (learned σ)
 │         → score = ⟨s1⟩·cos(π·tanh(⟨s2⟩·s3) + φ) → sigmoid gate
-│         → gated window mean added to RGB channels → SiLU (coords frozen)
-│     → per-token MLP 5→16→16 (SiLU) → BN → cosine-gated pool → 16-d
+│         → gated window mean added to RGB channels → SiLU (edges + coords frozen)
+│     → per-token MLP 11→16→16 (SiLU) → BN → cosine-gated pool → 16-d
 │     → concat global window-center (x,y) → 18-d embedding
 │
 ├─ STAGE 2 · embedding map (B,18,53,95):
@@ -96,10 +99,12 @@ At the chosen **960×540** input: typical mannequin ≈ 49×13 px, worst case �
 │     wᵢ = Σⱼ s1ⱼ·cos(π·tanh(s2ⱼ·s3ᵢ) + φ)   → softmax(3) → mixed 256-d
 │     → split into 16 tokens × 16-d → pad with learned 2-vector → (16,18)
 │
-└─ STAGE 4 · per-window head (5,035×):
-      20 tokens = 16 global + own embedding + own 3 Path-A vectors (all 18-d)
-      → shared cosine gate → sigmoid-weighted mean → BN
-      → Linear 18→8 → SiLU → Tanh → Linear 8→3
+└─ STAGE 4 · per-window head (5,035×), two pooled streams (D31):
+      local stream: own embedding + own 3 Path-A vectors (4 × 18-d)
+        → BN → cosine gate → sigmoid-weighted mean → 18-d
+      context stream: 16 global tokens (once per frame)
+        → BN → cosine gate → sigmoid-weighted mean → 18-d
+      → concat (36-d) → Linear 36→8 → SiLU → Tanh → Linear 8→3
       → overlap-average window logits into 10×10 cells (54×96 grid) → argmax
 ```
 
@@ -111,21 +116,24 @@ Output granularity: 10×10 px cells at 540p = 20×20 px at capture = 0.24–0.56
 
 ### 4.0 Stage 0 — windowing and tokens
 
-- `F.unfold(rgb, kernel=20, stride=10)` → `(B, 3·400, 5035)`. Grid: `(540−20)/10+1 = 53` rows, `(960−20)/10+1 = 95` cols. Both axes tile the frame exactly (20 + 52·10 = 540; 20 + 94·10 = 960).
+- **Stem (before windowing):** the EdgeDQ stem (D33, default) produces a 9-channel full-frame feature map: colour + 3 vertical-edge + 3 horizontal-edge channels (7×7 oriented Sobel init, learnable, bracketed by dual-quaternion colour transforms). The `highpass` ablation variant (D32) produces 6 channels. Everything is a plain conv at export; because the stem runs on the full frame, the windowed and 4-phase dense paths stay bit-identical.
+- `F.unfold(feat, kernel=20, stride=10)` → `(B, 9·400, 5035)`. Grid: `(540−20)/10+1 = 53` rows, `(960−20)/10+1 = 95` cols. Both axes tile the frame exactly (20 + 52·10 = 540; 20 + 94·10 = 960).
 - Token order inside a window is row-major `(row·20 + col)`; windows are ordered `(row·95 + col)`. The coordinate buffers are constructed to match this exactly.
-- **Window-relative coords** `u = (col+0.5)/20`, `v = (row+0.5)/20` are concatenated to every pixel token (dim 3→5). They are *frozen channels*: no round update, no activation ever touches them.
+- **Window-relative coords** `u = (col+0.5)/20`, `v = (row+0.5)/20` are concatenated to every pixel token (dim 9→11). Like the edge channels, they are *frozen channels*: no round update, no activation ever touches them.
 - **Global coords** `x = (10·i+10)/960`, `y = (10·j+10)/540` (window centers ≡ mean of the center-4 pixels) are concatenated to embeddings (dim 16→18).
 
 **Why two coordinate frames:** global coords vary by only ~0.001 between adjacent pixels inside a window — numerically invisible after normalization, so within-window shape needs window-relative coords. Global position (horizon bias, runway location) belongs at the embedding level where 0.01-scale steps are meaningful.
 
-### 4.1 Stage 1 — window encoder (508 params)
+### 4.1 Stage 1 — window encoder (1,050 params incl. stem)
 
-**Dual quaternion RGB transform (8 params).** Real part `q_r` (4) → rotation matrix R ∈ SO(3); dual part `q_d` (4) → translation `t = 2·vec(q_d ⊗ q_r*)`. Output: `R·rgb + t`. A *rigid* transform of color space: rotation + offset, norm-preserving, 6–7 effective DOF. At export this is a constant 3×3 conv + bias — zero deploy risk, zero extra inference cost.
+**Dual quaternion RGB transform (8 params each).** Real part `q_r` (4) → rotation matrix R ∈ SO(3); dual part `q_d` (4) → translation `t = 2·vec(q_d ⊗ q_r*)`. Output: `R·rgb + t`. A *rigid* transform of color space: rotation + offset, norm-preserving, 6–7 effective DOF. At export this is a constant 3×3 conv + bias — zero deploy risk, zero extra inference cost. The stem uses five instances.
 
-**Mixing rounds ×3 (17 params each).** Round r on tokens `x ∈ (400, 5)`:
+**EdgeDQ stem (334 params, D33).** Triplicate the frame: one copy stays raw colour; the other two pass through a learned DQ colour rotation then a learnable 7×7 oriented edge conv (depthwise, Sobel-7 init — vertical and horizontal). Each 3-channel group is then re-framed by its own DQ → 9 channels. Frozen through the rounds like (u,v) (only the first 3 colour channels get the residual update). Rationale: without it the tokens are single-pixel colours and Stage 1 has no edge/texture operator at all — measured mannequin-vs-clutter separability in the trained v6 embeddings was barely above chance (linear-probe lift ×1.4 vs tent ×2.0) while mannequins differ from clutter by shape/texture, not colour. The `highpass` variant (D32: DQ-RGB + depthwise 3×3 zero-DC high-pass, 35 params, 6 channels) is kept as the minimal-stem ablation.
+
+**Mixing rounds ×3 (35 params each).** Round r on tokens `x ∈ (400, 11)`:
 
 1. `x̂ = BN(x)` (per-channel BatchNorm; folds into the following dot products at export).
-2. Three shared dot products: `s_k = x̂ · V_k`, `V ∈ ℝ^{3×5}` → maps `s1, s2, s3 ∈ ℝ^{400}`.
+2. Three shared dot products: `s_k = x̂ · V_k`, `V ∈ ℝ^{3×11}` → maps `s1, s2, s3 ∈ ℝ^{400}`.
 3. Gaussian blur of `s1` and `s2` over the 20×20 token grid: 9×9 kernel built from learned σ (`σ = softplus(σ_raw) + 0.5`, init ≈ 3.1 px). ⟨s1⟩, ⟨s2⟩ are neighborhood amplitude/frequency fields; `s3` stays per-token.
 4. `score = ⟨s1⟩ · cos(π·tanh(⟨s2⟩·s3) + φ)`, φ learned per round, init π/2.
 5. `gate = sigmoid(score)`; `pooled = mean(gate ⊙ x)` over 400 tokens (unnormalized gated mean — no softmax).
@@ -133,7 +141,7 @@ Output granularity: 10×10 px cells at 540p = 20×20 px at capture = 0.24–0.56
 
 Semantics: a smooth local field defines the lens `a·cos(b·x+φ)`; each token's own s3 is read through its neighborhood's lens — tokens that deviate from their surroundings score differently from tokens that conform (emergent edge/blob detection). σ interpolates between per-token gating (σ→0) and whole-window-context gating (σ→∞).
 
-**Per-token MLP (368 params).** `Linear(5,16) → SiLU → Linear(16,16) → SiLU`. This plus the pool is a 300:1 compression (4,800 input values → 16 floats) — the model's tightest capacity point.
+**Per-token MLP (464 params).** `Linear(11,16) → SiLU → Linear(16,16) → SiLU`. This plus the pool is a 300:1 compression (4,800 capture-res values → 16 floats) — the model's tightest capacity point.
 
 **Cosine-gated pool (49 params + BN 32).** `CosineGate(16)`: 3 shared 16-d dots → `score = s1·cos(π·tanh(s2·s3)+φ)` → sigmoid → gated mean over 400 tokens → 16-d embedding. BN(16) before scoring.
 
@@ -159,11 +167,16 @@ Each state contributes an (amplitude, frequency) pair; each state's third scalar
 
 **Note (spec correction):** the original spec said "split 256 into 8×16" — 8×16 = 128 ≠ 256. Resolved as 16 tokens × 16-d (D18).
 
-### 4.4 Stage 4 — head (270 params)
+### 4.4 Stage 4 — head (505 params)
 
-Per window: token set `T = {16 global tokens, own 18-d embedding, own 3 Path-A vectors}` (20 × 18-d). `CosineGate(18)` scores all 20 tokens → sigmoid → gated mean → BN(18) → `Linear(18,8) → SiLU → Tanh → Linear(8,3)`.
+Two pooled streams per window (D31):
 
-Token-set semantics: *what's here* (own embedding) + *what's around here at 3 scales* (Path A) + *what frame is this* (global tokens).
+- **Local stream** (per window): `{own 18-d embedding, own 3 Path-A vectors}` (4 × 18-d) → BN(18) → `CosineGate(18)` → sigmoid → gated mean → 18-d.
+- **Context stream** (once per frame): 16 global tokens → BN(18) → `CosineGate(18)` → sigmoid → gated mean → 18-d.
+
+Concat (36-d) → `Linear(36,8) → SiLU → Tanh → Linear(8,3)`.
+
+Token-set semantics: *what's here* (own embedding) + *what's around here at 3 scales* (Path A) + *what frame is this* (context stream). The streams are pooled separately because the 16 global tokens are identical for all 5,035 windows: pooled jointly (v6) they capped per-window evidence at 4/20 of the vector and the shared BN's variance was dominated by cross-image variation, collapsing the head into an image classifier (D31).
 
 **Cell averaging.** Window logits `(B,3,53,95)` → grouped `conv_transpose2d` with a 2×2 ones kernel → `(B,3,54,96)`, divided by a precomputed coverage-count map (1/2/4 at corners/edges/interior). Every 10×10 cell's logits are the average of the ≤4 windows covering it — a free 4-view ensemble, differentiable, so the training loss applies at cell level directly.
 
@@ -174,20 +187,21 @@ Token-set semantics: *what's here* (own embedding) + *what's around here at 3 sc
 | # | Block | Computation | Params |
 |---|---|---|---|
 | 1 | Dual quaternion | 4 + 4 | 8 |
-| 2 | Mixing rounds ×3 | 3 × (3·5 V + φ + σ) | 51 |
-| 3 | Round BNs ×3 | 3 × BN(5) | 30 |
-| 4 | Per-token MLP | 5·16+16 + 16·16+16 | 368 |
-| 5 | Encoder pool BN + gate | BN(16) + 3·16 + φ | 81 |
-| 6 | Path A kernels | 9 + 49 + 121 | 179 |
-| 7 | Path B BNs ×3 | 3 × BN2d(18) | 108 |
-| 8 | Path B scorers ×3 | 3 × (18·8+8 + 8·4+4 + 4+1) | 579 |
-| 9 | Path B expands ×3 | 3 × (18·256+256) | **14,592** |
-| 10 | Global mix | 3·256 U + φ + pad 2 | 771 |
-| 11 | Head gate + BN | 3·18 + φ + BN(18) | 91 |
-| 12 | Head classifier | 18·8+8 + 8·3+3 | 179 |
-| | **Total** | | **17,037** |
+| 2 | High-pass stem | depthwise 3×3×3, no bias | 27 |
+| 3 | Mixing rounds ×3 | 3 × (3·8 V + φ + σ) | 78 |
+| 4 | Round BNs ×3 | 3 × BN(8) | 48 |
+| 5 | Per-token MLP | 8·16+16 + 16·16+16 | 416 |
+| 6 | Encoder pool BN + gate | BN(16) + 3·16 + φ | 81 |
+| 7 | Path A kernels | 9 + 49 + 121 | 179 |
+| 8 | Path B BNs ×3 | 3 × BN2d(18) | 108 |
+| 9 | Path B scorers ×3 | 3 × (18·8+8 + 8·4+4 + 4+1) | 579 |
+| 10 | Path B expands ×3 | 3 × (18·256+256) | **14,592** |
+| 11 | Global mix | 3·256 U + φ + pad 2 | 771 |
+| 12 | Head gates + BNs ×2 streams | 2 × (3·18 + φ + BN(18)) | 182 |
+| 13 | Head classifier | 36·8+8 + 8·3+3 | 323 |
+| | **Total** | | **17,392** |
 
-86% of the model is row 9. Deliberately kept unshared across levels (capacity should live in how global evidence is shaped); sharing one expansion drops the model to ~7.3k if ever needed.
+84% of the model is row 10. Deliberately kept unshared across levels (capacity should live in how global evidence is shaped); sharing one expansion drops the model to ~7.3k if ever needed.
 
 ---
 
@@ -290,6 +304,10 @@ Every decision, its alternatives, and why. Numbered in rough pipeline-then-histo
 
 **D30 — MPS training specifics.** Gradient checkpointing on the encoder (recompute in backward; halve BN momentum to compensate for double stat updates); fp32 default (model is tiny; MPS fp16 autocast available behind a flag); `PYTORCH_ENABLE_MPS_FALLBACK=1` as safety net; batch 4 × grad-accum 4 default.
 
+**D31 — Head: split-stream pooling (v7 fix for 0.000 mannequin recall).** The v6 head gated-pooled all 20 tokens in one mean. The 16 global tokens are *identical for every window of a frame*, so per-window evidence (own embedding + 3 Path-A) could contribute at most 4/20 of the pooled vector, and the shared BN normalized against variance dominated by cross-image global-token variation. Measured failure: head logits constant per frame regardless of GT cell class (mean mannequin logit −0.75 on background, mannequin, and tent cells alike); 0/3,443 mannequin cells predicted while a linear probe on the same per-window features recovered signal. Fix: pool the 4-token local stream and the 16-token context stream separately (each BN → cosine gate → gated mean), classify from the 36-d concat. Per-window signal now owns half the classifier input unconditionally. Same op classes as v6 (BN folds, sigmoid gates) — Hailo-neutral; the context stream is computed once per frame, not per window.
+
+**D32 — High-pass texture stem (v7 fix for weak mannequin separability, risks 2/6).** Stage 1 tokens were single-pixel `(r,g,b,u,v)`; the only spatial op in the encoder was a Gaussian blur of gate scores, so nothing in the model could see edges or texture. Mannequins (13 px wide typical) differ from near-object clutter by shape/texture, not color — the pre-registered capacity bump (D12 upgrade, hidden 24) added width but no spatial features and did not recover recall; risk 6 named this ceiling. Fix: depthwise 3×3 zero-DC conv on the quat RGB (27 params) appends 3 local-contrast channels to every token, frozen through the rounds like (u,v). Placed on the full frame before windowing: windowed and 4-phase dense paths remain bit-identical, and the export graph gains exactly one standard conv (Hailo-native).
+
 ---
 
 ## 8. Known risks and pre-registered mitigations
@@ -368,6 +386,7 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 | v4 | 40×40 @ stride 20, full-res flash attention | (detour) — compute wash, coarser labels |
 | v5 | Back to 20×20 @ 10; **Hailo mapping**: attention → gated pooling (both sites), softmax → sigmoid, RMSNorm → BN, bounded cos for LUTs, Stage 3 → CPU, 4-phase plan | 30 FPS on Pi 5 + Hailo-8; op support > FLOPs |
 | v6 | **960×540** (dataset-derived target sizes); 16×16 global token split fix; final param/compute lock; 3-experiment plan with YOLO26n teacher | gen2 config measurements; implementation |
+| v7 | **Split-stream head** (local vs context pooled separately, D31); **high-pass texture stem** (depthwise 3×3, tokens 5→8, D32); 17,392 params | trained v6 hit 0.000 mannequin cell recall: head logits constant per frame (global-token dilution), linear-probe lift ×1.4 (no edge/texture features) — risks 2/6 triggered |
 
 ---
 

@@ -44,10 +44,12 @@ def run_device(model, device):
 
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
-    model = ANetV1(use_checkpoint=False)
-    n = sum(p.numel() for p in model.parameters())
-    print(f"ANetV1 params: {n:,}")
-    assert 15_000 < n < 19_000, "param count off spec (~17k, ARCHITECTURE.md §5)"
+    for stem in ("edge_dq", "highpass"):
+        m = ANetV1(use_checkpoint=False, stem=stem)
+        n = sum(p.numel() for p in m.parameters())
+        print(f"ANetV1 params ({stem}): {n:,}")
+        assert 15_000 < n < 19_000, "param count off spec (~17-18k, ARCHITECTURE.md §5)"
+    model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 
     model.train()

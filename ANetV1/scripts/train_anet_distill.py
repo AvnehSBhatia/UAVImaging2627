@@ -31,9 +31,10 @@ def main():
         raise FileNotFoundError(f"{teacher_dir} — run cache_teacher.py first")
 
     train_ds, val_ds = build_datasets(cfg, teacher_dir=teacher_dir)
-    model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden)
+    model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
+                   stem=cfg.train.stem)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"ANetV1-distill: {n_params:,} params (hidden={cfg.train.hidden}) | "
+    print(f"ANetV1-distill: {n_params:,} params (hidden={cfg.train.hidden}, stem={cfg.train.stem}) | "
           f"train {len(train_ds)} | val {len(val_ds)} | teacher {teacher_dir}")
     Trainer(model, train_ds, val_ds, cfg, distill=True).train()
 

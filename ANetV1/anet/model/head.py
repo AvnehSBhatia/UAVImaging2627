@@ -6,22 +6,32 @@ from .blocks import CosineGate, ManualBatchNorm
 
 
 class RegionHead(nn.Module):
-    """Per-window classifier over 20 tokens: 16 global + own embedding +
-    own 3 Path-A vectors (D14, D19). Cosine-gated pooling, no QK matmul."""
+    """Per-window classifier (D14, D19, D31). The window's own evidence (its
+    embedding + 3 Path-A vectors) and the 16 image-global tokens are pooled in
+    SEPARATE gated streams and concatenated: the 16 global tokens are identical
+    for every window of a frame, so pooling them together with the 4 per-window
+    tokens caps window-specific signal at 4/20 of the vector and the head
+    degenerates into an image classifier (measured: constant logits, 0.000
+    mannequin recall). Cosine-gated pooling, no QK matmul."""
 
     def __init__(self, dim=18, n_classes=3):
         super().__init__()
-        self.gate = CosineGate(dim)
-        self.bn = ManualBatchNorm(dim)
-        self.fc1 = nn.Linear(dim, 8)
+        self.local_bn = ManualBatchNorm(dim)
+        self.local_gate = CosineGate(dim)
+        self.ctx_bn = ManualBatchNorm(dim)
+        self.ctx_gate = CosineGate(dim)
+        self.fc1 = nn.Linear(2 * dim, 8)
         self.fc2 = nn.Linear(8, n_classes)
 
-    def forward(self, toks):  # (B, W, T, 18) -> (B, W, 3)
-        pooled = (self.gate(toks).unsqueeze(-1) * toks).mean(2)  # (B, W, 18)
-        b, w, c = pooled.shape
-        pooled = self.bn(pooled.reshape(-1, c)).reshape(b, w, c)
-        h = torch.tanh(F.silu(self.fc1(pooled)))  # 18 -> SiLU -> Tanh (D20)
+    def forward(self, ltoks, gtoks):  # (B,W,4,d), (B,16,d) -> (B,W,3)
+        b, w, t, c = ltoks.shape
+        ln = self.local_bn(ltoks.reshape(-1, c)).reshape(b, w, t, c)
+        loc = (self.local_gate(ln).unsqueeze(-1) * ln).mean(2)  # (B, W, d)
+        gn = self.ctx_bn(gtoks.reshape(-1, c)).reshape(gtoks.shape)
+        ctx = (self.ctx_gate(gn).unsqueeze(-1) * gn).mean(1)  # (B, d)
+        h = torch.cat([loc, ctx.unsqueeze(1).expand(-1, w, -1)], -1)
+        h = torch.tanh(F.silu(self.fc1(h)))  # SiLU -> Tanh (D20)
         return self.fc2(h)
 
     def reg_l2(self):
-        return self.gate.reg_l2()
+        return self.local_gate.reg_l2() + self.ctx_gate.reg_l2()

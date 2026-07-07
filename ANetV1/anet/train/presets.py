@@ -28,7 +28,8 @@ def anet_cfg(**overrides):
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
-        hidden=16,                    # 16 = 17,037-param spec; 24 = capacity bump (ARCH §8.2)
+        hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
+        stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
         use_checkpoint=not IS_CUDA,   # Mac: memory valve; CUDA: pure waste
         amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
         samples_per_epoch=None if IS_CUDA else 6000,

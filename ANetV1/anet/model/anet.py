@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from .blocks import DualQuaternionRGB
+from .blocks import DualQuaternionRGB, EdgeDQStem
 from .encoder import WindowEncoder
 from .globalmix import GlobalCosineMix
 from .head import RegionHead
@@ -26,20 +26,41 @@ class ANetV1(nn.Module):
     WIN, STRIDE = 20, 10
     PHASES = ((0, 0), (0, 10), (10, 0), (10, 10))
 
-    def __init__(self, use_checkpoint=True, dense=True, hidden=16):
+    def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass"):
         super().__init__()
         self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
         self.nw = (self.IMG_W - self.WIN) // self.STRIDE + 1  # 95
         self.n_win = self.nh * self.nw  # 5035
         self.use_checkpoint = use_checkpoint
         self.dense = dense
+        self.stem = stem
 
         # hidden=16 is the 17k spec model; hidden=24 is the pre-registered
         # capacity mitigation (ARCHITECTURE §8 risk 2, ~24k params with the
         # Path-B ripple). d = embedding + global (x,y) coords, 18 at spec.
         d = hidden + 2
-        self.quat = DualQuaternionRGB()
-        self.encoder = WindowEncoder(hidden)
+        # Pixel-token feature stem: gives Stage 1 the edge/texture evidence colour
+        # alone can't provide (probe: mannequin signal is in the pixels, not the
+        # embeddings). Runs on the full frame BEFORE windowing so windowed/dense
+        # paths stay bit-identical and the export graph gains only plain convs.
+        #   highpass (D32): quat-RGB + isotropic 3x3 high-pass -> 6 feat channels
+        #   edge_dq  (D33): oriented dual-quaternion edge front-end -> 9 feat channels
+        # Both keep the 3 colour channels first, so the encoder's colour-only
+        # residual update (MixRound `:3`) and frozen-evidence channels are unchanged.
+        if stem == "edge_dq":
+            self.stem_mod = EdgeDQStem()
+            self.feat = EdgeDQStem.out_channels  # 9
+        elif stem == "highpass":
+            self.quat = DualQuaternionRGB()
+            self.grad = nn.Conv2d(3, 3, 3, padding=1, groups=3, bias=False)
+            with torch.no_grad():
+                self.grad.weight.fill_(-1.0 / 9.0)
+                self.grad.weight[:, :, 1, 1] += 1.0
+            self.feat = 6
+        else:
+            raise ValueError(f"unknown stem {stem!r} (highpass|edge_dq)")
+        self.in_dim = self.feat + 2  # + (u,v) window-relative coords
+        self.encoder = WindowEncoder(hidden, in_dim=self.in_dim)
         self.pools = nn.ModuleList([ScalarKernelPool(d, k) for k in (3, 7, 11)])
         self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
         self.mix = GlobalCosineMix(pad_to=d)
@@ -73,20 +94,35 @@ class ANetV1(nn.Module):
         self.register_buffer("cell_counts", F.conv_transpose2d(ones, torch.ones(1, 1, 2, 2)))
         self.register_buffer("cell_kernel", torch.ones(3, 1, 2, 2))
 
+    @classmethod
+    def from_state_dict(cls, sd, **kwargs):
+        """Rebuild a model with hidden/stem inferred from checkpoint shapes."""
+        hidden = sd["encoder.mlp.0.weight"].shape[0]
+        stem = "edge_dq" if any(k.startswith("stem_mod.") for k in sd) else "highpass"
+        model = cls(hidden=hidden, stem=stem, **kwargs)
+        model.load_state_dict(sd)
+        return model
+
     def _ckpt(self, fn, *args):
         if self.use_checkpoint and self.training:
             return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)
         return fn(*args)
 
-    def _map_dense(self, rgb):  # (B,3,540,960) -> (B,16,53,95)
-        b = rgb.shape[0]
+    def _features(self, img):  # (B,3,540,960) -> (B,feat,540,960)
+        if self.stem == "edge_dq":
+            return self.stem_mod(img)
+        rgb = self.quat(img)
+        return torch.cat([rgb, self.grad(rgb)], 1)
+
+    def _map_dense(self, feat):  # (B,feat,540,960) -> (B,hidden,53,95)
+        b = feat.shape[0]
         out = None
         for oy, ox in self.PHASES:
             hp = ((self.IMG_H - oy) // self.WIN) * self.WIN
             wp = ((self.IMG_W - ox) // self.WIN) * self.WIN
             x = torch.cat(
                 [
-                    rgb[:, :, oy : oy + hp, ox : ox + wp],
+                    feat[:, :, oy : oy + hp, ox : ox + wp],
                     self.uv_tile[:, :, :hp, :wp].expand(b, -1, -1, -1),
                 ],
                 1,
@@ -97,18 +133,18 @@ class ANetV1(nn.Module):
             out[:, :, oy // self.STRIDE :: 2, ox // self.STRIDE :: 2] = e
         return out
 
-    def _map_windowed(self, rgb):  # reference path
-        b = rgb.shape[0]
-        win = F.unfold(rgb, self.WIN, stride=self.STRIDE)  # (B, 3*400, 5035)
-        win = win.reshape(b, 3, self.WIN * self.WIN, self.n_win).permute(0, 3, 2, 1)
+    def _map_windowed(self, feat):  # reference path
+        b = feat.shape[0]
+        win = F.unfold(feat, self.WIN, stride=self.STRIDE)  # (B, feat*400, 5035)
+        win = win.reshape(b, self.feat, self.WIN * self.WIN, self.n_win).permute(0, 3, 2, 1)
         x = torch.cat([win, self.uv.expand(b, self.n_win, -1, -1)], -1)
-        emb = self._ckpt(self.encoder, x.reshape(-1, self.WIN * self.WIN, 5))
+        emb = self._ckpt(self.encoder, x.reshape(-1, self.WIN * self.WIN, self.in_dim))
         return emb.reshape(b, self.n_win, -1).permute(0, 2, 1).reshape(b, -1, self.nh, self.nw)
 
     def forward(self, img):
         b = img.shape[0]
-        rgb = self.quat(img)
-        m16 = self._map_dense(rgb) if self.dense else self._map_windowed(rgb)
+        feat = self._features(img)
+        m16 = self._map_dense(feat) if self.dense else self._map_windowed(feat)
         m = torch.cat([m16, self.xy_map.expand(b, -1, -1, -1)], 1)  # (B,18,53,95)
 
         maps = [p(m) for p in self.pools]  # Path A, full res (D14)
@@ -118,11 +154,9 @@ class ANetV1(nn.Module):
         emb = m.flatten(2).permute(0, 2, 1)  # (B, W, 18)
         own = emb.unsqueeze(2)  # (B, W, 1, 18)
         local = torch.stack([mp.flatten(2).permute(0, 2, 1) for mp in maps], 2)  # (B,W,3,18)
-        toks = torch.cat(
-            [gtoks.unsqueeze(1).expand(-1, self.n_win, -1, -1), own, local], 2
-        )  # (B, W, 20, 18)
+        ltoks = torch.cat([own, local], 2)  # (B, W, 4, 18) — per-window stream (D31)
 
-        wlogits = self.head(toks).permute(0, 2, 1).reshape(b, 3, self.nh, self.nw)
+        wlogits = self.head(ltoks, gtoks).permute(0, 2, 1).reshape(b, 3, self.nh, self.nw)
         cells = F.conv_transpose2d(wlogits, self.cell_kernel, groups=3)
         return cells / self.cell_counts  # (B, 3, 54, 96)
 

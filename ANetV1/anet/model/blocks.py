@@ -93,6 +93,49 @@ def bounded_cos_score(s1, s2, s3, phi):
     return s1 * torch.cos(math.pi * torch.tanh(s2 * s3) + phi)
 
 
+def sobel7(orient):
+    """7x7 separable Sobel/Scharr edge kernel. 'v' -> d/dx (fires on vertical
+    edges), 'h' -> d/dy (horizontal edges). Used to init the oriented edge convs
+    (learnable from there)."""
+    smooth = torch.tensor([1.0, 4.0, 8.0, 10.0, 8.0, 4.0, 1.0])
+    smooth = smooth / smooth.sum()
+    deriv = torch.tensor([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]) / 6.0
+    return torch.outer(smooth, deriv) if orient == "v" else torch.outer(deriv, smooth)
+
+
+class EdgeDQStem(nn.Module):
+    """Oriented-edge dual-quaternion front-end (D33). Injects the texture/edge
+    evidence a colour-only encoder lacks — the probe showed mannequin signal is
+    in the 540p pixels but not in the embeddings.
+
+    Triplicate the frame; leave one copy raw; send the other two through a
+    learned dual-quaternion colour rotation then a 7x7 oriented edge operator
+    (one vertical, one horizontal); stack -> 9ch; apply 'one more learned DQ'
+    per stacked image (a quaternion rotates a 3-vector, so the 9ch stack takes
+    three block-diagonal DQs — keeps the colour/edge grouping clean so the
+    encoder still updates only the 3 colour channels and reads edges as frozen
+    evidence). Every op is a dense conv that bakes to a constant at export ->
+    Hailo-legal (D5-style), ~+200M MACs of the NPU's favourite op class."""
+
+    out_channels = 9
+
+    def __init__(self):
+        super().__init__()
+        self.dq_v = DualQuaternionRGB()  # learned colour frame before each edge op
+        self.dq_h = DualQuaternionRGB()
+        self.edge_v = nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False)
+        self.edge_h = nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False)
+        with torch.no_grad():
+            self.edge_v.weight.copy_(sobel7("v").reshape(1, 1, 7, 7).expand(3, 1, 7, 7))
+            self.edge_h.weight.copy_(sobel7("h").reshape(1, 1, 7, 7).expand(3, 1, 7, 7))
+        # "one more learned DQ" after stacking, per stacked image (block-diagonal)
+        self.dq_out = nn.ModuleList([DualQuaternionRGB() for _ in range(3)])
+
+    def forward(self, img):  # (B,3,H,W) -> (B,9,H,W): [colour, vert-edge, horiz-edge]
+        groups = (img, self.edge_v(self.dq_v(img)), self.edge_h(self.dq_h(img)))
+        return torch.cat([dq(g) for dq, g in zip(self.dq_out, groups)], 1)
+
+
 class CosineGate(nn.Module):
     """3 shared dots -> s1*cos(pi*tanh(s2*s3)+phi) -> sigmoid token weights (D10)."""
 
