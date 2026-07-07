@@ -14,10 +14,12 @@ data:
 
 train:
   epochs: 30
-  # batch 64: activations ~1.2-1.5GB/img under bf16 autograd -> ~80-95GB of 192GB
-  # (comfortable headroom for MIOpen workspaces). 300 steps/epoch, 9k steps total.
-  batch_size: 64
-  accum_steps: 1
+  # Activations scale with batch x hidden width (params are irrelevant):
+  # hidden 16 @ b64 ~= 80-95GB, hidden 24 @ b64 ~= 120-145GB -> allocator GC
+  # thrash = "slow + eats all RAM". batch 32 x accum 2 keeps the effective
+  # batch at 64 (same optimizer trajectory, same lr) at half the activations.
+  batch_size: 32
+  accum_steps: 2
   use_checkpoint: false          # recompute is pure waste with 192GB HBM
   # hidden: 24                   # UNCOMMENT if synthetic mannequin recall is still
   #                              # 0 at epoch ~10: pre-registered capacity bump
@@ -36,7 +38,9 @@ train:
   class_alpha: [1.0, 8.0, 4.0]   # [background, mannequin, tent]
   l2_score_reg: 1.0e-4           # cosine-frequency bound (D24)
   l1_kernel_reg: 1.0e-4          # sparse pyramid kernels (D24)
-  num_workers: 16                # ~50ms/img JPEG decode; 16 workers ≈ 320 img/s feed
+  # 8 is plenty (decode >> step time at b32) and halves pinned host RAM:
+  # workers x prefetch(2) x batch x 6MB/img stays ~3GB instead of ~12GB
+  num_workers: 8
   checkpoint_dir: runs/anet
 
 distill:
