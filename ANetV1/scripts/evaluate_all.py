@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from anet import ANetV1  # noqa: E402
-from anet.config import load_config  # noqa: E402
+from anet.train.presets import anet_cfg  # noqa: E402
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.data.rasterize import boxes_to_grid, transform_boxes  # noqa: E402
 from anet.train.metrics import CellConfusion, ObjectMetrics  # noqa: E402
@@ -120,7 +120,6 @@ def eval_yolo(weights, ds, cfg, conf=0.25):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=str(Path(__file__).parents[1] / "configs/anet.yaml"))
     ap.add_argument("--yolo", help="trained YOLO weights .pt")
     ap.add_argument("--anet", help="ANetV1 checkpoint (runs/anet/best.pt)")
     ap.add_argument("--anet-distill", help="distilled checkpoint (runs/anet_distill/best.pt)")
@@ -128,7 +127,7 @@ def main():
                     help="also measure b1 latency and throughput per model")
     ap.add_argument("--out", default="runs/comparison.json")
     args = ap.parse_args()
-    cfg = load_config(args.config)
+    cfg = anet_cfg()
 
     ds = SUASCells(cfg.data.root, "test", coverage_thresh=cfg.data.coverage_thresh)
     device = pick_device()

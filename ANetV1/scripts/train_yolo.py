@@ -1,6 +1,9 @@
-"""Experiment 1: YOLO26n baseline (falls back to YOLO11n) on the SUAS dataset."""
+"""Experiment 1: YOLO26n baseline (falls back to YOLO11n).
 
-import argparse
+No yaml, no flags — edit SETTINGS below and run:
+    python scripts/train_yolo.py
+"""
+
 import gc
 import os
 import sys
@@ -25,8 +28,23 @@ os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", _alloc)
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from anet.config import load_config  # noqa: E402
+from anet.train.presets import IS_CUDA, anet_cfg  # noqa: E402
 from anet.train.trainer import yolo_device  # noqa: E402
+
+# --------------------------------------------------------------------------
+# EDIT HERE
+# --------------------------------------------------------------------------
+SETTINGS = dict(
+    weights="yolo26n.pt",        # falls back to yolo11n.pt if unavailable
+    imgsz=960,                   # spec comparison point (ARCHITECTURE §10)
+    epochs=60,
+    patience=10,                 # ultralytics native early stop on fitness
+    batch=64 if IS_CUDA else 16,  # 64 == ultralytics nominal batch (nbs)
+    workers=8 if IS_CUDA else 0,  # 0 on MPS: ultralytics worker RAM leak (#22791)
+    amp=IS_CUDA,                 # CUDA amp is well-trodden; MPS autocast is flaky
+    project="runs/yolo",
+)
+DATA_ROOT = anet_cfg().data.root  # env DATA_ROOT or <repo>/datasets/suas-synth-50k
 
 _LOG_EVERY = 50
 _batch_count = 0
@@ -79,17 +97,12 @@ def _cuda_epoch_reclaim(trainer):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=str(Path(__file__).parents[1] / "configs/anet.yaml"))
-    args = ap.parse_args()
-    cfg = load_config(args.config)
-
     from ultralytics import YOLO
 
     try:
-        model = YOLO(cfg.yolo.weights)
+        model = YOLO(SETTINGS["weights"])
     except Exception as e:  # yolo26n not in this ultralytics version yet
-        print(f"{cfg.yolo.weights} unavailable ({e}); falling back to yolo11n.pt")
+        print(f"{SETTINGS['weights']} unavailable ({e}); falling back to yolo11n.pt")
         model = YOLO("yolo11n.pt")
 
     device = yolo_device()
@@ -100,22 +113,22 @@ def main():
         model.add_callback("on_fit_epoch_end", _cuda_epoch_reclaim)
 
     anet_root = Path(__file__).resolve().parents[1]
-    project = anet_root / cfg.yolo.project
+    project = anet_root / SETTINGS["project"]
     project.mkdir(parents=True, exist_ok=True)
 
     model.train(
-        data=str(Path(cfg.data.root) / "data.yaml"),
-        imgsz=cfg.yolo.imgsz,
-        epochs=cfg.yolo.epochs,
-        patience=getattr(cfg.yolo, "patience", 100),  # ultralytics native early stop
-        batch=cfg.yolo.batch,
+        data=str(Path(DATA_ROOT) / "data.yaml"),  # ultralytics' own format, not ours
+        imgsz=SETTINGS["imgsz"],
+        epochs=SETTINGS["epochs"],
+        patience=SETTINGS["patience"],
+        batch=SETTINGS["batch"],
         device=device,
         project=str(project),
         name="baseline",
         exist_ok=True,  # resume-safe: never silently forks baseline2/
         cache=False,
-        workers=cfg.yolo.workers,
-        amp=cfg.yolo.amp,
+        workers=SETTINGS["workers"],
+        amp=SETTINGS["amp"],
     )
 
 

@@ -1,7 +1,7 @@
 """Why is a class at zero recall? Loads a checkpoint, runs synthetic val, and
 reports per-class logit statistics, prediction counts, and near-miss analysis.
 
-  python scripts/diagnose.py --ckpt runs/anet/last.pt [--config configs/anet_mi300x.yaml] [--n 200]
+  python scripts/diagnose.py --ckpt runs/anet/last.pt [--n 200]
 """
 
 import argparse
@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Subset
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from anet import ANetV1  # noqa: E402
-from anet.config import load_config  # noqa: E402
+from anet.train.presets import anet_cfg  # noqa: E402
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.train.trainer import pick_device  # noqa: E402
 
@@ -25,10 +25,9 @@ CLS = ("background", "mannequin", "tent")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config", default=str(Path(__file__).parents[1] / "configs/anet_mi300x.yaml"))
     ap.add_argument("--n", type=int, default=200, help="synthetic val images to scan")
     args = ap.parse_args()
-    cfg = load_config(args.config)
+    cfg = anet_cfg()
     device = pick_device()
 
     sd = torch.load(args.ckpt, map_location=device)

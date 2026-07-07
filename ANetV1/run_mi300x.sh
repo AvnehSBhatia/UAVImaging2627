@@ -29,7 +29,6 @@ REPO_ROOT="$(dirname "$ANET_DIR")"
 
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/datasets/suas-synth-50k}"
 DATA_SRC="${DATA_SRC:-}"
-CONFIG="$ANET_DIR/configs/anet_mi300x.yaml"
 YOLO_BEST="$ANET_DIR/runs/yolo/baseline/weights/best.pt"
 STAGE_DIR="$ANET_DIR/runs/.stages"
 LOG_DIR="$ANET_DIR/logs"
@@ -101,18 +100,18 @@ EOF
 # --------------------------------------------------------------- stages ------
 run_smoke()   { "$PY" scripts/smoke_test.py; }
 
-run_yolo()    { "$PY" scripts/train_yolo.py --config "$CONFIG"; }
+run_yolo()    { "$PY" scripts/train_yolo.py; }
 
 check_yolo()  { [[ -f "$YOLO_BEST" ]] || die "expected $YOLO_BEST after YOLO training"; }
 
-run_anet()    { "$PY" scripts/train_anet.py --config "$CONFIG"; }
+run_anet()    { "$PY" scripts/train_anet.py; }
 
-run_teacher() { "$PY" scripts/cache_teacher.py --config "$CONFIG" \
+run_teacher() { "$PY" scripts/cache_teacher.py \
                     --weights "$YOLO_BEST" --splits train val; }
 
-run_distill() { "$PY" scripts/train_anet_distill.py --config "$CONFIG"; }
+run_distill() { "$PY" scripts/train_anet_distill.py; }
 
-run_eval()    { "$PY" scripts/evaluate_all.py --config "$CONFIG" \
+run_eval()    { "$PY" scripts/evaluate_all.py \
                     --yolo "$YOLO_BEST" \
                     --anet runs/anet/best.pt \
                     --anet-distill runs/anet_distill/best.pt \

@@ -6,8 +6,6 @@
 #
 # Env:
 #   DATA_ROOT   dataset root (default: <repo>/datasets/suas-synth-50k)
-#   PARALLEL=1  use batch-32 config safe alongside YOLO (default: 1)
-#   PARALLEL=0  use full batch-64 anet_mi300x.yaml (YOLO should be finished)
 #   FORCE=1     rerun even if runs/.stages/anet.done exists
 set -euo pipefail
 
@@ -16,7 +14,6 @@ ANET_DIR="$(pwd)"
 REPO_ROOT="$(dirname "$ANET_DIR")"
 
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/datasets/suas-synth-50k}"
-PARALLEL="${PARALLEL:-1}"
 STAGE_DIR="$ANET_DIR/runs/.stages"
 LOG_DIR="$ANET_DIR/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
@@ -36,21 +33,15 @@ else
     PY="${PYTHON:-python3}"
 fi
 
-if [[ "$PARALLEL" == "1" ]]; then
-    CONFIG="$ANET_DIR/configs/anet_mi300x_parallel.yaml"
-else
-    CONFIG="$ANET_DIR/configs/anet_mi300x.yaml"
-fi
-
+# settings live IN scripts/train_anet.py now (no yaml) — edit that file to tune
 MARKER="$STAGE_DIR/anet.done"
 if [[ -f "$MARKER" && "${FORCE:-0}" != 1 ]]; then
     echo "anet stage already done (rm $MARKER or FORCE=1 to redo)"
     exit 0
 fi
 
-printf '\n== ANetV1 MI300X | data=%s | parallel=%s | python=%s ==\n' \
-    "$DATA_ROOT" "$PARALLEL" "$PY"
+printf '\n== ANetV1 MI300X | data=%s | python=%s ==\n' "$DATA_ROOT" "$PY"
 
-"$PY" scripts/train_anet.py --config "$CONFIG" 2>&1 | tee "$LOG_DIR/anet.log"
+"$PY" scripts/train_anet.py 2>&1 | tee "$LOG_DIR/anet.log"
 touch "$MARKER"
 echo "done -> $ANET_DIR/runs/anet/best.pt"
