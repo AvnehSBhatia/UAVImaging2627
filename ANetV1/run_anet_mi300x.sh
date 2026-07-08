@@ -46,12 +46,17 @@ else
     PY="${PYTHON:-python3}"
 fi
 
-# settings live IN scripts/train_anet.py now (no yaml) — edit that file to tune
-MARKER="$STAGE_DIR/anet.done"
-if [[ -f "$MARKER" && "${FORCE:-0}" != 1 ]]; then
-    echo "anet stage already done (rm $MARKER or FORCE=1 to redo)"
-    exit 0
+# settings live IN scripts/train_anet.py now (no yaml) — edit that file to tune.
+# No stage-marker gate here: running this script MEANS "train ANet now".
+# Only guard: never start a second trainer on top of a live one.
+if pgrep -f "train_anet.py" > /dev/null 2>&1; then
+    echo "a train_anet.py is ALREADY RUNNING:"
+    pgrep -af "train_anet.py"
+    echo "watch it:  tail -f logs/anet_run.out   (or logs/anet.log)"
+    echo "kill it:   pkill -f train_anet.py      then rerun this script"
+    exit 1
 fi
+MARKER="$STAGE_DIR/anet.done"
 
 printf '\n== ANetV1 MI300X | data=%s | python=%s ==\n' "$DATA_ROOT" "$PY"
 
