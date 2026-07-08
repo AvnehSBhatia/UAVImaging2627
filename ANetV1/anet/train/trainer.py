@@ -66,12 +66,17 @@ class Trainer:
         frac = getattr(cfg.train, "mps_memory_frac", None)
         if frac and self.device.type == "mps":
             torch.mps.set_per_process_memory_fraction(float(frac))
-        # benchmark=True on ROCm forces an exhaustive MIOpen search per unique
-        # conv shape — measured ~27 min of "hang" in epoch 0 for zero steady-state
-        # gain (tiny launch-bound convs). MIOPEN_FIND_MODE=FAST does the right
-        # thing instead. Opt back in via cudnn_benchmark: true (NVIDIA, fat convs).
-        if self.device.type == "cuda" and getattr(cfg.train, "cudnn_benchmark", False):
-            torch.backends.cudnn.benchmark = True
+        if self.device.type == "cuda":
+            # TF32 for the fp32 GEMMs that stay outside autocast (ManualBatchNorm
+            # runs fp32 on purpose) — free speed on Ampere+/CDNA3
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # benchmark=True on ROCm forces an exhaustive MIOpen search per unique
+            # conv shape — measured ~27 min of "hang" in epoch 0 for zero steady-
+            # state gain (tiny launch-bound convs). MIOPEN_FIND_MODE=FAST does the
+            # right thing instead. Preset default: True on NVIDIA, False on HIP.
+            if getattr(cfg.train, "cudnn_benchmark", False):
+                torch.backends.cudnn.benchmark = True
 
         # amp: "fp16" | "bf16" | none — MPS/CUDA only (D30).
         # fp16 measured NaN on this model at batch 8; leave off unless re-validated.
@@ -80,19 +85,40 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(
             self.device.type, enabled=self.amp_dtype is torch.float16
         )
+        # self.model stays the RAW module (clean state_dicts, eager eval paths);
+        # compiled entry points wrap it instead:
+        #   _loss_fn   — the whole train-step math (normalize + forward + loss +
+        #                reg) in ONE compiled region, so fwd AND bwd replay as
+        #                CUDA/HIP graphs and the loss tail (dozens of tiny-tensor
+        #                kernels) stops paying per-op launch overhead
+        #   model_eval — forward-only compiled wrapper for the val loop
+        self._loss_fn = self._loss_tensors
+        self.model_eval = self.model
         if getattr(cfg.train, "compile", False):
             # the model is launch-bound (thousands of tiny kernels at ~1% util);
             # reduce-overhead captures HIP/CUDA graphs to collapse the launch storm.
             # compiles lazily on first step, so failures surface there — set
             # compile:false to fall back to eager. First step is slow (autotune).
+            # dynamic=False: train shapes are static (drop_last=True) and static
+            # shapes are what lets cudagraph capture stick.
             mode = getattr(cfg.train, "compile_mode", "reduce-overhead")
-            self.model = torch.compile(self.model, mode=mode)
+            self._loss_fn = torch.compile(self._loss_tensors, mode=mode, dynamic=False)
+            self.model_eval = torch.compile(self.model, mode=mode)
             print(f"torch.compile ON (mode={mode}) — first step compiles, then fast",
                   flush=True)
 
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0
-        )
+        # fused AdamW: one multi-tensor kernel per step instead of ~6 tiny
+        # launches per parameter tensor — real money on a launch-bound model
+        try:
+            self.opt = torch.optim.AdamW(
+                self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0,
+                fused=self.device.type == "cuda",
+            )
+        except RuntimeError:  # fused unsupported on this build — foreach fallback
+            self.opt = torch.optim.AdamW(
+                self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0,
+                foreach=True,
+            )
         steps = cfg.train.epochs * (len(self.train_loader) // cfg.train.accum_steps)
         warmup = getattr(cfg.train, "warmup_steps", 0) or 0
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -116,13 +142,23 @@ class Trainer:
         return torch.autocast(self.device.type, self.amp_dtype,
                               enabled=self.amp_dtype is not None)
 
-    def _reg_losses(self):
-        m = getattr(self.model, "_orig_mod", self.model)
-        return m.reg_losses()
+    @staticmethod
+    def _prep_img(img):
+        # uint8 loader path (cfg.data.uint8): normalize on-GPU. Inside the
+        # compiled region this fuses straight into the stem's first ops.
+        if img.dtype == torch.uint8:
+            img = img.float() / 255.0
+        return img
 
     def _loss(self, batch):
-        cells = self.model(batch["image"].to(self.device, non_blocking=True))
+        img = batch["image"].to(self.device, non_blocking=True)
         grid = batch["grid"].to(self.device, non_blocking=True)
+        teacher = (batch["teacher"].to(self.device, non_blocking=True)
+                   if self.distill else None)
+        return self._loss_fn(img, grid, teacher)
+
+    def _loss_tensors(self, img, grid, teacher=None):
+        cells = self.model(self._prep_img(img))
         c = self.cfg.train
         ta = getattr(c, "tversky_alpha", 0.7)
         tb = getattr(c, "tversky_beta", 0.3)
@@ -142,19 +178,22 @@ class Trainer:
             if tw:
                 hard = hard + tw * tversky_loss(cells, grid, alpha=ta, beta=tb)
         loss = hard
-        if self.distill:
+        if teacher is not None:
             loss = (1.0 - self.cfg.distill.kl_weight) * hard + \
                 self.cfg.distill.kl_weight * distill_kl(
-                    cells, batch["teacher"].to(self.device),
-                    temperature=self.cfg.distill.temperature,
+                    cells, teacher, temperature=self.cfg.distill.temperature,
                 )
-        l2, l1 = self._reg_losses()
+        l2, l1 = self.model.reg_losses()
         return loss + self.cfg.train.l2_score_reg * l2 + self.cfg.train.l1_kernel_reg * l1
 
     def train(self):
         accum = self.cfg.train.accum_steps
         patience = getattr(self.cfg.train, "early_stop_patience", 0) or 0
         clip = getattr(self.cfg.train, "grad_clip", 0.0) or 0.0
+        # loss.item() every step is a full device sync — it stops the CPU from
+        # queueing ahead, which on a launch-bound model IS the throughput.
+        # check>1: accumulate the loss on-GPU, sync + NaN-check once per window.
+        check = max(int(getattr(self.cfg.train, "nan_check_every", 1) or 1), 1)
         stale, nan_streak = 0, 0
         n_batches = len(self.train_loader)
         log_path = self.out_dir / "log.csv"
@@ -171,6 +210,8 @@ class Trainer:
         for epoch in range(self.cfg.train.epochs):
             self.model.train()
             t0, running, n = time.time(), 0.0, 0
+            loss_win = torch.zeros((), device=self.device)  # on-GPU window sum
+            win_n = 0
             self.opt.zero_grad()
             if epoch == 0 and self.cfg.train.num_workers > 0:
                 print(f"epoch 0: spawning {self.cfg.train.num_workers} dataloader "
@@ -181,26 +222,38 @@ class Trainer:
                 with self._autocast():
                     loss = self._loss(batch) / accum
                 self.scaler.scale(loss).backward()
-                lv = loss.item() * accum
-                if step == 0:
-                    note = (" (MIOpen autotune, ~1-2 min first CUDA ops)"
-                            if epoch == 0 and self.device.type == "cuda" else "")
-                    print(f"epoch {epoch}: first step loss={lv:.4f}{note}", flush=True)
-                if not math.isfinite(lv):
-                    # drop the poisoned accumulation window; a persistent NaN
-                    # means diverged weights — die fast, don't train garbage
-                    nan_streak += 1
-                    self.opt.zero_grad()
-                    if nan_streak == 1 or nan_streak % 10 == 0:
-                        print(f"epoch {epoch} step {step}: non-finite loss "
-                              f"(streak {nan_streak}) — skipping step", flush=True)
-                    if nan_streak >= 25:
-                        raise RuntimeError(
-                            "non-finite loss for 25 consecutive steps — model has "
-                            "diverged; lower lr / check amp before rerunning")
-                    continue
-                nan_streak = 0
-                running, n = running + lv, n + 1
+                # consume the loss buffer NOW (cudagraph outputs are overwritten
+                # by the next replay) — but without a sync
+                loss_win += loss.detach()
+                win_n += 1
+                if step == 0 or win_n >= check or step + 1 == n_batches:
+                    wsum = loss_win.item() * accum  # the ONE sync per window
+                    loss_win.zero_()
+                    if step == 0:
+                        note = ((" (compile + MIOpen/cuDNN autotune — first "
+                                 "steps take minutes)")
+                                if epoch == 0 and self.device.type == "cuda" else "")
+                        print(f"epoch {epoch}: first step loss={wsum:.4f}{note}",
+                              flush=True)
+                    if not math.isfinite(wsum):
+                        # drop the pending accumulation window. With check>1 the
+                        # window's earlier optimizer steps already ran, so a NaN
+                        # is caught up to `check` steps late — real divergence
+                        # keeps producing NaN windows and dies fast below.
+                        nan_streak += 1
+                        win_n = 0
+                        self.opt.zero_grad()
+                        if nan_streak == 1 or nan_streak % 10 == 0:
+                            print(f"epoch {epoch} step {step}: non-finite loss "
+                                  f"(streak {nan_streak}) — skipping step", flush=True)
+                        if nan_streak * check >= 25:
+                            raise RuntimeError(
+                                "non-finite loss for >=25 consecutive steps — model "
+                                "has diverged; lower lr / check amp before rerunning")
+                        continue
+                    nan_streak = 0
+                    running, n = running + wsum, n + win_n
+                    win_n = 0
                 if step > 0 and (step + 1) % 100 == 0:
                     print(f"epoch {epoch}: {step + 1}/{n_batches} steps", flush=True)
                 if (step + 1) % accum == 0:
@@ -258,8 +311,9 @@ class Trainer:
         cells_m, obj_m = CellConfusion(), ObjectMetrics()
         thresh = getattr(self.cfg.train, "conf_thresh", 0.0) or 0.0
         for batch in loader:
+            img = self._prep_img(batch["image"].to(self.device, non_blocking=True))
             with self._autocast():
-                logits = self.model(batch["image"].to(self.device, non_blocking=True))
+                logits = self.model_eval(img)
             pred = confident_pred(logits.float(), thresh).cpu().numpy()
             target = batch["grid"].numpy()
             cells_m.update(pred, target)

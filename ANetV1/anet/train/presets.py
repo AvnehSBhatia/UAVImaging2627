@@ -17,6 +17,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 IS_CUDA = torch.cuda.is_available()
+IS_ROCM = torch.version.hip is not None  # MI300X presents as cuda but is MIOpen
 
 
 def anet_cfg(**overrides):
@@ -35,6 +36,17 @@ def anet_cfg(**overrides):
         # few-x faster epochs. Set False if inductor errors on the ROCm build.
         compile=IS_CUDA,
         compile_mode="reduce-overhead",
+        # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
+        # shapes here are static) but forces an exhaustive ~27-min MIOpen search
+        # on ROCm for zero gain (see trainer.py) — so: on for CUDA, off for HIP.
+        cudnn_benchmark=IS_CUDA and not IS_ROCM,
+        # every loss.item() is a full GPU sync that stops the CPU from queueing
+        # the next steps (the model is launch-bound, so runahead IS the speedup).
+        # >1 = accumulate the loss on-GPU and sync/NaN-check every N steps.
+        # Tradeoff: a NaN inside a window is only caught at the window edge, after
+        # its optimizer steps already ran — divergence still dies fast (streak
+        # logic), but transient NaNs are no longer skipped. 1 = old exact behavior.
+        nan_check_every=16 if IS_CUDA else 1,
         hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
         stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
         use_checkpoint=not IS_CUDA,   # Mac: memory valve; CUDA: pure waste
@@ -68,7 +80,10 @@ def anet_cfg(**overrides):
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
-        num_workers=8 if IS_CUDA else 2,
+        # decode+letterbox of 1920x1080 JPEGs is the per-item cost; with uint8
+        # images the workers do no fp32 math, so 16 keeps a 32-batch GPU fed
+        num_workers=min(16, os.cpu_count() or 8) if IS_CUDA else 2,
+        prefetch_factor=4 if IS_CUDA else 2,
         checkpoint_dir="runs/anet",
     )
     data = dict(
@@ -76,6 +91,10 @@ def anet_cfg(**overrides):
         coverage_thresh=0.3,
         # VisDrone downweighting (no-ops if vd_* files were stashed out)
         vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0,
+        # ship uint8 frames from the loader, normalize on-GPU (trainer): 4x less
+        # H2D + pin_memory traffic. Only the Trainer handles this; eval scripts
+        # build their own SUASCells without it and still get floats.
+        uint8=IS_CUDA,
     )
     distill = dict(teacher_cache="runs/teacher_cache", kl_weight=0.7, temperature=2.0)
     yolo = dict(weights="yolo26n.pt", imgsz=960)  # shared by teacher cache + eval

@@ -36,6 +36,7 @@ def build_datasets(cfg, teacher_dir=None):
         vd_weight=cfg.data.vd_weight,
         mannequin_weight=cfg.data.mannequin_weight,
         tent_weight=cfg.data.tent_weight,
+        uint8=getattr(cfg.data, "uint8", False),  # Trainer normalizes on-GPU
     )
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)

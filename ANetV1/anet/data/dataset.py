@@ -38,10 +38,15 @@ def _read_label(path):
 
 class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
-                 vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0):
+                 vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
+        # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
+        # conversion to the consumer (the Trainer does it on-GPU): 4x less
+        # pinned-memory + H2D traffic per image and no fp32 convert in the
+        # loader workers. Default False so eval/viz scripts see [0,1] floats.
+        self.uint8 = uint8
         self.teacher_dir = Path(teacher_dir) if teacher_dir else None
         img_dir = self.root / "images" / split
         if not img_dir.is_dir():
@@ -80,9 +85,14 @@ class SUASCells(Dataset):
         s, nw, nh, px, py = letterbox_params(w0, h0)
         canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (PAD_VALUE,) * 3)
         canvas.paste(img.resize((nw, nh), Image.BILINEAR), (px, py))
-        tensor = torch.from_numpy(
-            np.asarray(canvas, np.float32).transpose(2, 0, 1) / 255.0
-        )
+        if self.uint8:
+            tensor = torch.from_numpy(
+                np.ascontiguousarray(np.asarray(canvas, np.uint8).transpose(2, 0, 1))
+            )
+        else:
+            tensor = torch.from_numpy(
+                np.asarray(canvas, np.float32).transpose(2, 0, 1) / 255.0
+            )
 
         boxes = transform_boxes(_read_label(self.label_dir / f"{path.stem}.txt"), w0, h0)
         grid = torch.from_numpy(boxes_to_grid(boxes, self.coverage_thresh))
