@@ -119,11 +119,14 @@ def anet_cfg(**overrides):
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
         # SPAWN workers are heavy (each re-imports torch, ~1-2GB); 16 of them + the
-        # compile process OOM'd the container ("Terminated" + leaked semaphores).
-        # The model is launch-bound so the GPU is barely fed anyway — 6 workers
-        # decode well ahead of the ~1-2s/step compute. Bump only if a worker
-        # profile shows the GPU actually starving.
-        num_workers=min(6, os.cpu_count() or 6) if IS_CUDA else 2,
+        # compile process OOM'd the container ("Terminated" + leaked semaphores at
+        # shutdown). torch.compile now adds its own compile-worker RAM tenant, so
+        # if the box is tight, cut workers: ANET_NUM_WORKERS=2 ./run_anet_mi300x.sh.
+        # The model is launch-bound so the GPU is barely fed anyway — a handful of
+        # workers decode well ahead of the ~1-2s/step compute. num_workers=0 makes
+        # the loader run in-process (no spawn, no semaphore warning at all).
+        num_workers=int(os.environ["ANET_NUM_WORKERS"]) if "ANET_NUM_WORKERS" in os.environ
+        else (min(6, os.cpu_count() or 6) if IS_CUDA else 2),
         prefetch_factor=2 if IS_CUDA else 2,
         checkpoint_dir="runs/anet",
     )
