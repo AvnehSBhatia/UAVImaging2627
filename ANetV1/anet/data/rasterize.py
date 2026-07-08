@@ -62,8 +62,8 @@ def center_cell(box):
     return r, c
 
 
-def boxes_to_grid(boxes, coverage_thresh=0.3):
-    """Hard labels: (54, 96) int64; 0=background, 1=mannequin, 2=tent."""
+def _coverage_grid(boxes):
+    """Per-class max cell coverage (N_CLASSES, 54, 96) in [0,1]."""
     cov = np.zeros((N_CLASSES, GRID_H, GRID_W), np.float32)
     for box in boxes:
         k = int(box[0])
@@ -71,12 +71,37 @@ def boxes_to_grid(boxes, coverage_thresh=0.3):
             cov[k, r, c] = max(cov[k, r, c], f)
         r, c = center_cell(box)
         cov[k, r, c] = 1.0  # a box always marks at least its center cell
+    return cov
+
+
+def _cov_to_grid(cov, coverage_thresh):
     grid = np.zeros((GRID_H, GRID_W), np.int64)
     best = cov.max(0)
     cls = cov.argmax(0)
     hit = best >= coverage_thresh
     grid[hit] = cls[hit] + 1
     return grid
+
+
+def boxes_to_grid(boxes, coverage_thresh=0.3):
+    """Hard labels: (54, 96) int64; 0=background, 1=mannequin, 2=tent."""
+    return _cov_to_grid(_coverage_grid(boxes), coverage_thresh)
+
+
+def boxes_to_grid_band(boxes, coverage_thresh=0.3, band_lo=0.05):
+    """Hard labels + per-class boundary band for the loss.
+
+    band (N_CLASSES, 54, 96) bool: cells whose class-k coverage lands in
+    [band_lo, coverage_thresh) — partially covered by an object yet labeled
+    background by the hard threshold. A 29%-covered cell and a 30%-covered cell
+    are nearly identical pixels with opposite hard labels, so these cells are
+    label noise: the trainer excludes them from the dense focal anchor and from
+    class k's Tversky FP sum (they still count as FP for OTHER classes).
+    """
+    cov = _coverage_grid(boxes)
+    grid = _cov_to_grid(cov, coverage_thresh)
+    band = (cov >= band_lo) & (cov < coverage_thresh)
+    return grid, band
 
 
 def boxes_to_soft_grid(boxes_conf, coverage_thresh=0.0):

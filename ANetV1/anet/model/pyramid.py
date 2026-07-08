@@ -6,21 +6,35 @@ from .blocks import ManualBatchNorm
 
 
 class ScalarKernelPool(nn.Module):
-    """k x k neighborhood sum with one learned scalar per position, shared
-    across channels (D13). Same-resolution output feeds Path A."""
+    """k x k neighborhood map feeding Path A.
 
-    def __init__(self, channels, k):
+    per_channel=False (D13 spec): ONE learned scalar per position, shared across
+    all channels — 179 params for the three scales.
+    per_channel=True  (D37, viz upgrade): a full depthwise k x k kernel PER
+    channel, box-filter-initialised so it starts bit-identical to the shared
+    form and only specialises from there. The three context scales can now
+    weight each embedding channel differently — the pre-registered response to
+    mushy/under-filled tent blobs and mannequin/car scale confusion (ARCH §8
+    risk 2 second step). ~4.5k params at d=26; still tiny next to Path B."""
+
+    def __init__(self, channels, k, per_channel=False):
         super().__init__()
         self.channels = channels
         self.k = k
-        self.weight = nn.Parameter(torch.full((1, 1, k, k), 1.0 / (k * k)))
+        self.per_channel = per_channel
+        c = channels if per_channel else 1
+        self.weight = nn.Parameter(torch.full((c, 1, k, k), 1.0 / (k * k)))
 
     def forward(self, m):  # (B, C, H, W)
-        w = self.weight.expand(self.channels, 1, self.k, self.k)
+        w = self.weight if self.per_channel else \
+            self.weight.expand(self.channels, 1, self.k, self.k)
         return F.conv2d(m, w, padding=self.k // 2, groups=self.channels)
 
     def reg_l1(self):
-        return self.weight.abs().sum()
+        # keep the per-kernel L1 pressure identical to the shared form (D24) so
+        # per_channel doesn't silently multiply the penalty by `channels`
+        s = self.weight.abs().sum()
+        return s / self.channels if self.per_channel else s
 
 
 class GatedGlobalPool(nn.Module):

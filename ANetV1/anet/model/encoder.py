@@ -40,13 +40,25 @@ class MixRound(nn.Module):
     def _blur(self, s):  # (N, 400)
         return self._blur_tiles(s.reshape(-1, 1, self.GRID, self.GRID)).reshape(s.shape)
 
-    def _blur_dense(self, s):  # (B, 1, H, W): blur within each 20x20 tile
-        b, _, h, w = s.shape
-        nh, nw = h // self.GRID, w // self.GRID
-        t = s.reshape(b, nh, self.GRID, nw, self.GRID).permute(0, 1, 3, 2, 4)
-        t = self._blur_tiles(t.reshape(-1, 1, self.GRID, self.GRID))
-        t = t.reshape(b, nh, nw, self.GRID, self.GRID).permute(0, 1, 3, 2, 4)
-        return t.reshape(b, 1, h, w)
+    def _blur_matrix(self, device, dtype):
+        """The 1-d tile blur as a banded GRID x GRID matrix: K[j,i] = g[j-i+4]
+        (zero beyond the 9-tap band == the zero padding at tile borders)."""
+        g = self._kernel1d(device, dtype)
+        eye = torch.eye(self.GRID, device=device, dtype=dtype)
+        return F.conv1d(eye.unsqueeze(1), g.reshape(1, 1, self.KSIZE),
+                        padding=self.KSIZE // 2).squeeze(1)
+
+    def _blur_dense(self, s):  # (B, C, H, W), H/W multiples of 20: per-tile blur
+        # Separable blur within aligned 20-blocks == a block-diagonal matrix per
+        # axis. Each contiguous 20-slice is a GEMM row: reshape(-1,20) @ K does
+        # the whole W axis in one matmul (no per-tile convs, no permute storm);
+        # the H axis is the same trick after one transpose. ~10x less dispatch
+        # and pure GEMM work vs blurring 5,184 separate (1,20,20) tiles.
+        K = self._blur_matrix(s.device, s.dtype)
+        t = (s.reshape(-1, self.GRID) @ K).reshape(s.shape)
+        t = t.transpose(-1, -2)
+        t = (t.reshape(-1, self.GRID) @ K).reshape(t.shape)
+        return t.transpose(-1, -2)
 
     def forward(self, x):  # (N, 400, dim)
         n, t, c = x.shape
@@ -59,16 +71,36 @@ class MixRound(nn.Module):
         rgb = F.silu(x[..., :3] + pooled[:, None, :3])
         return torch.cat([rgb, x[..., 3:]], -1)
 
+    def _fold(self):
+        """Eval-BN as a per-channel affine (running stats): scale, shift."""
+        scale = self.bn.weight * torch.rsqrt(self.bn.running_var + self.bn.eps)
+        shift = self.bn.bias - self.bn.running_mean * scale
+        return scale, shift
+
     def forward_dense(self, x):  # (B, dim, H, W), H/W multiples of 20 — same math
-        xn = self.bn(x)
-        s = F.conv2d(xn, self.V.reshape(3, -1, 1, 1))
-        s1 = self._blur_dense(s[:, 0:1])
-        s2 = self._blur_dense(s[:, 1:2])
-        gate = torch.sigmoid(bounded_cos_score(s1, s2, s[:, 2:3], self.phi))
+        s = F.conv2d(self.bn(x), self.V.reshape(3, -1, 1, 1))
+        s12 = self._blur_dense(s[:, :2])  # s1, s2 blurred in one pass
+        gate = torch.sigmoid(bounded_cos_score(s12[:, 0:1], s12[:, 1:2], s[:, 2:3], self.phi))
         pooled = F.avg_pool2d(gate * x, self.GRID)  # gated window mean (B,5,nh,nw)
         up = F.interpolate(pooled[:, :3], scale_factor=self.GRID, mode="nearest")
         rgb = F.silu(x[:, :3] + up)
         return torch.cat([rgb, x[:, 3:]], 1)
+
+    def dense_round_rgb(self, rgb, frozen_score):
+        """Eval fast path: same round math on the 3 RGB channels only.
+        `frozen_score` is this round's precomputed V·BN(frozen channels) map
+        (they never change across rounds), the BN affine is folded into the
+        RGB conv, and the gated pool runs on RGB alone — the round never
+        touches the 8 frozen channels (original pooled[:, :3] slice == pooling
+        only RGB)."""
+        scale, _ = self._fold()
+        w = (self.V * scale)[:, :3]
+        s = F.conv2d(rgb, w.reshape(3, 3, 1, 1)) + frozen_score
+        s12 = self._blur_dense(s[:, :2])
+        gate = torch.sigmoid(bounded_cos_score(s12[:, 0:1], s12[:, 1:2], s[:, 2:3], self.phi))
+        pooled = F.avg_pool2d(gate * rgb, self.GRID)
+        up = F.interpolate(pooled, scale_factor=self.GRID, mode="nearest")
+        return F.silu(rgb + up)
 
     def reg_l2(self):
         return (self.V[1] ** 2).sum() + (self.V[2] ** 2).sum()
@@ -99,14 +131,35 @@ class WindowEncoder(nn.Module):
         return (self.gate(hn).unsqueeze(-1) * h).mean(1)
 
     def forward_dense(self, x):  # (B, in_dim, H, W) -> (B, hidden, H/20, W/20)
-        for r in self.rounds:
-            x = r.forward_dense(x)
+        if self.training:
+            for r in self.rounds:
+                x = r.forward_dense(x)
+        else:
+            # eval fast path: the frozen channels' score contributions for all
+            # 3 rounds in ONE conv over the 8 frozen channels (constant across
+            # rounds), then each round runs on the 3 RGB channels only
+            rgb, frozen = x[:, :3], x[:, 3:]
+            ws, bs = [], []
+            for r in self.rounds:
+                scale, shift = r._fold()
+                ws.append((r.V * scale)[:, 3:])
+                bs.append(r.V @ shift)
+            fs = F.conv2d(frozen, torch.cat(ws).reshape(-1, self.in_dim - 3, 1, 1),
+                          torch.cat(bs))
+            for i, r in enumerate(self.rounds):
+                rgb = r.dense_round_rgb(rgb, fs[:, 3 * i : 3 * i + 3])
+            x = torch.cat([rgb, frozen], 1)
         # per-token MLP == 1x1 convs with the shared Linear weights
         fc1, fc2 = self.mlp[0], self.mlp[2]
         h = F.silu(F.conv2d(x, fc1.weight.reshape(self.hidden, self.in_dim, 1, 1), fc1.bias))
         h = F.silu(F.conv2d(h, fc2.weight.reshape(self.hidden, self.hidden, 1, 1), fc2.bias))
-        hn = self.bn(h)
-        s = F.conv2d(hn, self.gate.V.reshape(3, self.hidden, 1, 1))
+        if self.training:
+            s = F.conv2d(self.bn(h), self.gate.V.reshape(3, self.hidden, 1, 1))
+        else:  # fold eval-BN affine into the gate conv (as in MixRound._score_conv)
+            scale = self.bn.weight * torch.rsqrt(self.bn.running_var + self.bn.eps)
+            shift = self.bn.bias - self.bn.running_mean * scale
+            s = F.conv2d(h, (self.gate.V * scale).reshape(3, self.hidden, 1, 1),
+                         self.gate.V @ shift)
         gate = torch.sigmoid(bounded_cos_score(s[:, 0:1], s[:, 1:2], s[:, 2:3], self.gate.phi))
         return F.avg_pool2d(gate * h, MixRound.GRID)
 

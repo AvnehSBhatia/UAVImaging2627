@@ -1,5 +1,6 @@
 import csv
 import math
+import os
 import time
 from pathlib import Path
 
@@ -77,6 +78,7 @@ class Trainer:
             # runs fp32 on purpose) — free speed on Ampere+/CDNA3
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")  # tensor-core/MFMA fp32 GEMMs
             # benchmark=True on ROCm forces an exhaustive MIOpen search per unique
             # conv shape — measured ~27 min of "hang" in epoch 0 for zero steady-
             # state gain (tiny launch-bound convs). MIOPEN_FIND_MODE=FAST does the
@@ -94,24 +96,52 @@ class Trainer:
         # self.model stays the RAW module (clean state_dicts, eager eval paths);
         # compiled entry points wrap it instead:
         #   _loss_fn   — the whole train-step math (normalize + forward + loss +
-        #                reg) in ONE compiled region, so fwd AND bwd replay as
-        #                CUDA/HIP graphs and the loss tail (dozens of tiny-tensor
-        #                kernels) stops paying per-op launch overhead
+        #                reg) in ONE compiled region, so inductor fuses fwd AND
+        #                bwd elementwise chains into a few Triton kernels and the
+        #                loss tail (dozens of tiny-tensor kernels) stops paying
+        #                per-op launch overhead
         #   model_eval — forward-only compiled wrapper for the val loop
         self._loss_fn = self._loss_tensors
         self.model_eval = self.model
-        if getattr(cfg.train, "compile", False):
-            # the model is launch-bound (thousands of tiny kernels at ~1% util);
-            # reduce-overhead captures HIP/CUDA graphs to collapse the launch storm.
-            # compiles lazily on first step, so failures surface there — set
-            # compile:false to fall back to eager. First step is slow (autotune).
-            # dynamic=False: train shapes are static (drop_last=True) and static
-            # shapes are what lets cudagraph capture stick.
-            mode = getattr(cfg.train, "compile_mode", "reduce-overhead")
-            self._loss_fn = torch.compile(self._loss_tensors, mode=mode, dynamic=False)
-            self.model_eval = torch.compile(self.model, mode=mode)
-            print(f"torch.compile ON (mode={mode}) — first step compiles, then fast",
-                  flush=True)
+        self._compiled = False  # bound methods aren't `is`-comparable; track explicitly
+        # ANET_COMPILE=0/1 is a fast off/on switch that beats editing presets.
+        want_compile = getattr(cfg.train, "compile", False)
+        env_compile = os.environ.get("ANET_COMPILE")
+        if env_compile is not None:
+            want_compile = env_compile.strip().lower() in ("1", "true", "yes")
+        if want_compile:
+            # The model is launch-bound: thousands of tiny kernels at ~1% util.
+            # Inductor fuses the elementwise chains (cos/tanh/sigmoid/silu, the
+            # BN affine, the gated-pool multiplies) into a handful of Triton
+            # kernels — the "fused kernels/ops" win — collapsing the dispatch
+            # storm that dominates wall time on this tiny net.
+            #   mode "default": Triton fusion, NO cudagraph capture. Chosen as
+            #     the safe default because reduce-overhead's HIP-graph capture
+            #     aliases the compiled output buffer, which fights grad-accum +
+            #     the on-GPU loss accumulation (loss_win += loss.detach()) and
+            #     crashed on this ROCm build. reduce-overhead is still available
+            #     via compile_mode for a machine where cudagraphs behave.
+            #   host-OOM guard: inductor forks one compile worker PER thread
+            #     (default min(32,ncpu)), each a full torch import — that is what
+            #     "Terminated" the box compiling the BACKWARD graph before. Cap
+            #     to 1 unless the caller already set it. setdefault must run
+            #     before the first (lazy) compile, i.e. here.
+            os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            mode = getattr(cfg.train, "compile_mode", "default")
+            try:
+                # dynamic=False: train shapes are static (drop_last=True), which
+                # lets inductor specialize + skips guard overhead every step.
+                self._loss_fn = torch.compile(self._loss_tensors, mode=mode,
+                                              dynamic=False)
+                self.model_eval = torch.compile(self.model, mode=mode)
+                self._compiled = True
+                print(f"torch.compile ON (mode={mode}, "
+                      f"threads={os.environ['TORCHINDUCTOR_COMPILE_THREADS']}) — "
+                      "first step compiles (slow), then fast", flush=True)
+            except Exception as e:  # never let a compile setup error kill training
+                self._loss_fn, self.model_eval = self._loss_tensors, self.model
+                print(f"torch.compile setup FAILED ({type(e).__name__}: {e}) — "
+                      "falling back to eager", flush=True)
 
         # fused AdamW: one multi-tensor kernel per step instead of ~6 tiny
         # launches per parameter tensor — real money on a launch-bound model
@@ -161,28 +191,52 @@ class Trainer:
         grid = batch["grid"].to(self.device, non_blocking=True)
         teacher = (batch["teacher"].to(self.device, non_blocking=True)
                    if self.distill else None)
-        return self._loss_fn(img, grid, teacher)
+        band = (batch["band"].to(self.device, non_blocking=True)
+                if "band" in batch else None)
+        if not self._compiled:  # eager: no fallback needed
+            return self._loss_fn(img, grid, teacher, band)
+        try:  # lazy compilation happens on the FIRST call — catch + degrade here
+            return self._loss_fn(img, grid, teacher, band)
+        except Exception as e:
+            print(f"torch.compile failed at first step ({type(e).__name__}: {e}) — "
+                  "falling back to eager for the rest of training", flush=True)
+            self._loss_fn = self._loss_tensors
+            self.model_eval = self.model
+            self._compiled = False
+            return self._loss_fn(img, grid, teacher, band)
 
-    def _loss_tensors(self, img, grid, teacher=None):
+    def _loss_tensors(self, img, grid, teacher=None, band=None):
         cells = self.model(self._prep_img(img))
         c = self.cfg.train
         ta = getattr(c, "tversky_alpha", 0.7)
         tb = getattr(c, "tversky_beta", 0.3)
+        smooth = getattr(c, "ft_smooth", 1.0)
+        if isinstance(ta, (list, tuple)):
+            ta = tuple(ta)
+        # boundary-band background cells (partial coverage in [band_lo, thresh))
+        # are label noise — drop them from the dense anchor so it stops pushing
+        # "background" on cells that are half object (the ring tug-of-war)
+        amask = None
+        if band is not None:
+            amask = ~(band.any(1) & (grid == 0))
         if getattr(c, "loss_mode", "combo") == "focal_tversky":
             # single balanced term (no focal-vs-Tversky fight) + a GENTLE per-cell
             # focal anchor for dense, stable gradient early on. The anchor uses a
             # mild alpha (it stabilizes; focal-Tversky does the class balancing).
             ft = focal_tversky_loss(cells, grid, alpha=ta, beta=tb,
-                                    gamma=getattr(c, "ft_gamma", 0.75))
+                                    gamma=getattr(c, "ft_gamma", 0.75),
+                                    smooth=smooth, band=band)
             anchor = focal_loss(cells, grid, gamma=c.focal_gamma,
-                                alpha=tuple(getattr(c, "ft_anchor_alpha", (1.0, 2.0, 2.0))))
+                                alpha=tuple(getattr(c, "ft_anchor_alpha", (1.0, 2.0, 2.0))),
+                                mask=amask)
             hard = ft + getattr(c, "ft_anchor_weight", 0.5) * anchor
         else:  # legacy: focal + separately-weighted Tversky (can tug-of-war)
             hard = focal_loss(cells, grid, gamma=c.focal_gamma,
-                              alpha=tuple(c.class_alpha))
+                              alpha=tuple(c.class_alpha), mask=amask)
             tw = getattr(c, "tversky_weight", 0.0) or 0.0
             if tw:
-                hard = hard + tw * tversky_loss(cells, grid, alpha=ta, beta=tb)
+                hard = hard + tw * tversky_loss(cells, grid, alpha=ta, beta=tb,
+                                                smooth=smooth, band=band)
         loss = hard
         if teacher is not None:
             loss = (1.0 - self.cfg.distill.kl_weight) * hard + \

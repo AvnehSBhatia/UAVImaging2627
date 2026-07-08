@@ -26,19 +26,31 @@ def anet_cfg(**overrides):
         # effective batch 64 on CUDA (32x2), 16 on Mac (4x4). NB: activations are
         # ~2.5GB/image under autograd (edge_dq/hidden24), so single-batch 64 OOMs
         # the 192GB card (~160GB) — 32 is the ceiling. accum 2 keeps effective 64.
+        # MEMORY NOTE (D38): the single-batched Stage-1 pass holds all 4 phases'
+        # transients at once (~10-15% higher peak than the old 4-pass loop) for
+        # ~4x fewer kernel launches. If batch 32 now OOMs, drop to batch_size=16,
+        # accum_steps=4 — same effective 64, half the activation footprint, and
+        # STILL fewer total launches than the old batch-32 4-pass (the batched
+        # encoder runs once per microbatch regardless of batch size).
         batch_size=32 if IS_CUDA else 4,
         accum_steps=2 if IS_CUDA else 4,
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
-        # torch.compile is OFF: it crashed twice on this ROCm build — mode
-        # "reduce-overhead" (HIP graphs) is incompatible with grad-accum +
-        # on-GPU loss accumulation, and "default" OOM'd the host compiling the
-        # BACKWARD graph (died "Terminated" right after the first forward). The
-        # runahead (nan_check_every) already gives the launch-bound speedup, so
-        # compile is not needed. To retry later: set compile=True AND export
-        # TORCHINDUCTOR_COMPILE_THREADS=1 to cap the compiler's host RAM.
-        compile=False,
+        # torch.compile ON for CUDA/ROCm: this net is launch-bound (thousands of
+        # tiny kernels at ~1% util), and inductor fusing the elementwise chains
+        # into a few Triton kernels is the biggest single lever. Two past crashes
+        # are now root-caused and fixed:
+        #   - "reduce-overhead" (HIP graphs) aliased the compiled output buffer,
+        #     fighting grad-accum + on-GPU loss accumulation -> use mode "default"
+        #     (fusion, no cudagraph capture). reduce-overhead stays selectable.
+        #   - "default" once OOM'd the host compiling the BACKWARD graph because
+        #     inductor forks one full-torch compile worker per thread -> the
+        #     trainer now setdefaults TORCHINDUCTOR_COMPILE_THREADS=1 before the
+        #     first (lazy) compile, and the run script exports it too.
+        # Robust fallback: any compile error (setup OR first-step) degrades to
+        # eager instead of dying. Fast off-switch: ANET_COMPILE=0 (or compile=False).
+        compile=IS_CUDA,
         compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search
@@ -54,6 +66,12 @@ def anet_cfg(**overrides):
         nan_check_every=1,
         hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
         stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
+        # per-channel Path A kernels (D37): the pre-registered "mushy tent blob"
+        # upgrade (ARCH §8.2 step 2), justified by the 000008 viz (tent recall
+        # ~half, low-contrast tent nearly missed, mannequin/car scale confusion).
+        # Box-filter init -> starts identical to the shared-scalar spec form.
+        # False restores the exact 179-param D13 Path A.
+        path_a_per_channel=True,
         use_checkpoint=not IS_CUDA,   # Mac: memory valve; CUDA: pure waste
         amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
         samples_per_epoch=None if IS_CUDA else 6000,
@@ -79,10 +97,20 @@ def anet_cfg(**overrides):
         ft_anchor_weight=0.5,        # weight of the dense per-cell focal anchor
         ft_anchor_alpha=[1.0, 2.0, 2.0],  # MILD — balancing is Focal-Tversky's job, not the anchor's
         tversky_weight=0.2,          # only used in "combo" mode
-        # FP-reduction step 1: alpha 0.7->0.8 makes Focal-Tversky punish false
-        # positives harder than misses (fp/img was too high).
-        tversky_alpha=0.8,           # FP penalty (both modes)
+        # FP-reduction step 1: alpha > beta makes Focal-Tversky punish false
+        # positives harder than misses (fp/img was too high). Per-class pair
+        # (mannequin, tent): the viz showed the global 0.8 shrinking tent blobs
+        # to ~half their GT cells while the mannequin channel still hedged —
+        # keep full FP pressure on mannequin, relax tent so it fills its box.
+        tversky_alpha=(0.8, 0.6),    # FP penalty per class (both modes)
         tversky_beta=0.3,            # FN penalty (both modes)
+        # smooth ~1 virtual TP cell in the Tversky index. The old eps=1e-6 made
+        # the index saturate whenever a class was ABSENT from a frame: gradient
+        # wrt FP measured ~1e-14, i.e. zero FP suppression exactly where FPs
+        # live. That, not alpha, was why the mannequin channel became a generic
+        # objectness halo (rings around tents, blobs on cars) held down only by
+        # the mild anchor + the conf_thresh crutch.
+        ft_smooth=1.0,
         # FP-reduction step 2: at eval/deploy, only count a foreground cell if its
         # softmax prob clears this bar — kills marginal (ambiguous) predictions that
         # dominate fp/img. 0 = plain argmax. Raise to cut FP, lower if recall drops.
@@ -108,6 +136,13 @@ def anet_cfg(**overrides):
         # H2D + pin_memory traffic. Only the Trainer handles this; eval scripts
         # build their own SUASCells without it and still get floats.
         uint8=IS_CUDA,
+        # boundary ignore band: cells with class coverage in [band_lo, 0.3) are
+        # labeled background by the hard threshold but are half object — a 29%-
+        # vs 30%-covered cell is the same pixels with opposite labels. The loss
+        # ignores them (anchor skips the cell; Tversky FP skips them for the
+        # covering class only). Kills the ring tug-of-war at object boundaries.
+        # None = off (plain hard labels, pre-band behavior).
+        band_lo=0.05,
     )
     distill = dict(teacher_cache="runs/teacher_cache", kl_weight=0.7, temperature=2.0)
     yolo = dict(weights="yolo26n.pt", imgsz=960)  # shared by teacher cache + eval

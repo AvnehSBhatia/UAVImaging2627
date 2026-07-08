@@ -33,8 +33,10 @@ python scripts/evaluate_all.py \
   --anet runs/anet/best.pt \
   --anet-distill runs/anet_distill/best.pt
 
-# fast local inference: self-contained ONNX + CoreML EP (~2.5x faster than eager MPS)
-python scripts/export_onnx.py --ckpt runs/anet/best.pt --bench   # then use anet.onnxrt.OnnxANet
+# fast local inference (see ARCHITECTURE.md D34/D35):
+#   fastest: anet.metal.MetalANet.from_checkpoint(ckpt) — fused Metal kernel, ~7.4 ms/img
+#   portable: self-contained ONNX + CoreML EP (~21 ms/img)
+python scripts/export_onnx.py --ckpt runs/anet/best.pt --bench   # exports + benches all paths
 ```
 
 Training runs on Apple Silicon MPS; if MPS hits an unsupported op, set `PYTORCH_ENABLE_MPS_FALLBACK=1`. Hyperparameters live in `ANetV1/configs/anet.yaml`.

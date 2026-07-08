@@ -92,6 +92,19 @@ def main():
         dt = timed(eager, iters=20)
         print(f"  eager PyTorch ({dev})            "
               f"{dt * 1e3:7.1f} ms/img | {1 / dt:6.1f} img/s | {dt * 1000:6.1f} s per 1k")
+        if dev.type == "mps" and model.stem == "edge_dq":
+            from anet.metal import MetalANet
+
+            mm = MetalANet(ANetV1.from_state_dict(sd, use_checkpoint=False))
+            xm = x.to("mps")
+
+            def metal():
+                mm(xm)
+                torch.mps.synchronize()
+
+            dt = timed(metal, iters=40)
+            print(f"  MetalANet fused kernel (mps)     "
+                  f"{dt * 1e3:7.1f} ms/img | {1 / dt:6.1f} img/s | {dt * 1000:6.1f} s per 1k")
 
 
 if __name__ == "__main__":

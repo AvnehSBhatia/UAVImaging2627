@@ -32,7 +32,8 @@ def main():
 
     train_ds, val_ds = build_datasets(cfg, teacher_dir=teacher_dir)
     model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
-                   stem=cfg.train.stem)
+                   stem=cfg.train.stem,
+                   path_a_per_channel=cfg.train.path_a_per_channel)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"ANetV1-distill: {n_params:,} params (hidden={cfg.train.hidden}, stem={cfg.train.stem}) | "
           f"train {len(train_ds)} | val {len(val_ds)} | teacher {teacher_dir}")

@@ -26,7 +26,8 @@ class ANetV1(nn.Module):
     WIN, STRIDE = 20, 10
     PHASES = ((0, 0), (0, 10), (10, 0), (10, 10))
 
-    def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass"):
+    def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
+                 path_a_per_channel=True):
         super().__init__()
         self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
         self.nw = (self.IMG_W - self.WIN) // self.STRIDE + 1  # 95
@@ -34,6 +35,7 @@ class ANetV1(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.dense = dense
         self.stem = stem
+        self.path_a_per_channel = path_a_per_channel
 
         # hidden=16 is the 17k spec model; hidden=24 is the pre-registered
         # capacity mitigation (ARCHITECTURE §8 risk 2, ~24k params with the
@@ -61,7 +63,9 @@ class ANetV1(nn.Module):
             raise ValueError(f"unknown stem {stem!r} (highpass|edge_dq)")
         self.in_dim = self.feat + 2  # + (u,v) window-relative coords
         self.encoder = WindowEncoder(hidden, in_dim=self.in_dim)
-        self.pools = nn.ModuleList([ScalarKernelPool(d, k) for k in (3, 7, 11)])
+        self.pools = nn.ModuleList(
+            [ScalarKernelPool(d, k, per_channel=path_a_per_channel) for k in (3, 7, 11)]
+        )
         # learned per-path transform after Path A k3/k7/k11 (D36): one generalized
         # DQ per scale. A quaternion rotates a 3-vector, so on the d-dim map it's a
         # learned 1x1 conv (identity-init -> starts as a no-op, bakes to a constant
@@ -106,10 +110,12 @@ class ANetV1(nn.Module):
 
     @classmethod
     def from_state_dict(cls, sd, **kwargs):
-        """Rebuild a model with hidden/stem inferred from checkpoint shapes."""
+        """Rebuild a model with hidden/stem/Path-A inferred from checkpoint shapes
+        (so pre-D37 shared-scalar checkpoints and per-channel ones both load)."""
         hidden = sd["encoder.mlp.0.weight"].shape[0]
         stem = "edge_dq" if any(k.startswith("stem_mod.") for k in sd) else "highpass"
-        model = cls(hidden=hidden, stem=stem, **kwargs)
+        per_channel = sd["pools.0.weight"].shape[0] > 1
+        model = cls(hidden=hidden, stem=stem, path_a_per_channel=per_channel, **kwargs)
         model.load_state_dict(sd)
         return model
 
@@ -124,36 +130,23 @@ class ANetV1(nn.Module):
         rgb = self.quat(img)
         return torch.cat([rgb, self.grad(rgb)], 1)
 
-    def _map_dense(self, feat):  # (B,feat,540,960) -> (B,hidden,53,95)
-        b = feat.shape[0]
-        ph, pw = self.nh // 2 + 1, self.nw // 2 + 1  # padded phase grid 27x48
-        es = []
-        for oy, ox in self.PHASES:
-            hp = ((self.IMG_H - oy) // self.WIN) * self.WIN
-            wp = ((self.IMG_W - ox) // self.WIN) * self.WIN
-            x = torch.cat(
-                [
-                    feat[:, :, oy : oy + hp, ox : ox + wp],
-                    self.uv_tile[:, :, :hp, :wp].expand(b, -1, -1, -1),
-                ],
-                1,
-            )
-            e = self._ckpt(self.encoder.forward_dense, x)  # (B,16,hp/20,wp/20)
-            es.append(F.pad(e, (0, pw - e.shape[-1], 0, ph - e.shape[-2])))
-        # interleave the four stride-2 phase grids with pixel_shuffle instead of
-        # strided scatter: identical placement (phase (oy,ox) -> out[oy/10::2,
-        # ox/10::2]), but ScatterND forced CPU partitions in the CoreML EP; the
-        # padded row/col land at index 53/95 and are cropped off
-        m = F.pixel_shuffle(torch.stack(es, 2).flatten(1, 2), 2)
-        return m[:, :, : self.nh, : self.nw]
-
-    def _map_dense_batched(self, feat):  # eval/export: 4 phases in ONE encoder pass
-        # Every encoder op is tile-local and eval BN uses running stats, so the
-        # 4 phase crops (padded back to 540x960 to share the tile grid) can ride
-        # the batch dim: one encoder trace instead of four -> ~4x fewer kernel
-        # dispatches (the CoreML/MPS bottleneck). Padding creates garbage tiles
-        # whose outputs land exactly on the cropped row 53 / col 95. Not used in
-        # training: batch-stat BNs would mix garbage tiles into the statistics.
+    def _map_dense_all(self, feat, pad_mode):  # (B,feat,540,960) -> (B,hidden,53,95)
+        # ALL FOUR stride-2 phases ride the batch dim through ONE encoder pass
+        # (the phase loop used to launch the whole 96%-FLOP encoder 4x — pure
+        # dispatch overhead on a launch-bound tiny model). Legal because every
+        # encoder op is tile-local (1x1 convs, per-tile blur, non-overlapping
+        # 20x20 pool) and the stem's cross-tile receptive field already ran on
+        # the full frame in _features. Each phase crop is padded back to
+        # 540x960 so the four share the same tile grid; the padded row/col land
+        # exactly on the cropped index 53/95 (pixel_shuffle interleave below).
+        #   pad_mode "constant" (eval/export): zero pad — those garbage tiles are
+        #     discarded and eval BN uses frozen running stats, so their values
+        #     never touch a real output. Kept for the ONNX/Hailo graph (a
+        #     ConstantPad is what the CoreML partitioner and DFC expect).
+        #   pad_mode "replicate" (train): edge-replicate so the ~3% padded tiles
+        #     are IN-DISTRIBUTION and don't skew the shared BN *batch* statistics
+        #     the valid tiles are normalized against (a joint 4-phase BN batch,
+        #     vs the old per-phase stats — larger and cleaner, never garbage).
         b = feat.shape[0]
         ph, pw = self.nh // 2 + 1, self.nw // 2 + 1  # 27x48 per-phase grid
         crops = []
@@ -161,14 +154,24 @@ class ANetV1(nn.Module):
             hp = ((self.IMG_H - oy) // self.WIN) * self.WIN
             wp = ((self.IMG_W - ox) // self.WIN) * self.WIN
             crops.append(F.pad(feat[:, :, oy : oy + hp, ox : ox + wp],
-                               (0, self.IMG_W - wp, 0, self.IMG_H - hp)))
+                               (0, self.IMG_W - wp, 0, self.IMG_H - hp), mode=pad_mode))
         x = torch.cat(crops, 0)  # (4B, feat, 540, 960), phase-major
         uv = torch.zeros_like(x[:, :2]) + self.uv_tile  # expand w/o shape math
         x = torch.cat([x, uv], 1)
-        e = self.encoder.forward_dense(x)  # (4B, C, 27, 48)
+        e = self._ckpt(self.encoder.forward_dense, x)  # (4B, C, 27, 48)
         e = e.reshape(4, b, -1, ph, pw).permute(1, 2, 0, 3, 4)  # (B, C, 4, 27, 48)
+        # interleave the four stride-2 phase grids with pixel_shuffle instead of
+        # strided scatter: identical placement (phase (oy,ox) -> out[oy/10::2,
+        # ox/10::2]), but ScatterND forced CPU partitions in the CoreML EP; the
+        # padded row/col land at index 53/95 and are cropped off
         m = F.pixel_shuffle(e.flatten(1, 2), 2)
         return m[:, :, : self.nh, : self.nw]
+
+    def _map_dense(self, feat):  # train path: replicate-pad (BN-batch-safe)
+        return self._map_dense_all(feat, "replicate")
+
+    def _map_dense_batched(self, feat):  # eval/export path: zero-pad (graph-stable)
+        return self._map_dense_all(feat, "constant")
 
     def _map_windowed(self, feat):  # reference path
         b = feat.shape[0]
@@ -198,7 +201,10 @@ class ANetV1(nn.Module):
     def forward(self, img):
         feat = self._features(img)
         if self.dense:
-            m16 = self._map_dense(feat) if self.training else self._map_dense_batched(feat)
+            # same single-pass batched encoder in both modes; only the phase-pad
+            # mode differs (replicate keeps BN batch stats clean in training,
+            # constant keeps the exported graph Hailo/CoreML-friendly)
+            m16 = self._map_dense_all(feat, "replicate" if self.training else "constant")
         else:
             m16 = self._map_windowed(feat)
         return self._tail(m16)

@@ -18,6 +18,7 @@ from .rasterize import (
     CANVAS_H,
     CANVAS_W,
     boxes_to_grid,
+    boxes_to_grid_band,
     letterbox_params,
     transform_boxes,
 )
@@ -38,10 +39,15 @@ def _read_label(path):
 
 class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
-                 vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False):
+                 vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
+                 band_lo=None):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
+        # band_lo: also emit out["band"] (2,54,96 bool) — per-class partial-
+        # coverage cells in [band_lo, coverage_thresh), used by the loss as an
+        # ignore band (boundary label noise). None = off (eval scripts).
+        self.band_lo = band_lo
         # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
         # conversion to the consumer (the Trainer does it on-GPU): 4x less
         # pinned-memory + H2D traffic per image and no fp32 convert in the
@@ -95,7 +101,12 @@ class SUASCells(Dataset):
             )
 
         boxes = transform_boxes(_read_label(self.label_dir / f"{path.stem}.txt"), w0, h0)
-        grid = torch.from_numpy(boxes_to_grid(boxes, self.coverage_thresh))
+        band = None
+        if self.band_lo is not None:
+            g, b = boxes_to_grid_band(boxes, self.coverage_thresh, self.band_lo)
+            grid, band = torch.from_numpy(g), torch.from_numpy(b)
+        else:
+            grid = torch.from_numpy(boxes_to_grid(boxes, self.coverage_thresh))
 
         padded = torch.full((MAX_BOXES, 5), -1.0)
         n = min(len(boxes), MAX_BOXES)
@@ -104,6 +115,8 @@ class SUASCells(Dataset):
 
         out = {"image": tensor, "grid": grid, "boxes": padded,
                "vd": self.is_visdrone(i), "stem": path.stem}
+        if band is not None:
+            out["band"] = band
         if self.teacher_dir is not None:
             soft = np.load(self.teacher_dir / f"{path.stem}.npz")["grid"]
             out["teacher"] = torch.from_numpy(soft)

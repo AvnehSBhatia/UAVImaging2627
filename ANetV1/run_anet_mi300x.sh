@@ -35,6 +35,12 @@ export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
 export PYTHONUNBUFFERED=1
+# torch.compile (on for CUDA/ROCm via presets): cap inductor to ONE compile
+# worker so it can't fork ncpu full-torch processes and OOM the host compiling
+# the backward graph (the old "Terminated" right after first forward). A warm
+# on-disk cache makes reruns skip recompilation. Set ANET_COMPILE=0 to disable.
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$ANET_DIR/.torchinductor}"
 _ALLOC="expandable_segments:True,garbage_collection_threshold:0.8"
 export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-$_ALLOC}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$_ALLOC}"

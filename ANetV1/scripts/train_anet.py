@@ -37,6 +37,7 @@ def build_datasets(cfg, teacher_dir=None):
         mannequin_weight=cfg.data.mannequin_weight,
         tent_weight=cfg.data.tent_weight,
         uint8=getattr(cfg.data, "uint8", False),  # Trainer normalizes on-GPU
+        band_lo=getattr(cfg.data, "band_lo", None),  # boundary ignore band for the loss
     )
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)
@@ -56,7 +57,8 @@ def main():
         print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, warmup=100)")
     else:
         model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
-                       stem=cfg.train.stem)
+                       stem=cfg.train.stem,
+                       path_a_per_channel=cfg.train.path_a_per_channel)
     n_params = sum(p.numel() for p in model.parameters())
     tw = cfg.train.tversky_weight
     print(f"ANetV1: {n_params:,} params (hidden={model.encoder.hidden}, stem={model.stem}) | "

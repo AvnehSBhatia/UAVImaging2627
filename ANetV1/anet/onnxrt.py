@@ -1,8 +1,9 @@
 """ONNX Runtime inference wrapper — the fast local path.
 
-Measured on an M-series Mac at batch 1 (hidden=24, edge_dq): ~36 ms/img via the
-CoreML EP (GPU) vs ~92 ms eager PyTorch on MPS and ~436 ms eager CPU. Exact
-parity with the PyTorch model (max logit delta ~1e-6).
+Measured on an M-series Mac at batch 1 (hidden=24, edge_dq, D34 eval graph):
+~21 ms/img via the CoreML EP (GPU) vs ~92 ms eager PyTorch on MPS and ~436 ms
+eager CPU. Exact parity with the PyTorch model (max logit delta ~1e-6, cell
+argmax agreement 1.0 on real val frames).
 
 Export first, then use the wrapper like the torch model:
 
@@ -21,9 +22,10 @@ def default_providers():
 
     providers = []
     if "CoreMLExecutionProvider" in ort.get_available_providers():
-        # MLProgram + ALL routes the big partitions to the GPU. CPUAndNeuralEngine
-        # measured 4x slower: the graph splits into ~9 partitions and the
-        # per-partition hops dominate on the ANE path.
+        # MLProgram + ALL routes the graph (single partition since D34) to the
+        # GPU. CPUAndNeuralEngine measured far slower: the ANE handles this
+        # op mix (reshape/elementwise-heavy) poorly. fp16 also measured slower
+        # than fp32 on Apple GPUs here — don't "optimize" without re-measuring.
         providers.append(("CoreMLExecutionProvider",
                           {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL"}))
     providers.append("CPUExecutionProvider")
