@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .losses import distill_kl, focal_loss, focal_tversky_loss, tversky_loss
-from .metrics import CellConfusion, ObjectMetrics
+from .metrics import CellConfusion, ObjectMetrics, confident_pred
 
 
 def pick_device():
@@ -256,10 +256,11 @@ class Trainer:
     def evaluate(self, loader):
         self.model.eval()
         cells_m, obj_m = CellConfusion(), ObjectMetrics()
+        thresh = getattr(self.cfg.train, "conf_thresh", 0.0) or 0.0
         for batch in loader:
             with self._autocast():
                 logits = self.model(batch["image"].to(self.device, non_blocking=True))
-            pred = logits.argmax(1).cpu().numpy()
+            pred = confident_pred(logits.float(), thresh).cpu().numpy()
             target = batch["grid"].numpy()
             cells_m.update(pred, target)
             for i in range(pred.shape[0]):

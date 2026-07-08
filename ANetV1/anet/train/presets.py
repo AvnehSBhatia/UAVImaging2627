@@ -57,8 +57,14 @@ def anet_cfg(**overrides):
         ft_anchor_weight=0.5,        # weight of the dense per-cell focal anchor
         ft_anchor_alpha=[1.0, 2.0, 2.0],  # MILD — balancing is Focal-Tversky's job, not the anchor's
         tversky_weight=0.2,          # only used in "combo" mode
-        tversky_alpha=0.7,           # FP penalty (both modes)
+        # FP-reduction step 1: alpha 0.7->0.8 makes Focal-Tversky punish false
+        # positives harder than misses (fp/img was too high).
+        tversky_alpha=0.8,           # FP penalty (both modes)
         tversky_beta=0.3,            # FN penalty (both modes)
+        # FP-reduction step 2: at eval/deploy, only count a foreground cell if its
+        # softmax prob clears this bar — kills marginal (ambiguous) predictions that
+        # dominate fp/img. 0 = plain argmax. Raise to cut FP, lower if recall drops.
+        conf_thresh=0.5,
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)

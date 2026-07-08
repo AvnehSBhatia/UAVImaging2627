@@ -48,6 +48,28 @@ class DualQuaternionRGB(nn.Module):
         r, t = self.matrix()
         return F.conv2d(img, r.reshape(3, 3, 1, 1), t)
 
+    @torch.no_grad()
+    def to_conv(self):
+        """Bake to a constant 1x1 conv for export (D5). The quaternion algebra
+        in matrix() (nested stack/unbind on parameter scalars) is constant at
+        inference and chokes the coremltools trace frontend."""
+        r, t = self.matrix()
+        conv = nn.Conv2d(3, 3, 1)
+        conv.weight.copy_(r.reshape(3, 3, 1, 1))
+        conv.bias.copy_(t)
+        return conv
+
+
+def fuse_dq(module):
+    """Recursively replace every DualQuaternionRGB with its baked 1x1 conv.
+    Call on a deepcopy before tracing/converting for deployment."""
+    for name, child in module.named_children():
+        if isinstance(child, DualQuaternionRGB):
+            setattr(module, name, child.to_conv())
+        else:
+            fuse_dq(child)
+    return module
+
 
 class ManualBatchNorm(nn.Module):
     """BatchNorm built from primitive ops. The fused MPS NativeBatchNormBackward
@@ -112,29 +134,32 @@ class EdgeDQStem(nn.Module):
     in the 540p pixels but not in the embeddings.
 
     Triplicate the frame; leave one copy raw; send the other two through a
-    learned dual-quaternion colour rotation then a 7x7 oriented edge operator
-    (one vertical, one horizontal); stack -> 9ch; apply 'one more learned DQ'
-    per stacked image (a quaternion rotates a 3-vector, so the 9ch stack takes
-    three block-diagonal DQs — keeps the colour/edge grouping clean so the
-    encoder still updates only the 3 colour channels and reads edges as frozen
-    evidence). Every op is a dense conv that bakes to a constant at export ->
-    Hailo-legal (D5-style), ~+200M MACs of the NPU's favourite op class."""
+    learned dual-quaternion colour rotation then a 7x7 FREELY-LEARNED conv
+    (D35: two learned filters, not fixed Sobel — the data picks the texture
+    operators, initialised small so they grow from ~0 rather than injecting
+    noise); stack -> 9ch; apply 'one more learned DQ' per stacked image
+    (block-diagonal, keeps the colour/edge grouping clean so the encoder still
+    updates only the 3 colour channels and reads the learned-texture channels as
+    frozen evidence). Every op is a dense conv that bakes to a constant at export
+    -> Hailo-legal (D5-style), the NPU's favourite op class."""
 
     out_channels = 9
 
     def __init__(self):
         super().__init__()
-        self.dq_v = DualQuaternionRGB()  # learned colour frame before each edge op
+        self.dq_v = DualQuaternionRGB()  # learned colour frame before each filter
         self.dq_h = DualQuaternionRGB()
+        # freely-learned 7x7 depthwise texture filters (D35), small init so the
+        # channels start near zero and the encoder ignores them until they train
         self.edge_v = nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False)
         self.edge_h = nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False)
         with torch.no_grad():
-            self.edge_v.weight.copy_(sobel7("v").reshape(1, 1, 7, 7).expand(3, 1, 7, 7))
-            self.edge_h.weight.copy_(sobel7("h").reshape(1, 1, 7, 7).expand(3, 1, 7, 7))
+            self.edge_v.weight.mul_(0.2)
+            self.edge_h.weight.mul_(0.2)
         # "one more learned DQ" after stacking, per stacked image (block-diagonal)
         self.dq_out = nn.ModuleList([DualQuaternionRGB() for _ in range(3)])
 
-    def forward(self, img):  # (B,3,H,W) -> (B,9,H,W): [colour, vert-edge, horiz-edge]
+    def forward(self, img):  # (B,3,H,W) -> (B,9,H,W): [colour, tex1, tex2]
         groups = (img, self.edge_v(self.dq_v(img)), self.edge_h(self.dq_h(img)))
         return torch.cat([dq(g) for dq, g in zip(self.dq_out, groups)], 1)
 

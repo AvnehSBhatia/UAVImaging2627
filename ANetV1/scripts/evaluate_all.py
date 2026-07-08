@@ -21,7 +21,7 @@ from anet import ANetV1  # noqa: E402
 from anet.train.presets import anet_cfg  # noqa: E402
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.data.rasterize import boxes_to_grid, transform_boxes  # noqa: E402
-from anet.train.metrics import CellConfusion, ObjectMetrics  # noqa: E402
+from anet.train.metrics import CellConfusion, ObjectMetrics, confident_pred  # noqa: E402
 from anet.train.trainer import pick_device, yolo_device  # noqa: E402
 
 
@@ -75,13 +75,14 @@ def _load_anet(ckpt, device):
     return model
 
 
-def eval_anet(ckpt, ds, device):
+def eval_anet(ckpt, ds, device, conf_thresh=0.0):
     model = _load_anet(ckpt, device)
     cells_m, obj_m = CellConfusion(), ObjectMetrics()
     loader = DataLoader(ds, batch_size=4, num_workers=4)
     with torch.no_grad():
         for batch in loader:
-            pred = model(batch["image"].to(device)).argmax(1).cpu().numpy()
+            logits = model(batch["image"].to(device)).float()
+            pred = confident_pred(logits, conf_thresh).cpu().numpy()
             cells_m.update(pred, batch["grid"].numpy())
             for i in range(pred.shape[0]):
                 obj_m.update(pred[i], batch["boxes"][i].numpy(), bool(batch["vd"][i]))
@@ -135,11 +136,11 @@ def main():
         if args.latency:
             results["yolo"].update(latency_yolo(args.yolo, ds, cfg))
     if args.anet:
-        results["anet"] = eval_anet(args.anet, ds, device)
+        results["anet"] = eval_anet(args.anet, ds, device, getattr(cfg.train, "conf_thresh", 0.0))
         if args.latency:
             results["anet"].update(latency_anet(args.anet, device))
     if args.anet_distill:
-        results["anet_distill"] = eval_anet(args.anet_distill, ds, device)
+        results["anet_distill"] = eval_anet(args.anet_distill, ds, device, getattr(cfg.train, "conf_thresh", 0.0))
         if args.latency:
             results["anet_distill"].update(latency_anet(args.anet_distill, device))
 

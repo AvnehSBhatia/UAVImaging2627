@@ -62,6 +62,16 @@ class ANetV1(nn.Module):
         self.in_dim = self.feat + 2  # + (u,v) window-relative coords
         self.encoder = WindowEncoder(hidden, in_dim=self.in_dim)
         self.pools = nn.ModuleList([ScalarKernelPool(d, k) for k in (3, 7, 11)])
+        # learned per-path transform after Path A k3/k7/k11 (D36): one generalized
+        # DQ per scale. A quaternion rotates a 3-vector, so on the d-dim map it's a
+        # learned 1x1 conv (identity-init -> starts as a no-op, bakes to a constant
+        # 1x1 conv at export). Lets each scale recombine its channels before both
+        # Path B and the head consume it.
+        self.path_dq = nn.ModuleList([nn.Conv2d(d, d, 1) for _ in range(3)])
+        with torch.no_grad():
+            for conv in self.path_dq:
+                conv.weight.copy_(torch.eye(d).reshape(d, d, 1, 1))
+                conv.bias.zero_()
         self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
         self.mix = GlobalCosineMix(pad_to=d)
         self.head = RegionHead(dim=d)
@@ -137,6 +147,29 @@ class ANetV1(nn.Module):
         m = F.pixel_shuffle(torch.stack(es, 2).flatten(1, 2), 2)
         return m[:, :, : self.nh, : self.nw]
 
+    def _map_dense_batched(self, feat):  # eval/export: 4 phases in ONE encoder pass
+        # Every encoder op is tile-local and eval BN uses running stats, so the
+        # 4 phase crops (padded back to 540x960 to share the tile grid) can ride
+        # the batch dim: one encoder trace instead of four -> ~4x fewer kernel
+        # dispatches (the CoreML/MPS bottleneck). Padding creates garbage tiles
+        # whose outputs land exactly on the cropped row 53 / col 95. Not used in
+        # training: batch-stat BNs would mix garbage tiles into the statistics.
+        b = feat.shape[0]
+        ph, pw = self.nh // 2 + 1, self.nw // 2 + 1  # 27x48 per-phase grid
+        crops = []
+        for oy, ox in self.PHASES:
+            hp = ((self.IMG_H - oy) // self.WIN) * self.WIN
+            wp = ((self.IMG_W - ox) // self.WIN) * self.WIN
+            crops.append(F.pad(feat[:, :, oy : oy + hp, ox : ox + wp],
+                               (0, self.IMG_W - wp, 0, self.IMG_H - hp)))
+        x = torch.cat(crops, 0)  # (4B, feat, 540, 960), phase-major
+        uv = torch.zeros_like(x[:, :2]) + self.uv_tile  # expand w/o shape math
+        x = torch.cat([x, uv], 1)
+        e = self.encoder.forward_dense(x)  # (4B, C, 27, 48)
+        e = e.reshape(4, b, -1, ph, pw).permute(1, 2, 0, 3, 4)  # (B, C, 4, 27, 48)
+        m = F.pixel_shuffle(e.flatten(1, 2), 2)
+        return m[:, :, : self.nh, : self.nw]
+
     def _map_windowed(self, feat):  # reference path
         b = feat.shape[0]
         win = F.unfold(feat, self.WIN, stride=self.STRIDE)  # (B, feat*400, 5035)
@@ -145,13 +178,11 @@ class ANetV1(nn.Module):
         emb = self._ckpt(self.encoder, x.reshape(-1, self.WIN * self.WIN, self.in_dim))
         return emb.reshape(b, self.n_win, -1).permute(0, 2, 1).reshape(b, -1, self.nh, self.nw)
 
-    def forward(self, img):
-        b = img.shape[0]
-        feat = self._features(img)
-        m16 = self._map_dense(feat) if self.dense else self._map_windowed(feat)
+    def _tail(self, m16):  # (B,hidden,53,95) embedding map -> (B,3,54,96) cells
+        b = m16.shape[0]
         m = torch.cat([m16, self.xy_map.expand(b, -1, -1, -1)], 1)  # (B,18,53,95)
 
-        maps = [p(m) for p in self.pools]  # Path A, full res (D14)
+        maps = [dq(p(m)) for p, dq in zip(self.pools, self.path_dq)]  # Path A + per-path DQ (D14, D36)
         states = torch.stack([gp(mp) for gp, mp in zip(self.globals_, maps)], 1)  # (B,3,256)
         gtoks = self.mix(states)  # (B, 16, 18)
 
@@ -163,6 +194,14 @@ class ANetV1(nn.Module):
         wlogits = self.head(ltoks, gtoks).permute(0, 2, 1).reshape(b, 3, self.nh, self.nw)
         cells = F.conv_transpose2d(wlogits, self.cell_kernel, groups=3)
         return cells / self.cell_counts  # (B, 3, 54, 96)
+
+    def forward(self, img):
+        feat = self._features(img)
+        if self.dense:
+            m16 = self._map_dense(feat) if self.training else self._map_dense_batched(feat)
+        else:
+            m16 = self._map_windowed(feat)
+        return self._tail(m16)
 
     def reg_losses(self):
         l2 = self.encoder.reg_l2() + self.mix.reg_l2() + self.head.reg_l2()

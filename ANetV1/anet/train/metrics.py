@@ -8,10 +8,23 @@ box-area decile computed from the labels themselves.
 from collections import deque
 
 import numpy as np
+import torch
 
 from ..data.rasterize import GRID_H, GRID_W, box_footprint_cells
 
 CLASS_NAMES = ("background", "mannequin", "tent")
+
+
+def confident_pred(logits, thresh=0.0):
+    """argmax, but demote a foreground win to background if its softmax prob
+    doesn't clear `thresh` — the eval/deploy false-positive gate. logits (B,3,H,W).
+    thresh<=0 is plain argmax."""
+    probs = torch.softmax(logits, 1)
+    pred = probs.argmax(1)
+    if thresh > 0:
+        top = probs.gather(1, pred.unsqueeze(1)).squeeze(1)
+        pred = torch.where((pred > 0) & (top < thresh), torch.zeros_like(pred), pred)
+    return pred
 
 
 class CellConfusion:
