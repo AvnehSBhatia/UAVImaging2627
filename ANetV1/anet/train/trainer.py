@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from .losses import distill_kl, focal_loss, tversky_loss
+from .losses import distill_kl, focal_loss, focal_tversky_loss, tversky_loss
 from .metrics import CellConfusion, ObjectMetrics
 
 
@@ -123,17 +123,24 @@ class Trainer:
     def _loss(self, batch):
         cells = self.model(batch["image"].to(self.device, non_blocking=True))
         grid = batch["grid"].to(self.device, non_blocking=True)
-        # hard-label objective: focal (per-cell hard-example mining) + Tversky
-        # (set-level FP/FN control — the precision knob for fp/img)
-        hard = focal_loss(cells, grid, gamma=self.cfg.train.focal_gamma,
-                          alpha=tuple(self.cfg.train.class_alpha))
-        tw = getattr(self.cfg.train, "tversky_weight", 0.0) or 0.0
-        if tw:
-            hard = hard + tw * tversky_loss(
-                cells, grid,
-                alpha=getattr(self.cfg.train, "tversky_alpha", 0.7),
-                beta=getattr(self.cfg.train, "tversky_beta", 0.3),
-            )
+        c = self.cfg.train
+        ta = getattr(c, "tversky_alpha", 0.7)
+        tb = getattr(c, "tversky_beta", 0.3)
+        if getattr(c, "loss_mode", "combo") == "focal_tversky":
+            # single balanced term (no focal-vs-Tversky fight) + a GENTLE per-cell
+            # focal anchor for dense, stable gradient early on. The anchor uses a
+            # mild alpha (it stabilizes; focal-Tversky does the class balancing).
+            ft = focal_tversky_loss(cells, grid, alpha=ta, beta=tb,
+                                    gamma=getattr(c, "ft_gamma", 0.75))
+            anchor = focal_loss(cells, grid, gamma=c.focal_gamma,
+                                alpha=tuple(getattr(c, "ft_anchor_alpha", (1.0, 2.0, 2.0))))
+            hard = ft + getattr(c, "ft_anchor_weight", 0.5) * anchor
+        else:  # legacy: focal + separately-weighted Tversky (can tug-of-war)
+            hard = focal_loss(cells, grid, gamma=c.focal_gamma,
+                              alpha=tuple(c.class_alpha))
+            tw = getattr(c, "tversky_weight", 0.0) or 0.0
+            if tw:
+                hard = hard + tw * tversky_loss(cells, grid, alpha=ta, beta=tb)
         loss = hard
         if self.distill:
             loss = (1.0 - self.cfg.distill.kl_weight) * hard + \

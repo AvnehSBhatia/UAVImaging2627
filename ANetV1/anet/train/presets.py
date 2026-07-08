@@ -49,12 +49,16 @@ def anet_cfg(**overrides):
         # (60 vs 196 in the traced frame), so per-OBJECT it generated less loss
         # even at alpha 8 (60*8 < 196*4). 12 ~ per-object-balanced (4 * 196/60).
         class_alpha=[1.0, 12.0, 4.0],  # [background, mannequin, tent]
-        # Tversky term (FP/FN-aware). It's SIZE-INVARIANT (one set-level score per
-        # class, independent of cell count) — the structural fix for small objects
-        # generating less loss. 0.2 leans on it harder; alpha>beta punishes FP.
-        tversky_weight=0.2,
-        tversky_alpha=0.7,            # FP penalty
-        tversky_beta=0.3,             # FN penalty
+        # loss_mode "focal_tversky": ONE size-invariant balanced term (Focal-Tversky)
+        # + a gentle focal anchor. No focal-vs-Tversky tug-of-war -> no fp 0.3<->28
+        # limit cycle. "combo" = legacy focal + separate Tversky (kept for ablation).
+        loss_mode="focal_tversky",
+        ft_gamma=0.75,               # (1-TI)**gamma; <1 focuses hard classes, stays stable
+        ft_anchor_weight=0.5,        # weight of the dense per-cell focal anchor
+        ft_anchor_alpha=[1.0, 2.0, 2.0],  # MILD — balancing is Focal-Tversky's job, not the anchor's
+        tversky_weight=0.2,          # only used in "combo" mode
+        tversky_alpha=0.7,           # FP penalty (both modes)
+        tversky_beta=0.3,            # FN penalty (both modes)
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
