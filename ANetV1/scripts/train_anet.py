@@ -48,8 +48,11 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        cfg.train.warmup_steps = 0  # already trained — no alive-at-init warmup
-        print(f"RESUMING from {init} (warm start, warmup disabled)")
+        # keep a SHORT warmup + lower peak lr: hitting a converged model with the
+        # full 4e-3 immediately made it thrash (mannequin 0.08<->0.63, fp 0.3<->28)
+        cfg.train.warmup_steps = 100
+        cfg.train.lr = min(cfg.train.lr, 2.0e-3)
+        print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, warmup=100)")
     else:
         model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
                        stem=cfg.train.stem)

@@ -81,7 +81,14 @@ class Trainer:
             self.device.type, enabled=self.amp_dtype is torch.float16
         )
         if getattr(cfg.train, "compile", False):
-            self.model = torch.compile(self.model)
+            # the model is launch-bound (thousands of tiny kernels at ~1% util);
+            # reduce-overhead captures HIP/CUDA graphs to collapse the launch storm.
+            # compiles lazily on first step, so failures surface there — set
+            # compile:false to fall back to eager. First step is slow (autotune).
+            mode = getattr(cfg.train, "compile_mode", "reduce-overhead")
+            self.model = torch.compile(self.model, mode=mode)
+            print(f"torch.compile ON (mode={mode}) — first step compiles, then fast",
+                  flush=True)
 
         self.opt = torch.optim.AdamW(
             self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0

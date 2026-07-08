@@ -30,6 +30,11 @@ def anet_cfg(**overrides):
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
+        # torch.compile: the model is launch-bound (~1% GPU util, thousands of
+        # tiny kernels), so HIP-graph capture is the big speed lever — expect a
+        # few-x faster epochs. Set False if inductor errors on the ROCm build.
+        compile=IS_CUDA,
+        compile_mode="reduce-overhead",
         hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
         stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
         use_checkpoint=not IS_CUDA,   # Mac: memory valve; CUDA: pure waste
@@ -40,12 +45,14 @@ def anet_cfg(**overrides):
         select_tent_weight=0.5,       # best.pt = argmax(mannequin + 0.5*tent), not mannequin alone
         mps_memory_frac=0.5,          # Mac: error instead of swap-freezing
         focal_gamma=2.0,
-        class_alpha=[1.0, 8.0, 4.0],  # [background, mannequin, tent]
-        # Tversky term (FP/FN-aware). focal is ~0.05 here, Tversky is ~0.3-0.6, so
-        # weight 0.1 makes it a corrective, not the dominant term. alpha>beta =>
-        # punish false positives harder (the fp/img knob). Raise weight or alpha to
-        # cut FP; expect a small recall cost. Set weight 0 to disable.
-        tversky_weight=0.1,
+        # mannequin alpha 12 (was 8): a mannequin is ~3x fewer cells than a tent
+        # (60 vs 196 in the traced frame), so per-OBJECT it generated less loss
+        # even at alpha 8 (60*8 < 196*4). 12 ~ per-object-balanced (4 * 196/60).
+        class_alpha=[1.0, 12.0, 4.0],  # [background, mannequin, tent]
+        # Tversky term (FP/FN-aware). It's SIZE-INVARIANT (one set-level score per
+        # class, independent of cell count) — the structural fix for small objects
+        # generating less loss. 0.2 leans on it harder; alpha>beta punishes FP.
+        tversky_weight=0.2,
         tversky_alpha=0.7,            # FP penalty
         tversky_beta=0.3,             # FN penalty
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
