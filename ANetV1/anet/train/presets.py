@@ -31,15 +31,14 @@ def anet_cfg(**overrides):
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
-        # torch.compile fuses the launch-bound pointwise chains (cosine gates,
-        # SiLU) into fewer kernels. NB: mode="reduce-overhead" (HIP graphs) is
-        # INCOMPATIBLE with this loop — grad-accum + on-GPU loss accumulation
-        # (nan_check_every) hold tensors across steps and the graph overwrites
-        # their buffers ("accessing tensor output of CUDAGraphs... overwritten").
-        # "default" fuses without graphs; the runahead (nan_check_every) already
-        # provides the launch-hiding graphs would. Set compile=False if inductor
-        # errors on the ROCm build.
-        compile=IS_CUDA,
+        # torch.compile is OFF: it crashed twice on this ROCm build — mode
+        # "reduce-overhead" (HIP graphs) is incompatible with grad-accum +
+        # on-GPU loss accumulation, and "default" OOM'd the host compiling the
+        # BACKWARD graph (died "Terminated" right after the first forward). The
+        # runahead (nan_check_every) already gives the launch-bound speedup, so
+        # compile is not needed. To retry later: set compile=True AND export
+        # TORCHINDUCTOR_COMPILE_THREADS=1 to cap the compiler's host RAM.
+        compile=False,
         compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search
