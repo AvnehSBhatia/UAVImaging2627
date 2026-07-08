@@ -31,11 +31,16 @@ def anet_cfg(**overrides):
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
-        # torch.compile: the model is launch-bound (~1% GPU util, thousands of
-        # tiny kernels), so HIP-graph capture is the big speed lever — expect a
-        # few-x faster epochs. Set False if inductor errors on the ROCm build.
+        # torch.compile fuses the launch-bound pointwise chains (cosine gates,
+        # SiLU) into fewer kernels. NB: mode="reduce-overhead" (HIP graphs) is
+        # INCOMPATIBLE with this loop — grad-accum + on-GPU loss accumulation
+        # (nan_check_every) hold tensors across steps and the graph overwrites
+        # their buffers ("accessing tensor output of CUDAGraphs... overwritten").
+        # "default" fuses without graphs; the runahead (nan_check_every) already
+        # provides the launch-hiding graphs would. Set compile=False if inductor
+        # errors on the ROCm build.
         compile=IS_CUDA,
-        compile_mode="reduce-overhead",
+        compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search
         # on ROCm for zero gain (see trainer.py) — so: on for CUDA, off for HIP.
