@@ -43,6 +43,30 @@ fi
 
 printf '\n== ANetV1 MI300X | data=%s | python=%s ==\n' "$DATA_ROOT" "$PY"
 
-"$PY" scripts/train_anet.py 2>&1 | tee "$LOG_DIR/anet.log"
+# --- forensics: something external SIGTERMs training ~5min in ("Terminated",
+# no traceback, survives compile-off/worker cuts/VRAM bounds). Record system
+# state every 10s so the death leaves evidence, and run python in its OWN
+# SESSION (setsid) so signals aimed at this shell's process group miss it.
+SYSMON="$LOG_DIR/sysmon.log"
+( while true; do
+    rss=$(ps -o rss= -C python3 2>/dev/null | sort -rn | head -1)
+    vram=$(rocm-smi --showmeminfo vram --csv 2>/dev/null | tail -1 | cut -d, -f3)
+    echo "$(date +%H:%M:%S) mem_avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo) py_rss_kb=${rss:-0} vram_used=${vram:-?}"
+    sleep 10
+  done >> "$SYSMON" ) &
+MON_PID=$!
+trap 'kill $MON_PID 2>/dev/null' EXIT
+
+set +e
+setsid "$PY" scripts/train_anet.py < /dev/null 2>&1 | tee "$LOG_DIR/anet.log"
+rc=${PIPESTATUS[0]}
+set -e
+if [[ "$rc" != 0 ]]; then
+    echo "=== training exited rc=$rc — last system samples ==="
+    tail -6 "$SYSMON" || true
+    echo "=== kernel log (look for amdgpu/KFD/oom lines) ==="
+    dmesg 2>/dev/null | tail -20 || echo "(dmesg not permitted in this container)"
+    exit "$rc"
+fi
 touch "$MARKER"
 echo "done -> $ANET_DIR/runs/anet/best.pt"
