@@ -85,10 +85,13 @@ def anet_cfg(**overrides):
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
-        # decode+letterbox of 1920x1080 JPEGs is the per-item cost; with uint8
-        # images the workers do no fp32 math, so 16 keeps a 32-batch GPU fed
-        num_workers=min(16, os.cpu_count() or 8) if IS_CUDA else 2,
-        prefetch_factor=4 if IS_CUDA else 2,
+        # SPAWN workers are heavy (each re-imports torch, ~1-2GB); 16 of them + the
+        # compile process OOM'd the container ("Terminated" + leaked semaphores).
+        # The model is launch-bound so the GPU is barely fed anyway — 6 workers
+        # decode well ahead of the ~1-2s/step compute. Bump only if a worker
+        # profile shows the GPU actually starving.
+        num_workers=min(6, os.cpu_count() or 6) if IS_CUDA else 2,
+        prefetch_factor=2 if IS_CUDA else 2,
         checkpoint_dir="runs/anet",
     )
     data = dict(
