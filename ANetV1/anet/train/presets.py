@@ -28,12 +28,17 @@ def anet_cfg(**overrides):
         # the 192GB card (~160GB) — 32 is the ceiling. accum 2 keeps effective 64.
         # MEMORY NOTE (D38): the single-batched Stage-1 pass holds all 4 phases'
         # transients at once (~10-15% higher peak than the old 4-pass loop) for
-        # ~4x fewer kernel launches. If batch 32 now OOMs, drop to batch_size=16,
-        # accum_steps=4 — same effective 64, half the activation footprint, and
-        # STILL fewer total launches than the old batch-32 4-pass (the batched
-        # encoder runs once per microbatch regardless of batch size).
-        batch_size=32 if IS_CUDA else 4,
-        accum_steps=2 if IS_CUDA else 4,
+        # ~4x fewer kernel launches. Plus MIOpen autotune probes multi-GB
+        # workspaces on the fresh D37 grouped-conv shapes (see the "workspace
+        # required: 4.7e9" warnings) — a transient VRAM spike that can cliff a
+        # batch-32 step. If it OOMs / gets Terminated: ANET_BATCH=16 ANET_ACCUM=4
+        # (same effective 64, half the activation footprint, room for autotune
+        # workspace), ideally with MIOPEN_FIND_MODE=NORMAL on the first run to
+        # build the find-db so later epochs stop probing.
+        batch_size=int(os.environ["ANET_BATCH"]) if "ANET_BATCH" in os.environ
+        else (32 if IS_CUDA else 4),
+        accum_steps=int(os.environ["ANET_ACCUM"]) if "ANET_ACCUM" in os.environ
+        else (2 if IS_CUDA else 4),
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
