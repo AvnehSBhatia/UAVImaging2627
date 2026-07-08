@@ -13,6 +13,18 @@ cd "$(dirname "$0")"
 ANET_DIR="$(pwd)"
 REPO_ROOT="$(dirname "$ANET_DIR")"
 
+# auto-detach: this box's shell is a JupyterLab web terminal that SIGTERMs the
+# foreground process group on websocket blips (bare "Terminated", killed 5 runs).
+# On a TTY, relaunch detached and point the user at the log. FOREGROUND=1 opts out.
+if [[ -t 1 && "${FOREGROUND:-0}" != 1 ]]; then
+    mkdir -p logs
+    nohup "$0" "$@" < /dev/null >> logs/anet_run.out 2>&1 &
+    disown
+    echo "detached (pid $!) — terminal kills can't reach it now"
+    echo "watch:  tail -f logs/anet_run.out"
+    exit 0
+fi
+
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/datasets/suas-synth-50k}"
 STAGE_DIR="$ANET_DIR/runs/.stages"
 LOG_DIR="$ANET_DIR/logs"

@@ -16,16 +16,34 @@
 #   PYTHON           python binary (default: python3; box must have ROCm torch)
 #   FORCE=1          rerun all stages (default: completed stages are skipped)
 #   FORCE_STAGE=x    rerun one stage: data|smoke|yolo|anet|teacher|distill|eval
+#   FOREGROUND=1     do NOT auto-detach (for debugging only — see below)
 #
 # Stages are checkpointed in runs/.stages/ — the script is safe to rerun after
 # any failure; it resumes at the first incomplete stage. All output tees to
 # logs/<stage>.log.
+#
+# AUTO-DETACH: this box's shell is a JupyterLab web terminal (PID 7) behind a
+# cloudflared tunnel — it SIGTERMs the foreground process group on websocket
+# blips, which repeatedly killed multi-hour runs with a bare "Terminated".
+# When launched on a TTY, the script therefore re-launches itself detached
+# (nohup + own session) and tells you where to tail. FOREGROUND=1 opts out.
 # =============================================================================
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ANET_DIR="$(pwd)"
 REPO_ROOT="$(dirname "$ANET_DIR")"
+
+# --- auto-detach: survive the Jupyter web terminal (see header) --------------
+if [[ -t 1 && "${FOREGROUND:-0}" != 1 ]]; then
+    mkdir -p logs
+    OUT="logs/pipeline.out"
+    nohup "$0" "$@" < /dev/null >> "$OUT" 2>&1 &
+    disown
+    echo "detached (pid $!) — terminal kills can't reach it now"
+    echo "watch:  tail -f $OUT"
+    exit 0
+fi
 
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/datasets/suas-synth-50k}"
 DATA_SRC="${DATA_SRC:-}"
@@ -46,6 +64,7 @@ export PYTHONUNBUFFERED=1
 _ALLOC="expandable_segments:True,garbage_collection_threshold:0.8"
 export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-$_ALLOC}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$_ALLOC}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-$_ALLOC}"  # unified name (newer torch/ROCm)
 
 # Container images usually preinstall ROCm torch in /opt/venv, not system python3.
 if [[ -z "${PYTHON:-}" && -x /opt/venv/bin/python3 ]]; then
@@ -57,7 +76,27 @@ fi
 say()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# stage <name> <command...>: run once, tee log, mark done; skip if already done
+# --- telemetry: MemAvailable / biggest-python RSS / VRAM every 10s -----------
+SYSMON="$LOG_DIR/sysmon.log"
+( while true; do
+    rss=$(ps -o rss= -C python3 2>/dev/null | sort -rn | head -1)
+    vram=$(rocm-smi --showmeminfo vram 2>/dev/null | awk '/Used/{print $NF; exit}')
+    echo "$(date +%F_%H:%M:%S) mem_avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo) py_rss_kb=${rss:-0} vram_used=${vram:-?}"
+    sleep 10
+  done >> "$SYSMON" ) &
+MON_PID=$!
+trap 'kill $MON_PID 2>/dev/null' EXIT
+
+forensics() {  # called when a stage dies abnormally
+    echo "=== stage '$1' exited rc=$2 — last system samples ==="
+    tail -6 "$SYSMON" 2>/dev/null || true
+    echo "=== kernel log tail (amdgpu/KFD/oom lines matter) ==="
+    dmesg 2>/dev/null | tail -20 || echo "(dmesg not permitted in this container)"
+}
+
+# stage <name> <command...>: run once, tee log, mark done; skip if already
+# done; dump forensics on abnormal exit. (Terminal-kill immunity comes from
+# the auto-detach at the top, so no per-stage setsid needed.)
 stage() {
     local name="$1"; shift
     local marker="$STAGE_DIR/$name.done"
@@ -66,7 +105,14 @@ stage() {
         return 0
     fi
     say "stage: $name"
-    ( "$@" ) 2>&1 | tee "$LOG_DIR/$name.log"
+    set +e
+    ( "$@" ) < /dev/null 2>&1 | tee "$LOG_DIR/$name.log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    if [[ "$rc" != 0 ]]; then
+        forensics "$name" "$rc"
+        exit "$rc"
+    fi
     touch "$marker"
 }
 
