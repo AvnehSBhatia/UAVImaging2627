@@ -44,13 +44,14 @@ def anet_cfg(**overrides):
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search
         # on ROCm for zero gain (see trainer.py) — so: on for CUDA, off for HIP.
         cudnn_benchmark=IS_CUDA and not IS_ROCM,
-        # every loss.item() is a full GPU sync that stops the CPU from queueing
-        # the next steps (the model is launch-bound, so runahead IS the speedup).
-        # >1 = accumulate the loss on-GPU and sync/NaN-check every N steps.
-        # Tradeoff: a NaN inside a window is only caught at the window edge, after
-        # its optimizer steps already ran — divergence still dies fast (streak
-        # logic), but transient NaNs are no longer skipped. 1 = old exact behavior.
-        nan_check_every=16 if IS_CUDA else 1,
+        # nan_check_every>1 (runahead: no per-step sync) let the CPU enqueue the
+        # NEXT step's forward while the previous step's ~80GB of activations were
+        # still live -> ~160GB+ in flight -> VRAM exhausted -> the amdgpu/KFD
+        # driver SIGTERMs the process ("Terminated", no traceback; MIOpen logs
+        # "provided ptr: 0" because torch had no free VRAM for workspace). This
+        # model's activations are too big for ANY lookahead at batch 32 — keep 1.
+        # (Safe to raise only if batch is dropped so 2-3 steps fit in VRAM.)
+        nan_check_every=1,
         hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
         stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
         use_checkpoint=not IS_CUDA,   # Mac: memory valve; CUDA: pure waste
@@ -60,6 +61,11 @@ def anet_cfg(**overrides):
         early_stop_min_epochs=10,
         select_tent_weight=0.5,       # best.pt = argmax(mannequin + 0.5*tent), not mannequin alone
         mps_memory_frac=0.5,          # Mac: error instead of swap-freezing
+        # cap the torch allocator below physical VRAM so overallocation raises a
+        # catchable torch.OutOfMemoryError (traceback, diagnosable) instead of the
+        # driver killing the process with a bare SIGTERM; also leaves MIOpen
+        # room to get real autotune workspace instead of "provided ptr: 0"
+        cuda_memory_frac=0.90,
         focal_gamma=2.0,
         # mannequin alpha 12 (was 8): a mannequin is ~3x fewer cells than a tent
         # (60 vs 196 in the traced frame), so per-OBJECT it generated less loss

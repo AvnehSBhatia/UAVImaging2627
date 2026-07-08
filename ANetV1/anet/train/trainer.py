@@ -67,6 +67,12 @@ class Trainer:
         if frac and self.device.type == "mps":
             torch.mps.set_per_process_memory_fraction(float(frac))
         if self.device.type == "cuda":
+            # cap the allocator below physical VRAM: overallocation then raises a
+            # catchable torch OOM (traceback) instead of the amdgpu/KFD driver
+            # SIGTERMing the process ("Terminated", no traceback)
+            cfrac = getattr(cfg.train, "cuda_memory_frac", None)
+            if cfrac:
+                torch.cuda.set_per_process_memory_fraction(float(cfrac))
             # TF32 for the fp32 GEMMs that stay outside autocast (ManualBatchNorm
             # runs fp32 on purpose) — free speed on Ampere+/CDNA3
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -230,8 +236,9 @@ class Trainer:
                     wsum = loss_win.item() * accum  # the ONE sync per window
                     loss_win.zero_()
                     if step == 0:
-                        note = ((" (compile + MIOpen/cuDNN autotune — first "
-                                 "steps take minutes)")
+                        compiled = bool(getattr(self.cfg.train, "compile", False))
+                        note = ((f" ({'compile + ' if compiled else ''}MIOpen/cuDNN "
+                                 "autotune — first steps are slow)")
                                 if epoch == 0 and self.device.type == "cuda" else "")
                         print(f"epoch {epoch}: first step loss={wsum:.4f}{note}",
                               flush=True)
