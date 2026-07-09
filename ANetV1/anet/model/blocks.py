@@ -87,16 +87,21 @@ class ManualBatchNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        if x.device.type != "mps":
-            # fused native BN (cuDNN/MIOpen/CPU): identical math and running-stat
-            # convention (lerp(momentum) == (1-m)*run + m*batch; unbiased var in
-            # the running buffer). The win is autograd: the fused kernel saves
-            # the input + two per-channel vectors, where the primitive-op form
-            # below saves TWO full-res fp32 intermediates per call — measured
-            # 1.35 GiB/img of the 2.87 GiB/img training footprint. Stats still
-            # accumulate in fp32 internally for half inputs (cuDNN/MIOpen
-            # mixed-precision BN), so the bf16 two-pass-variance concern that
-            # motivated the manual form's .float() does not apply here.
+        # fused native BN (cuDNN/MIOpen/CPU): identical math and running-stat
+        # convention (lerp(momentum) == (1-m)*run + m*batch; unbiased var in
+        # the running buffer). The win is autograd: the fused kernel saves the
+        # input + two per-channel vectors, where the primitive-op form below
+        # saves TWO full-res fp32 intermediates per call — measured 1.35 GiB/img
+        # of the 2.87 GiB/img training footprint. Stats still accumulate in fp32
+        # internally for half inputs, so the bf16 two-pass-variance concern that
+        # motivated the manual form's .float() does not apply.
+        # Two cases MUST take the primitive path instead:
+        #   - MPS: the fused kernel rejects some stride patterns in this graph.
+        #   - numel >= 2^31: MIOpen's BatchNorm kernel indexes N*C*H*W with a
+        #     32-bit int; past INT32_MAX it wraps negative and fails its own
+        #     static_assert(NCHW>=0) at HIP compile time (miopenStatusUnknownError).
+        #     Hits the full-res embed BN (4B·24·540·960) at batch >= ~44.
+        if x.device.type != "mps" and x.numel() < 2**31:
             return F.batch_norm(x, self.running_mean, self.running_var,
                                 self.weight, self.bias, self.training,
                                 self.momentum, self.eps)
