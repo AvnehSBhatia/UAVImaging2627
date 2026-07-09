@@ -101,8 +101,12 @@ def anet_cfg(**overrides):
         if "ANET_CKPT" in os.environ else not IS_CUDA,
         amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
         samples_per_epoch=None if IS_CUDA else 6000,
-        early_stop_patience=6,
-        early_stop_min_epochs=10,
+        # early stop killed a run at epoch 10 right after mannequin PEAKED (ep5)
+        # but while LR was still high and everything oscillating — it never
+        # reached the low-LR back half where the swings damp out. Give it the
+        # full schedule: min 25 epochs, patience 12. ANET_MIN_EP / ANET_PATIENCE.
+        early_stop_patience=int(os.environ["ANET_PATIENCE"]) if "ANET_PATIENCE" in os.environ else 12,
+        early_stop_min_epochs=int(os.environ["ANET_MIN_EP"]) if "ANET_MIN_EP" in os.environ else 25,
         select_tent_weight=0.5,       # best.pt = argmax(mannequin + 0.5*tent), not mannequin alone
         mps_memory_frac=0.5,          # Mac: error instead of swap-freezing
         # cap the torch allocator below physical VRAM so overallocation raises a
@@ -158,12 +162,19 @@ def anet_cfg(**overrides):
         if "ANET_ANCHOR_W" in os.environ else 0.5,
         ft_anchor_alpha=[1.0, 2.0, 2.0],  # MILD — balancing is Focal-Tversky's job
         tversky_weight=0.2,          # only used in "combo" mode
-        tversky_alpha=(0.8, 0.6),    # FP penalty per class (mannequin, tent)
-        tversky_beta=0.3,            # FN penalty
-        # ANTI-OSCILLATION knob: smooth is virtual-TP cells in the Tversky index;
-        # a larger value makes the index LESS reactive to per-batch FP/FN noise,
-        # which damps the limit cycle. 1.0 = original; ANET_SMOOTH=3 damps harder.
-        ft_smooth=float(os.environ["ANET_SMOOTH"]) if "ANET_SMOOTH" in os.environ else 1.0,
+        # RETRAIN tune (observed mannequin collapse-after-spike, ep5 0.30->ep8 0.00):
+        # mannequin alpha 0.8 punished the epoch-5 over-prediction so hard it
+        # slammed the channel back to 0. 0.7 keeps FP pressure but stops the
+        # collapse; tent stays 0.6. beta 0.3->0.4 so a miss hurts nearly as much
+        # as an FP (was too precision-biased for the under-detected class).
+        tversky_alpha=(float(os.environ["ANET_TV_ALPHA"]) if "ANET_TV_ALPHA" in os.environ
+                       else 0.7, 0.6),
+        tversky_beta=float(os.environ["ANET_TV_BETA"]) if "ANET_TV_BETA" in os.environ else 0.4,
+        # ANTI-OSCILLATION: smooth is virtual-TP cells in the Tversky index; a
+        # larger value makes the index LESS reactive to per-batch FP/FN noise so
+        # one over-predicting epoch can't slam the channel to 0. 1.0 = original;
+        # 2.0 damps the observed limit cycle. ANET_SMOOTH overrides.
+        ft_smooth=float(os.environ["ANET_SMOOTH"]) if "ANET_SMOOTH" in os.environ else 2.0,
         # eval/deploy FP gate (eval-only; does not affect training). 0.5 = original
         # working value; lower reveals sub-threshold predictions. ANET_CONF sets it.
         conf_thresh=float(os.environ["ANET_CONF"]) if "ANET_CONF" in os.environ else 0.5,
