@@ -127,7 +127,17 @@ class Trainer:
             #     to 1 unless the caller already set it. setdefault must run
             #     before the first (lazy) compile, i.e. here.
             os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
-            mode = getattr(cfg.train, "compile_mode", "default")
+            # ANET_COMPILE_MODE overrides the preset. "reduce-overhead" captures
+            # the whole step as a HIP/CUDA graph -> the ~1000s of kernel launches
+            # replay as ONE launch (the launch-bound win). Safe only at accum=1
+            # (no cross-step grad accumulation into a static-buffer graph) with
+            # the cudagraph-safe loss .clone() above.
+            mode = os.environ.get("ANET_COMPILE_MODE") or \
+                getattr(cfg.train, "compile_mode", "default")
+            if mode == "reduce-overhead" and cfg.train.accum_steps != 1:
+                print("WARN: reduce-overhead (cudagraphs) needs accum_steps=1; "
+                      f"have {cfg.train.accum_steps} — set ANET_ACCUM=1 "
+                      "(e.g. ANET_BATCH=64 ANET_ACCUM=1)", flush=True)
             try:
                 # dynamic=False: train shapes are static (drop_last=True), which
                 # lets inductor specialize + skips guard overhead every step.
@@ -282,9 +292,12 @@ class Trainer:
                 with self._autocast():
                     loss = self._loss(batch) / accum
                 self.scaler.scale(loss).backward()
-                # consume the loss buffer NOW (cudagraph outputs are overwritten
-                # by the next replay) — but without a sync
-                loss_win += loss.detach()
+                # copy the loss OUT of its buffer NOW: under cudagraphs (compile
+                # mode reduce-overhead) `loss` is a static output tensor that the
+                # NEXT replay overwrites, so a plain view-add would read stale
+                # values once we accumulate >1 step (nan_check_every>1). .clone()
+                # forces a real copy this step; it's a scalar, so ~free.
+                loss_win += loss.detach().clone()
                 win_n += 1
                 if step == 0 or win_n >= check or step + 1 == n_batches:
                     wsum = loss_win.item() * accum  # the ONE sync per window
