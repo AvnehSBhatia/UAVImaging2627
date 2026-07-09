@@ -6,27 +6,20 @@
 #
 # Env:
 #   DATA_ROOT   dataset root (default: <repo>/datasets/suas-synth-50k)
-#   FORCE=1     rerun even if runs/.stages/anet.done exists
-#   FOREGROUND=1  don't auto-detach (debug in this terminal)
-# Defaults below (ANET_*): workers=0, compile=0, batch=16/accum=4 — safe for
-# this container. Re-enable speed later: ANET_COMPILE=1 ANET_BATCH=32 ...
+# Fast defaults (2026-07-08 memory/throughput work): batch 16 x accum 4
+# (effective 64 unchanged), compile ON (inductor fuses + rematerializes ->
+# ~10GB VRAM), 4 spawn workers over the memmap dataset cache (first run
+# builds it: ~70GB under $DATA_ROOT/.anet_cache, ~10 min one-time).
+# Escape hatches if the container misbehaves:
+#   ANET_COMPILE=0        eager (trainer also auto-falls-back on any error)
+#   ANET_CKPT=1           per-round checkpointing (pair with eager: caps VRAM)
+#   ANET_NUM_WORKERS=0    in-process loader
+#   ANET_CACHE=0          no disk cache (slow PIL decode path)
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ANET_DIR="$(pwd)"
 REPO_ROOT="$(dirname "$ANET_DIR")"
-
-# auto-detach: this box's shell is a JupyterLab web terminal that SIGTERMs the
-# foreground process group on websocket blips (bare "Terminated", killed 5 runs).
-# On a TTY, relaunch detached and point the user at the log. FOREGROUND=1 opts out.
-if [[ -t 1 && "${FOREGROUND:-0}" != 1 ]]; then
-    mkdir -p logs
-    nohup "$0" "$@" < /dev/null >> logs/anet_run.out 2>&1 &
-    disown
-    echo "detached (pid $!) — terminal kills can't reach it now"
-    echo "watch:  tail -f logs/anet_run.out"
-    exit 0
-fi
 
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/datasets/suas-synth-50k}"
 STAGE_DIR="$ANET_DIR/runs/.stages"
@@ -34,12 +27,12 @@ LOG_DIR="$ANET_DIR/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
 
 export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
-# Container-safe defaults for this MI300X box (override anytime):
-#   spawn workers + torch.compile + batch-32 repeatedly hung epoch-0, leaked
-#   semaphores, and left 60-115GB orphaned VRAM (amd-smi host PIDs unkillable
-#   from inside the container). In-process loader, eager train, batch-16 first.
-export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
-export ANET_COMPILE="${ANET_COMPILE:-0}"
+# The old epoch-0 hangs are root-caused and fixed (fork->spawn workers,
+# inductor compile-workers capped to 1); the old 115GB VRAM is fixed at the
+# source (fused BN, bf16 stream, per-round checkpointing — ~10GB at batch 32).
+# Presets now default to the fast path; only pin what differs per-box here.
+export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-4}"
+export ANET_COMPILE="${ANET_COMPILE:-1}"
 export ANET_BATCH="${ANET_BATCH:-16}"
 export ANET_ACCUM="${ANET_ACCUM:-4}"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"
@@ -48,8 +41,8 @@ export NNPACK_DISABLE=1
 export PYTHONUNBUFFERED=1
 # torch.compile (on for CUDA/ROCm via presets): cap inductor to ONE compile
 # worker so it can't fork ncpu full-torch processes and OOM the host compiling
-# the backward graph (the old "Terminated" right after first forward). A warm
-# on-disk cache makes reruns skip recompilation. Set ANET_COMPILE=0 to disable.
+# the backward graph. A warm on-disk cache makes reruns skip recompilation.
+# Set ANET_COMPILE=0 to disable.
 export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$ANET_DIR/.torchinductor}"
 _ALLOC="expandable_segments:True,garbage_collection_threshold:0.8"
@@ -64,43 +57,18 @@ else
 fi
 
 # settings live IN scripts/train_anet.py now (no yaml) — edit that file to tune.
-# No stage-marker gate here: running this script MEANS "train ANet now".
-# Only guard: never start a second trainer on top of a live one.
+# Running this script MEANS "train ANet now" — no stage-marker gate. The only
+# guard: never start a second trainer on top of a live one.
 if pgrep -f "train_anet.py" > /dev/null 2>&1; then
     echo "a train_anet.py is ALREADY RUNNING:"
     pgrep -af "train_anet.py"
-    echo "watch it:  tail -f logs/anet_run.out   (or logs/anet.log)"
+    echo "watch it:  tail -f logs/anet.log"
     echo "kill it:   pkill -f train_anet.py      then rerun this script"
     exit 1
 fi
-MARKER="$STAGE_DIR/anet.done"
 
 printf '\n== ANetV1 MI300X | data=%s | python=%s ==\n' "$DATA_ROOT" "$PY"
 
-# --- forensics: something external SIGTERMs training ~5min in ("Terminated",
-# no traceback, survives compile-off/worker cuts/VRAM bounds). Record system
-# state every 10s so the death leaves evidence, and run python in its OWN
-# SESSION (setsid) so signals aimed at this shell's process group miss it.
-SYSMON="$LOG_DIR/sysmon.log"
-( while true; do
-    rss=$(ps -o rss= -C python3 2>/dev/null | sort -rn | head -1)
-    vram=$(rocm-smi --showmeminfo vram --csv 2>/dev/null | tail -1 | cut -d, -f3)
-    echo "$(date +%H:%M:%S) mem_avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo) py_rss_kb=${rss:-0} vram_used=${vram:-?}"
-    sleep 10
-  done >> "$SYSMON" ) &
-MON_PID=$!
-trap 'kill $MON_PID 2>/dev/null' EXIT
-
-set +e
-setsid "$PY" scripts/train_anet.py < /dev/null 2>&1 | tee "$LOG_DIR/anet.log"
-rc=${PIPESTATUS[0]}
-set -e
-if [[ "$rc" != 0 ]]; then
-    echo "=== training exited rc=$rc — last system samples ==="
-    tail -6 "$SYSMON" || true
-    echo "=== kernel log (look for amdgpu/KFD/oom lines) ==="
-    dmesg 2>/dev/null | tail -20 || echo "(dmesg not permitted in this container)"
-    exit "$rc"
-fi
-touch "$MARKER"
+"$PY" scripts/train_anet.py 2>&1 | tee "$LOG_DIR/anet.log"
+touch "$STAGE_DIR/anet.done"
 echo "done -> $ANET_DIR/runs/anet/best.pt"

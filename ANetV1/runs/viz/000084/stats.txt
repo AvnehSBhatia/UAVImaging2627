@@ -1,3 +1,0 @@
-image 000084
-mannequin: gt_cells=24 pred_cells=1
-tent: gt_cells=56 pred_cells=30

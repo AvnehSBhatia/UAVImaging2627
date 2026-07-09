@@ -1,3 +1,0 @@
-image 000508
-mannequin: gt_cells=8 pred_cells=0
-tent: gt_cells=164 pred_cells=177

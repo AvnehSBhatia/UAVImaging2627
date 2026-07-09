@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .blocks import CosineGate, ManualBatchNorm, bounded_cos_score
 
@@ -130,10 +131,25 @@ class WindowEncoder(nn.Module):
         hn = self.bn(h.reshape(-1, c)).reshape(n, t, c)
         return (self.gate(hn).unsqueeze(-1) * h).mean(1)
 
-    def forward_dense(self, x):  # (B, in_dim, H, W) -> (B, hidden, H/20, W/20)
+    def forward_dense(self, x, ckpt=False):  # (B, in_dim, H, W) -> (B, hidden, H/20, W/20)
+        # ckpt=True: checkpoint PER SEGMENT (each round + the MLP tail), not the
+        # whole encoder — a single segment rematerializes ALL its intermediates
+        # at the start of its backward, so whole-encoder wrapping barely lowers
+        # the peak. Per-segment caps the backward peak at the largest segment
+        # (the MLP tail) while forward holds only the 4 segment boundaries.
+        # Cost: one extra Stage-1 forward. BN stats update twice per recomputed
+        # segment (same behavior as the old whole-encoder wrap, ARCH §13).
         if self.training:
             for r in self.rounds:
-                x = r.forward_dense(x)
+                if ckpt:
+                    x = torch.utils.checkpoint.checkpoint(
+                        r.forward_dense, x, use_reentrant=False)
+                else:
+                    x = r.forward_dense(x)
+            if ckpt:
+                return torch.utils.checkpoint.checkpoint(
+                    self._dense_tail, x, use_reentrant=False)
+            return self._dense_tail(x)
         else:
             # eval fast path: the frozen channels' score contributions for all
             # 3 rounds in ONE conv over the 8 frozen channels (constant across
@@ -149,6 +165,9 @@ class WindowEncoder(nn.Module):
             for i, r in enumerate(self.rounds):
                 rgb = r.dense_round_rgb(rgb, fs[:, 3 * i : 3 * i + 3])
             x = torch.cat([rgb, frozen], 1)
+        return self._dense_tail(x)
+
+    def _dense_tail(self, x):  # (B, in_dim, H, W) -> (B, hidden, H/20, W/20)
         # per-token MLP == 1x1 convs with the shared Linear weights
         fc1, fc2 = self.mlp[0], self.mlp[2]
         h = F.silu(F.conv2d(x, fc1.weight.reshape(self.hidden, self.in_dim, 1, 1), fc1.bias))

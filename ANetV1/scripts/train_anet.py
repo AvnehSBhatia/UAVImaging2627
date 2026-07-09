@@ -38,6 +38,7 @@ def build_datasets(cfg, teacher_dir=None):
         tent_weight=cfg.data.tent_weight,
         uint8=getattr(cfg.data, "uint8", False),  # Trainer normalizes on-GPU
         band_lo=getattr(cfg.data, "band_lo", None),  # boundary ignore band for the loss
+        cache=getattr(cfg.data, "cache", False),  # memmap preprocessing cache
     )
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)

@@ -23,18 +23,17 @@ IS_ROCM = torch.version.hip is not None  # MI300X presents as cuda but is MIOpen
 def anet_cfg(**overrides):
     train = dict(
         epochs=30,
-        # effective batch 64 on CUDA (32x2), 16 on Mac (4x4). NB: activations are
-        # ~2.5GB/image under autograd (edge_dq/hidden24), so single-batch 64 OOMs
-        # the 192GB card (~160GB) — 32 is the ceiling. accum 2 keeps effective 64.
-        # MEMORY NOTE (D38): the single-batched Stage-1 pass holds all 4 phases'
-        # transients at once (~10-15% higher peak than the old 4-pass loop) for
-        # ~4x fewer kernel launches. Plus MIOpen autotune probes multi-GB
-        # workspaces on the fresh D37 grouped-conv shapes (see the "workspace
-        # required: 4.7e9" warnings) — a transient VRAM spike that can cliff a
-        # batch-32 step. If it OOMs / gets Terminated: ANET_BATCH=16 ANET_ACCUM=4
-        # (same effective 64, half the activation footprint, room for autotune
-        # workspace), ideally with MIOPEN_FIND_MODE=NORMAL on the first run to
-        # build the find-db so later epochs stop probing.
+        # effective batch 64 on CUDA (32x2), 16 on Mac (4x4).
+        # MEMORY (measured, 2026-07-08, hidden=24/edge_dq, batch 1 fwd+bwd):
+        # saved-for-backward was 2.87 GiB/img eager — 1.35 GiB of it fp32
+        # ManualBatchNorm intermediates (now fused F.batch_norm off-MPS) and
+        # ~0.5 GiB an fp32 type-promotion from the fp32 uv_tile cat (fixed).
+        # With those fixes it is 1.54 GiB/img eager, ~0.65 compiled (inductor
+        # rematerializes the pointwise chains), ~0.45+segment with per-round
+        # checkpointing. ROCm default batch 16 x accum 4 (effective 64
+        # unchanged) => ~10 GB compiled / ~25 GB eager fallback on the 192 GB
+        # card. MIOpen autotune can still spike multi-GB workspaces on first
+        # steps (MIOPEN_FIND_MODE=NORMAL once builds the find-db if it cliffs).
         batch_size=int(os.environ["ANET_BATCH"]) if "ANET_BATCH" in os.environ
         else (16 if IS_ROCM else (32 if IS_CUDA else 4)),
         accum_steps=int(os.environ["ANET_ACCUM"]) if "ANET_ACCUM" in os.environ
@@ -54,22 +53,22 @@ def anet_cfg(**overrides):
         #     trainer now setdefaults TORCHINDUCTOR_COMPILE_THREADS=1 before the
         #     first (lazy) compile, and the run script exports it too.
         # Robust fallback: any compile error (setup OR first-step) degrades to
-        # eager instead of dying. ROCm defaults OFF (container hung epoch-0);
-        # opt in with ANET_COMPILE=1. NVIDIA stays ON.
-        compile=(IS_CUDA and not IS_ROCM),
+        # eager instead of dying. ROCm now defaults ON: the epoch-0 hang was
+        # root-caused to fork()ed spawn workers + the inductor compile-worker
+        # fork storm, both fixed (spawn ctx, TORCHINDUCTOR_COMPILE_THREADS=1).
+        # ANET_COMPILE=0 is the quick kill switch if a container misbehaves.
+        compile=IS_CUDA,
         compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search
         # on ROCm for zero gain (see trainer.py) — so: on for CUDA, off for HIP.
         cudnn_benchmark=IS_CUDA and not IS_ROCM,
-        # nan_check_every>1 (runahead: no per-step sync) let the CPU enqueue the
-        # NEXT step's forward while the previous step's ~80GB of activations were
-        # still live -> ~160GB+ in flight -> VRAM exhausted -> the amdgpu/KFD
-        # driver SIGTERMs the process ("Terminated", no traceback; MIOpen logs
-        # "provided ptr: 0" because torch had no free VRAM for workspace). This
-        # model's activations are too big for ANY lookahead at batch 32 — keep 1.
-        # (Safe to raise only if batch is dropped so 2-3 steps fit in VRAM.)
-        nan_check_every=1,
+        # nan_check_every=1 forces a device sync per step (loss.item()) — it
+        # existed because runahead at ~80GB/step of activations OOM'd the card.
+        # With fused BN + bf16 stream + per-round checkpointing a step is
+        # ~5-10GB at batch 32, so 2-3 steps of CPU runahead fit easily and the
+        # per-step sync (which serialized the launch-bound tail) goes away.
+        nan_check_every=25 if IS_CUDA else 1,
         hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
         stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
         # per-channel Path A kernels (D37): the pre-registered "mushy tent blob"
@@ -78,7 +77,14 @@ def anet_cfg(**overrides):
         # Box-filter init -> starts identical to the shared-scalar spec form.
         # False restores the exact 179-param D13 Path A.
         path_a_per_channel=True,
-        use_checkpoint=not IS_CUDA,   # Mac: memory valve; CUDA: pure waste
+        # per-round checkpointing (encoder.forward_dense(ckpt=True)): backward
+        # peak = forward-held boundaries (~0.45 GiB/img) + the largest
+        # rematerialized segment, for one extra Stage-1 forward. Mac:
+        # mandatory memory valve. CUDA/ROCm: off — compile's min-cut
+        # partitioner already rematerializes, and checkpoint HOPs would break
+        # up the fused graph. ANET_CKPT=1 for eager runs that must stay small.
+        use_checkpoint=(os.environ["ANET_CKPT"].strip().lower() in ("1", "true", "yes"))
+        if "ANET_CKPT" in os.environ else not IS_CUDA,
         amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
         samples_per_epoch=None if IS_CUDA else 6000,
         early_stop_patience=6,
@@ -124,15 +130,13 @@ def anet_cfg(**overrides):
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
-        # SPAWN workers are heavy (each re-imports torch, ~1-2GB); 16 of them + the
-        # compile process OOM'd the container ("Terminated" + leaked semaphores at
-        # shutdown). torch.compile now adds its own compile-worker RAM tenant, so
-        # if the box is tight, cut workers: ANET_NUM_WORKERS=2 ./run_anet_mi300x.sh.
-        # The model is launch-bound so the GPU is barely fed anyway — a handful of
-        # workers decode well ahead of the ~1-2s/step compute. num_workers=0 makes
-        # the loader run in-process (no spawn, no semaphore warning at all).
+        # workers=0 (in-process) serialized a ~10ms PIL decode+resize per image
+        # with the GPU — at 45k imgs that alone is ~400s/epoch, and once the
+        # GPU side is fast the loader IS the epoch. With data.cache the item
+        # cost drops to a ~1.5MB memcpy, so 4 spawn workers (~1-2GB RAM each,
+        # not 16 — that OOM'd the container) keep the GPU fed with margin.
         num_workers=int(os.environ["ANET_NUM_WORKERS"]) if "ANET_NUM_WORKERS" in os.environ
-        else (0 if IS_ROCM else (min(6, os.cpu_count() or 6) if IS_CUDA else 2)),
+        else (4 if IS_ROCM else (min(6, os.cpu_count() or 6) if IS_CUDA else 2)),
         prefetch_factor=2 if IS_CUDA else 2,
         checkpoint_dir="runs/anet",
     )
@@ -152,6 +156,12 @@ def anet_cfg(**overrides):
         # covering class only). Kills the ring tug-of-war at object boundaries.
         # None = off (plain hard labels, pre-band behavior).
         band_lo=0.05,
+        # one-time preprocessing cache (memmapped uint8 frames + grids under
+        # <root>/.anet_cache, ~70GB for the train split): items become ~1.5MB
+        # memcpys instead of ~10ms PIL decode+resize. ANET_CACHE=0 to disable
+        # (e.g. tight disk); Mac default off (6k samples/epoch hides decode).
+        cache=(os.environ["ANET_CACHE"].strip().lower() in ("1", "true", "yes"))
+        if "ANET_CACHE" in os.environ else IS_CUDA,
     )
     distill = dict(teacher_cache="runs/teacher_cache", kl_weight=0.7, temperature=2.0)
     yolo = dict(weights="yolo26n.pt", imgsz=960)  # shared by teacher cache + eval

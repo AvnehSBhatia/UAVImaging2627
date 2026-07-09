@@ -87,6 +87,19 @@ class ManualBatchNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        if x.device.type != "mps":
+            # fused native BN (cuDNN/MIOpen/CPU): identical math and running-stat
+            # convention (lerp(momentum) == (1-m)*run + m*batch; unbiased var in
+            # the running buffer). The win is autograd: the fused kernel saves
+            # the input + two per-channel vectors, where the primitive-op form
+            # below saves TWO full-res fp32 intermediates per call — measured
+            # 1.35 GiB/img of the 2.87 GiB/img training footprint. Stats still
+            # accumulate in fp32 internally for half inputs (cuDNN/MIOpen
+            # mixed-precision BN), so the bf16 two-pass-variance concern that
+            # motivated the manual form's .float() does not apply here.
+            return F.batch_norm(x, self.running_mean, self.running_var,
+                                self.weight, self.bias, self.training,
+                                self.momentum, self.eps)
         if x.dim() == 4:
             dims, shape = (0, 2, 3), (1, -1, 1, 1)
         else:

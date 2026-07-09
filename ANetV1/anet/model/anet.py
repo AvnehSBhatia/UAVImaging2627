@@ -116,7 +116,12 @@ class ANetV1(nn.Module):
         stem = "edge_dq" if any(k.startswith("stem_mod.") for k in sd) else "highpass"
         per_channel = sd["pools.0.weight"].shape[0] > 1
         model = cls(hidden=hidden, stem=stem, path_a_per_channel=per_channel, **kwargs)
-        model.load_state_dict(sd)
+        # pre-D36 checkpoints (e.g. runs/anet/good.pt) predate path_dq; those
+        # convs are identity-init, so leaving them at init IS the old model
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        bad = [k for k in missing if not k.startswith("path_dq.")] + list(unexpected)
+        if bad:
+            raise RuntimeError(f"checkpoint/model mismatch beyond path_dq: {bad}")
         return model
 
     def _ckpt(self, fn, *args):
@@ -156,9 +161,14 @@ class ANetV1(nn.Module):
             crops.append(F.pad(feat[:, :, oy : oy + hp, ox : ox + wp],
                                (0, self.IMG_W - wp, 0, self.IMG_H - hp), mode=pad_mode))
         x = torch.cat(crops, 0)  # (4B, feat, 540, 960), phase-major
-        uv = torch.zeros_like(x[:, :2]) + self.uv_tile  # expand w/o shape math
+        # match uv to the stream dtype: the buffer is fp32, and cat's type
+        # promotion silently upcast the ENTIRE Stage-1 residual stream to fp32
+        # under bf16 autocast (autocast only re-casts conv inputs; every saved
+        # elementwise intermediate stayed fp32 — measured ~0.5 GiB/img)
+        uv = self.uv_tile.to(x.dtype).expand(x.shape[0], -1, -1, -1)
         x = torch.cat([x, uv], 1)
-        e = self._ckpt(self.encoder.forward_dense, x)  # (4B, C, 27, 48)
+        e = self.encoder.forward_dense(
+            x, ckpt=self.use_checkpoint and self.training)  # (4B, C, 27, 48)
         e = e.reshape(4, b, -1, ph, pw).permute(1, 2, 0, 3, 4)  # (B, C, 4, 27, 48)
         # interleave the four stride-2 phase grids with pixel_shuffle instead of
         # strided scatter: identical placement (phase (oy,ox) -> out[oy/10::2,
