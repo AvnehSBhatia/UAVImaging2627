@@ -31,7 +31,10 @@ export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 # inductor compile-workers capped to 1); the old 115GB VRAM is fixed at the
 # source (fused BN, bf16 stream, per-round checkpointing — ~10GB at batch 32).
 # Presets now default to the fast path; only pin what differs per-box here.
-export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-4}"
+# workers=0: spawn dataloader workers deadlock epoch-0 on this HIP container
+# (fork + locked MIOpen mutexes). The memmap cache makes in-process fast enough
+# for the launch-bound GPU. Set ANET_NUM_WORKERS>0 only if spawn is verified OK.
+export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
 export ANET_COMPILE="${ANET_COMPILE:-1}"
 export ANET_BATCH="${ANET_BATCH:-16}"
 export ANET_ACCUM="${ANET_ACCUM:-4}"

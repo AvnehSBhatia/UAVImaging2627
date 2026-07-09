@@ -141,13 +141,15 @@ def anet_cfg(**overrides):
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
-        # workers=0 (in-process) serialized a ~10ms PIL decode+resize per image
-        # with the GPU — at 45k imgs that alone is ~400s/epoch, and once the
-        # GPU side is fast the loader IS the epoch. With data.cache the item
-        # cost drops to a ~1.5MB memcpy, so 4 spawn workers (~1-2GB RAM each,
-        # not 16 — that OOM'd the container) keep the GPU fed with margin.
+        # ROCm default 0 (IN-PROCESS): spawn workers repeatedly DEADLOCK epoch-0
+        # on this MIOpen/HIP container (fork copies locked native mutexes; the
+        # first batch never arrives, needs kill -9). With data.cache an item is a
+        # ~1.5MB memcpy, not a ~10ms decode, so the in-process loader keeps the
+        # launch-bound GPU fed anyway — workers buy nothing here and cost a hang.
+        # NVIDIA is fine with workers; opt back in on ROCm via ANET_NUM_WORKERS>0
+        # only if you've confirmed spawn works on your box.
         num_workers=int(os.environ["ANET_NUM_WORKERS"]) if "ANET_NUM_WORKERS" in os.environ
-        else (4 if IS_ROCM else (min(6, os.cpu_count() or 6) if IS_CUDA else 2)),
+        else (0 if IS_ROCM else (min(6, os.cpu_count() or 6) if IS_CUDA else 2)),
         prefetch_factor=2 if IS_CUDA else 2,
         checkpoint_dir="runs/anet",
     )
