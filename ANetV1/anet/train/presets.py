@@ -128,6 +128,18 @@ def anet_cfg(**overrides):
         # count, so no per-class alpha juggling like the other modes need.
         balanced_alpha=(0.5, 0.5, 0.5),   # (bg, mannequin, tent) FP penalty
         balanced_beta=(0.5, 0.65, 0.5),   # (bg, mannequin, tent) miss penalty
+        # fixed class importance weights (bg, mann, tent) for balanced mode —
+        # overrides difficulty_temp. ANET_CLASS_W="0.06,0.6,0.34" e.g. None=off.
+        balanced_class_weights=(
+            tuple(float(x) for x in os.environ["ANET_CLASS_W"].split(","))
+            if "ANET_CLASS_W" in os.environ else None),
+        # prior-bias init on the classification head (RetinaNet §4.1): start each
+        # foreground class at this probability so the head is off the saturated
+        # all-background point (softmax Jacobian p(1-p)->0 kills fg gradient
+        # otherwise -> soft p(fg)=0.000, stuck all-bg). ANET_PRIOR_FG overrides.
+        # 0.1 is a good default; None = zero-bias (old behavior).
+        prior_fg=float(os.environ["ANET_PRIOR_FG"]) if "ANET_PRIOR_FG" in os.environ
+        else None,
         # difficulty_temp: up-weight the worst-doing class (detached softmax over
         # per-class losses). None = equal weight (stable default). Small (~0.3)
         # focuses hard; large (~2) ~ equal. ANET_DIFF_TEMP overrides.

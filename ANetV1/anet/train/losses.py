@@ -102,7 +102,7 @@ def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75,
 
 def balanced_tversky_loss(logits, target, alpha=(0.5, 0.5, 0.5),
                           beta=(0.5, 0.5, 0.5), gamma=0.75, smooth=1.0,
-                          band=None, difficulty_temp=None):
+                          band=None, difficulty_temp=None, class_weights=None):
     """Class-balanced Focal-Tversky over ALL classes {bg, mannequin, tent}, per
     image — one unified term, so there is no focal-vs-Tversky anchor to fight
     (the fight that made the mannequin channel oscillate 0<->over-predict).
@@ -129,6 +129,13 @@ def balanced_tversky_loss(logits, target, alpha=(0.5, 0.5, 0.5),
     DETACHED softmax over per-class losses (z-score-style "focus the loser"
     without the weight adding its own gradient dynamics — which would re-introduce
     an oscillation). None -> plain equal weight (the stable default).
+
+    class_weights: FIXED per-class weights in index order (bg, mann, tent),
+    e.g. (0.06, 0.6, 0.34) to hard-prioritize mannequin. Normalized to sum 1,
+    so loss = Σ w_c·(1−TI_c)^γ. Takes precedence over difficulty_temp — a
+    deliberate fixed prior on class importance instead of an adaptive one. Note
+    each (1−TI_c) already folds recall (via FN) and FP-per-real-cell (via FP)
+    into one bounded score, so this is exactly "w·(miss + fp)" per class.
     """
     p = F.softmax(logits, 1)                       # (B, C, H, W)
     C = p.shape[1]
@@ -158,6 +165,10 @@ def balanced_tversky_loss(logits, target, alpha=(0.5, 0.5, 0.5),
         ti = (tp + smooth) / (tp + a * fp + b * fn + smooth)
         per_class.append((1.0 - ti).clamp_min(0.0) ** gamma)   # (B,)
     L = torch.stack(per_class, 1)                  # (B, C)
+    if class_weights is not None:                  # FIXED prior on class importance
+        w = L.new_tensor(list(class_weights))
+        w = w / w.sum().clamp_min(1e-8)
+        return (L.mean(0) * w).sum()
     if difficulty_temp:
         w = torch.softmax(L.detach().mean(0) / difficulty_temp, 0)  # (C,), detached
         return (L.mean(0) * w).sum()               # sums to a class-weighted mean

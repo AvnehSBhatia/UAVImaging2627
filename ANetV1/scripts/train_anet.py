@@ -66,7 +66,8 @@ def main():
     else:
         model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
                        stem=cfg.train.stem,
-                       path_a_per_channel=cfg.train.path_a_per_channel)
+                       path_a_per_channel=cfg.train.path_a_per_channel,
+                       prior_fg=getattr(cfg.train, "prior_fg", None))
     n_params = sum(p.numel() for p in model.parameters())
     tw = cfg.train.tversky_weight
     print(f"ANetV1: {n_params:,} params (hidden={model.encoder.hidden}, stem={model.stem}) | "

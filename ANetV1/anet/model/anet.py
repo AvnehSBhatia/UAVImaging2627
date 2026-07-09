@@ -27,8 +27,9 @@ class ANetV1(nn.Module):
     PHASES = ((0, 0), (0, 10), (10, 0), (10, 10))
 
     def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
-                 path_a_per_channel=True):
+                 path_a_per_channel=True, prior_fg=None):
         super().__init__()
+        self.prior_fg = prior_fg
         self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
         self.nw = (self.IMG_W - self.WIN) // self.STRIDE + 1  # 95
         self.n_win = self.nh * self.nw  # 5035
@@ -78,7 +79,7 @@ class ANetV1(nn.Module):
                 conv.bias.zero_()
         self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
         self.mix = GlobalCosineMix(pad_to=d)
-        self.head = RegionHead(dim=d)
+        self.head = RegionHead(dim=d, prior_fg=prior_fg)
 
         # window-relative pixel coords, row-major to match F.unfold token order
         r = torch.arange(self.WIN, dtype=torch.float32)

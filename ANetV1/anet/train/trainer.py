@@ -305,10 +305,12 @@ class Trainer:
             bb = getattr(c, "balanced_beta", None)
             ba = tuple(ba) if isinstance(ba, (list, tuple)) else (ba if ba is not None else ta)
             bb = tuple(bb) if isinstance(bb, (list, tuple)) else (bb if bb is not None else tb)
+            cw = getattr(c, "balanced_class_weights", None)
             hard = balanced_tversky_loss(
                 cells, grid, alpha=ba, beta=bb,
                 gamma=getattr(c, "ft_gamma", 0.75), smooth=smooth, band=band,
-                difficulty_temp=getattr(c, "difficulty_temp", None))
+                difficulty_temp=getattr(c, "difficulty_temp", None),
+                class_weights=cw)
         elif getattr(c, "loss_mode", "combo") == "focal_tversky":
             # single balanced term (no focal-vs-Tversky fight) + a GENTLE per-cell
             # focal anchor for dense, stable gradient early on. The anchor uses a
