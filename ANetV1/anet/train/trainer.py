@@ -310,6 +310,13 @@ class Trainer:
             if first:
                 bar.set_description(f"epoch {epoch} [compiling 1st step ~1-3min]")
             for step, batch in enumerate(self.train_loader):
+                if step == 0:
+                    # heartbeat: if you see THIS, the loader is fine and the
+                    # first step is now compiling/autotuning (minutes on ROCm).
+                    # if you DON'T see this, the hang is in the dataloader.
+                    bar.write(f"epoch {epoch}: first batch loaded — first step "
+                              f"{'compiles' if first else 'runs'} now"
+                              + (" (compile+capture+MIOpen, minutes)" if first else ""))
                 with self._autocast():
                     loss = self._loss(batch) / accum
                 if step == 0 and first:
