@@ -209,20 +209,44 @@ class Trainer:
                 self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0,
                 foreach=True,
             )
-        steps = cfg.train.epochs * (len(self.train_loader) // cfg.train.accum_steps)
+        opt_steps_per_epoch = max(len(self.train_loader) // cfg.train.accum_steps, 1)
+        steps = cfg.train.epochs * opt_steps_per_epoch
         warmup = getattr(cfg.train, "warmup_steps", 0) or 0
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=max(steps - warmup, 1)
-        )
-        if warmup:  # linear warmup -> cosine; large batches need the ramp
-            self.sched = torch.optim.lr_scheduler.SequentialLR(
-                self.opt,
-                [torch.optim.lr_scheduler.LinearLR(
-                    self.opt, start_factor=0.05, total_iters=warmup), cosine],
-                milestones=[warmup],
-            )
-        else:
-            self.sched = cosine
+        sched_mode = os.environ.get("ANET_SCHED") or getattr(cfg.train, "sched", "cosine")
+        self.sched_mode = sched_mode
+        self.sched_per_epoch = False       # plateau steps on the val metric, not per-batch
+        self._warmup_total = warmup
+        self._warmup_left = 0
+        self._base_lrs = [g["lr"] for g in self.opt.param_groups]
+        L = torch.optim.lr_scheduler
+        if sched_mode == "plateau":
+            # ReduceLROnPlateau on the val selection metric (higher=better),
+            # stepped per-EPOCH after eval. Warmup is done manually per-step
+            # below (it doesn't compose with SequentialLR).
+            self.sched = L.ReduceLROnPlateau(
+                self.opt, mode="max",
+                factor=getattr(cfg.train, "plateau_factor", 0.5),
+                patience=getattr(cfg.train, "plateau_patience", 3), min_lr=1e-5)
+            self.sched_per_epoch = True
+            self._warmup_left = warmup
+        elif sched_mode == "restarts":
+            # cosine warm restarts: LR blasts to peak, cosine-decays over T_0
+            # opt-steps, then RESTARTS to peak (re-escapes a plateau). T_mult=2
+            # lengthens each cycle. Restarts supply their own high-LR kicks, so
+            # a separate warmup is unnecessary.
+            t0 = max(getattr(cfg.train, "restart_epochs", 5) * opt_steps_per_epoch, 1)
+            self.sched = L.CosineAnnealingWarmRestarts(self.opt, T_0=t0, T_mult=2)
+        else:  # cosine (default): warmup -> smooth cosine to 0
+            cosine = L.CosineAnnealingLR(self.opt, T_max=max(steps - warmup, 1))
+            if warmup:
+                self.sched = L.SequentialLR(
+                    self.opt,
+                    [L.LinearLR(self.opt, start_factor=0.05, total_iters=warmup), cosine],
+                    milestones=[warmup])
+            else:
+                self.sched = cosine
+        print(f"LR schedule: {sched_mode} | peak lr={self._base_lrs[0]:.1e} "
+              f"warmup={warmup} steps", flush=True)
 
         self.out_dir = Path(cfg.train.checkpoint_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -423,7 +447,17 @@ class Trainer:
                     self.scaler.step(self.opt)
                     self.scaler.update()
                     self.opt.zero_grad()
-                    self.sched.step()
+                    if self.sched_per_epoch:
+                        # plateau mode: no per-batch decay; run a manual linear
+                        # warmup during the warmup window, then hold at peak
+                        # until the per-epoch plateau step drops LR.
+                        if self._warmup_left > 0:
+                            self._warmup_left -= 1
+                            frac = 1.0 - self._warmup_left / max(self._warmup_total, 1)
+                            for g, base in zip(self.opt.param_groups, self._base_lrs):
+                                g["lr"] = base * (0.05 + 0.95 * frac)
+                    else:
+                        self.sched.step()
             bar.close()
             stats = self.evaluate(self.val_loader, desc=f"epoch {epoch} eval")
             # SYNTHETIC mannequin recall is the mission metric (ARCH §10; overall
@@ -435,6 +469,8 @@ class Trainer:
                 mann = stats["mannequin_recall"]
             tent_w = getattr(self.cfg.train, "select_tent_weight", 0.5)
             key = mann + tent_w * stats["tent_recall"]
+            if self.sched_per_epoch and self._warmup_left == 0:
+                self.sched.step(key)  # ReduceLROnPlateau on the selection metric
             row = [epoch, running / max(n, 1), stats["mannequin_recall"],
                    stats["mannequin_recall_synthetic"], stats["tent_recall"],
                    stats["fp_per_image"], round(time.time() - t0)]

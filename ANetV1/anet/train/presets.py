@@ -38,8 +38,22 @@ def anet_cfg(**overrides):
         else (16 if IS_ROCM else (32 if IS_CUDA else 4)),
         accum_steps=int(os.environ["ANET_ACCUM"]) if "ANET_ACCUM" in os.environ
         else (4 if IS_ROCM else (2 if IS_CUDA else 4)),
-        lr=4.0e-3 if IS_CUDA else 3.0e-3,
-        warmup_steps=300 if IS_CUDA else 0,
+        lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ
+        else (4.0e-3 if IS_CUDA else 3.0e-3),
+        # higher peak LR needs a longer ramp or it diverges on step 1 — scale
+        # warmup with LR (ANET_WARMUP overrides). At 1e-2 this gives ~600 steps.
+        warmup_steps=int(os.environ["ANET_WARMUP"]) if "ANET_WARMUP" in os.environ
+        else (300 if IS_CUDA else 0),
+        # LR schedule after warmup: "cosine" (smooth decay to 0, default),
+        # "restarts" (cosine warm restarts — periodic LR spikes to re-escape a
+        # plateau; good for a stuck class), "plateau" (ReduceLROnPlateau on the
+        # val selection metric). ANET_SCHED overrides. See the plateau caveat in
+        # trainer.py: it can CUT LR while a class is stuck at 0 (reads as a
+        # plateau) — exactly when you want LR high — so restarts is usually the
+        # better "ramp down but re-escape" choice for the mannequin basin.
+        sched=os.environ.get("ANET_SCHED") or "cosine",
+        plateau_patience=3, plateau_factor=0.5,   # ReduceLROnPlateau params
+        restart_epochs=5,                          # T_0 for cosine warm restarts
         grad_clip=1.0,
         # torch.compile ON for CUDA/ROCm: this net is launch-bound (thousands of
         # tiny kernels at ~1% util), and inductor fusing the elementwise chains
