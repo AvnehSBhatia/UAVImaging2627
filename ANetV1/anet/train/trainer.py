@@ -482,6 +482,11 @@ class Trainer:
                   f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
                   f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
                   f"sel={key:.3f} lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
+            # threshold-free progress: if these climb while mannequin_r stays 0,
+            # the model IS learning under the argmax/conf_thresh bar (not stuck)
+            print(f"  soft p(fg on gt): mann={stats['soft_mann']:.3f} "
+                  f"tent={stats['soft_tent']:.3f} | argmax fg cells={stats['argmax_fg']} "
+                  f"(threshold-free — cross ~0.5 to win argmax)", flush=True)
             state = getattr(self.model, "_orig_mod", self.model).state_dict()
             torch.save(state, self.out_dir / "last.pt")
             # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
@@ -506,16 +511,37 @@ class Trainer:
         self.model.eval()
         cells_m, obj_m = CellConfusion(), ObjectMetrics()
         thresh = getattr(self.cfg.train, "conf_thresh", 0.0) or 0.0
+        # THRESHOLD-FREE soft signal: mean softmax prob for each foreground class
+        # over the cells where it is the GT, and the argmax-only fg cell count.
+        # These move BEFORE the thresholded metrics do — so an all-zero
+        # mannequin_r with rising soft_mann means the model IS learning, just
+        # under the conf_thresh/argmax bar (not stuck). Removes the "loss drops
+        # but nothing improves" ambiguity.
+        soft_sum = {1: 0.0, 2: 0.0}
+        soft_n = {1: 0, 2: 0}
+        argmax_fg = {1: 0, 2: 0}
         for batch in tqdm(loader, desc=desc, unit="batch",
                           dynamic_ncols=True, leave=False):
             img = self._prep_img(batch["image"].to(self.device, non_blocking=True))
             with self._autocast():
                 logits = self.model_eval(img)
-            pred = confident_pred(logits.float(), thresh).cpu().numpy()
+            fl = logits.float()
+            probs = torch.softmax(fl, 1)
+            am = fl.argmax(1)
             target = batch["grid"].numpy()
+            tgt = batch["grid"].to(fl.device)
+            for c in (1, 2):
+                m = tgt == c
+                soft_sum[c] += float(probs[:, c][m].sum()) if m.any() else 0.0
+                soft_n[c] += int(m.sum())
+                argmax_fg[c] += int((am == c).sum())
+            pred = confident_pred(fl, thresh).cpu().numpy()
             cells_m.update(pred, target)
             for i in range(pred.shape[0]):
                 obj_m.update(pred[i], batch["boxes"][i].numpy(), bool(batch["vd"][i]))
         out = obj_m.summary()
         out["cells"] = cells_m.summary()
+        out["soft_mann"] = soft_sum[1] / max(soft_n[1], 1)
+        out["soft_tent"] = soft_sum[2] / max(soft_n[2], 1)
+        out["argmax_fg"] = argmax_fg[1] + argmax_fg[2]
         return out
