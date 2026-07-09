@@ -133,51 +133,40 @@ def anet_cfg(**overrides):
         balanced_class_weights=(
             tuple(float(x) for x in os.environ["ANET_CLASS_W"].split(","))
             if "ANET_CLASS_W" in os.environ else None),
-        # prior-bias init on the classification head (RetinaNet §4.1): start each
-        # foreground class at this probability so the head is off the saturated
-        # all-background point (softmax Jacobian p(1-p)->0 kills fg gradient
-        # otherwise -> soft p(fg)=0.000, stuck all-bg). ANET_PRIOR_FG overrides.
-        # 0.1 is a good default; None = zero-bias (old behavior).
-        prior_fg=float(os.environ["ANET_PRIOR_FG"]) if "ANET_PRIOR_FG" in os.environ
-        else None,
+        # ANTI-OSCILLATION / anti-collapse feature: prior-bias head init
+        # (RetinaNet §4.1). Starts each foreground class at this probability so
+        # the head sits OFF the saturated all-background point and can't fully
+        # collapse to 0 (the "predict nothing" half of the mannequin limit
+        # cycle). 0.1 -> fc2.bias=[0,-2.08,-2.08]. Default ON for CUDA now.
+        # ANET_PRIOR_FG=0 disables. Fresh models only (resume inherits ckpt bias).
+        prior_fg=(float(os.environ["ANET_PRIOR_FG"]) or None) if "ANET_PRIOR_FG" in os.environ
+        else (0.1 if IS_CUDA else None),
         # difficulty_temp: up-weight the worst-doing class (detached softmax over
         # per-class losses). None = equal weight (stable default). Small (~0.3)
         # focuses hard; large (~2) ~ equal. ANET_DIFF_TEMP overrides.
         difficulty_temp=float(os.environ["ANET_DIFF_TEMP"])
         if "ANET_DIFF_TEMP" in os.environ else None,
         ft_gamma=0.75,               # (1-TI)**gamma; <1 focuses hard classes, stays stable
-        # MANNEQUIN-COLLAPSE FIX (2026-07-08): fresh runs drove mannequin to
-        # pred_cells=0 (recall 0.000) while tent trained fine. Cause: in the
-        # ACTIVE focal_tversky mode the dense push for mannequin was only
-        # ft_anchor_alpha=2 while the Focal-Tversky term hit it with
-        # tversky_alpha=0.8 (heavy FP penalty) — so "never predict mannequin"
-        # (FP=0, misses cost only beta=0.3) was the loss minimum. Meanwhile
-        # class_alpha=[1,12,4] (the documented per-object mannequin balance) is
-        # DEAD CODE in this mode — only "combo" reads it. Fixes: (a) put the
-        # real mannequin push on the active anchor, (b) drop the FP over-penalty
-        # so predicting mannequin isn't pure loss, (c) raise the miss penalty.
-        ft_anchor_weight=0.75,       # was 0.5 — let the dense anchor actually drive
-        ft_anchor_alpha=[1.0, 6.0, 2.5],  # was [1,2,2]; mannequin push ~ class_alpha intent
+        # ORIGINAL focal_tversky (the config that trained working tent + good.pt-
+        # level mannequin). The 2026-07-08 "mannequin-collapse" rebalance cranked
+        # the anchor (weight 0.75, alpha 6) and RE-CREATED the focal-vs-Tversky
+        # tug-of-war -> mannequin oscillated 0<->over-predict. Reverted here; the
+        # anti-oscillation now comes from stabilizers (prior_fg below stops the
+        # collapse half; moderate LR + cosine avoid weight thrash) rather than
+        # from a stronger anchor. Env-overridable to tune without editing.
+        ft_anchor_weight=float(os.environ["ANET_ANCHOR_W"])
+        if "ANET_ANCHOR_W" in os.environ else 0.5,
+        ft_anchor_alpha=[1.0, 2.0, 2.0],  # MILD — balancing is Focal-Tversky's job
         tversky_weight=0.2,          # only used in "combo" mode
-        # alpha (FP penalty) per class (mannequin, tent). Mannequin was 0.8 —
-        # too high for a hard small class: it made zero-prediction optimal.
-        # 0.55 keeps FP pressure without collapsing recall; tent stays 0.6.
-        # Raise beta (miss penalty) 0.3->0.45 so misses hurt ~ as much as FPs.
-        tversky_alpha=(0.55, 0.6),   # FP penalty per class (both modes)
-        tversky_beta=0.45,           # FN penalty (both modes)
-        # smooth ~1 virtual TP cell in the Tversky index. The old eps=1e-6 made
-        # the index saturate whenever a class was ABSENT from a frame: gradient
-        # wrt FP measured ~1e-14, i.e. zero FP suppression exactly where FPs
-        # live. That, not alpha, was why the mannequin channel became a generic
-        # objectness halo (rings around tents, blobs on cars) held down only by
-        # the mild anchor + the conf_thresh crutch.
-        ft_smooth=1.0,
-        # eval/deploy FP gate: demote a foreground cell to background if its
-        # softmax prob < this. 0.5 was hiding weak-but-correct mannequin cells
-        # (on good.pt it cost ~0.11 synth recall AND made a fresh model read as
-        # 0.000 while it was still learning) — 0.3 restores visibility and real
-        # recall. Raise later to trade recall for fp/img once mannequin trains.
-        conf_thresh=0.3,
+        tversky_alpha=(0.8, 0.6),    # FP penalty per class (mannequin, tent)
+        tversky_beta=0.3,            # FN penalty
+        # ANTI-OSCILLATION knob: smooth is virtual-TP cells in the Tversky index;
+        # a larger value makes the index LESS reactive to per-batch FP/FN noise,
+        # which damps the limit cycle. 1.0 = original; ANET_SMOOTH=3 damps harder.
+        ft_smooth=float(os.environ["ANET_SMOOTH"]) if "ANET_SMOOTH" in os.environ else 1.0,
+        # eval/deploy FP gate (eval-only; does not affect training). 0.5 = original
+        # working value; lower reveals sub-threshold predictions. ANET_CONF sets it.
+        conf_thresh=float(os.environ["ANET_CONF"]) if "ANET_CONF" in os.environ else 0.5,
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
