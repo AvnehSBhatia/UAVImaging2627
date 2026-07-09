@@ -87,6 +87,34 @@ class MixRound(nn.Module):
         rgb = F.silu(x[:, :3] + up)
         return torch.cat([rgb, x[:, 3:]], 1)
 
+    def forward_dense_rgb(self, rgb, frozen):  # (B,3,H,W), (B,dim-3,H,W) -> (B,3,H,W)
+        """Train-mode RGB-only round — bit-equal to forward_dense(cat[rgb,frozen])
+        but never materializes the (dim)-channel stream. The 8 frozen channels
+        (edge/texture + uv) pass through every round unchanged, so only their
+        SCORE contribution matters; the residual/pool touch RGB alone.
+
+        BatchNorm is per-channel, so the round's joint dim-wide BN equals
+        F.batch_norm on the RGB slice + F.batch_norm on the frozen slice of the
+        SAME running buffers: identical per-channel stats, identical running-stat
+        updates (each round's bn buffer still sees the frozen channels), and
+        gradients still flow to the stem through the frozen score. Non-MPS only
+        (fused F.batch_norm; MPS keeps the dim-wide forward_dense + ManualBN)."""
+        bn = self.bn
+        c = self.V.shape[1]  # dim
+        rgb_n = F.batch_norm(rgb, bn.running_mean[:3], bn.running_var[:3],
+                             bn.weight[:3], bn.bias[:3], self.training,
+                             bn.momentum, bn.eps)
+        fro_n = F.batch_norm(frozen, bn.running_mean[3:], bn.running_var[3:],
+                             bn.weight[3:], bn.bias[3:], self.training,
+                             bn.momentum, bn.eps)
+        s = F.conv2d(rgb_n, self.V[:, :3].reshape(3, 3, 1, 1)) \
+            + F.conv2d(fro_n, self.V[:, 3:].reshape(3, c - 3, 1, 1))
+        s12 = self._blur_dense(s[:, :2])
+        gate = torch.sigmoid(bounded_cos_score(s12[:, 0:1], s12[:, 1:2], s[:, 2:3], self.phi))
+        pooled = F.avg_pool2d(gate * rgb, self.GRID)
+        up = F.interpolate(pooled, scale_factor=self.GRID, mode="nearest")
+        return F.silu(rgb + up)
+
     def dense_round_rgb(self, rgb, frozen_score):
         """Eval fast path: same round math on the 3 RGB channels only.
         `frozen_score` is this round's precomputed V·BN(frozen channels) map
@@ -140,12 +168,29 @@ class WindowEncoder(nn.Module):
         # Cost: one extra Stage-1 forward. BN stats update twice per recomputed
         # segment (same behavior as the old whole-encoder wrap, ARCH §13).
         if self.training:
-            for r in self.rounds:
-                if ckpt:
-                    x = torch.utils.checkpoint.checkpoint(
-                        r.forward_dense, x, use_reentrant=False)
-                else:
-                    x = r.forward_dense(x)
+            # RGB-only rounds (non-MPS): carry the 3 RGB channels through the
+            # rounds, not all `in_dim`. The 8 frozen channels never change, so
+            # each round only reads them for its score (forward_dense_rgb splits
+            # BN per channel-group, bit-exact). Cuts the round tensors from
+            # in_dim->3 channels: ~3x less Stage-1 activation memory/bandwidth,
+            # the biggest remaining training cost. MPS keeps the dim-wide path
+            # (ManualBatchNorm; small batches there don't need it).
+            if x.device.type != "mps":
+                rgb, frozen = x[:, :3], x[:, 3:]
+                for r in self.rounds:
+                    if ckpt:
+                        rgb = torch.utils.checkpoint.checkpoint(
+                            r.forward_dense_rgb, rgb, frozen, use_reentrant=False)
+                    else:
+                        rgb = r.forward_dense_rgb(rgb, frozen)
+                x = torch.cat([rgb, frozen], 1)
+            else:
+                for r in self.rounds:
+                    if ckpt:
+                        x = torch.utils.checkpoint.checkpoint(
+                            r.forward_dense, x, use_reentrant=False)
+                    else:
+                        x = r.forward_dense(x)
             if ckpt:
                 return torch.utils.checkpoint.checkpoint(
                     self._dense_tail, x, use_reentrant=False)

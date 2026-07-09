@@ -106,16 +106,25 @@ def anet_cfg(**overrides):
         # limit cycle. "combo" = legacy focal + separate Tversky (kept for ablation).
         loss_mode="focal_tversky",
         ft_gamma=0.75,               # (1-TI)**gamma; <1 focuses hard classes, stays stable
-        ft_anchor_weight=0.5,        # weight of the dense per-cell focal anchor
-        ft_anchor_alpha=[1.0, 2.0, 2.0],  # MILD — balancing is Focal-Tversky's job, not the anchor's
+        # MANNEQUIN-COLLAPSE FIX (2026-07-08): fresh runs drove mannequin to
+        # pred_cells=0 (recall 0.000) while tent trained fine. Cause: in the
+        # ACTIVE focal_tversky mode the dense push for mannequin was only
+        # ft_anchor_alpha=2 while the Focal-Tversky term hit it with
+        # tversky_alpha=0.8 (heavy FP penalty) — so "never predict mannequin"
+        # (FP=0, misses cost only beta=0.3) was the loss minimum. Meanwhile
+        # class_alpha=[1,12,4] (the documented per-object mannequin balance) is
+        # DEAD CODE in this mode — only "combo" reads it. Fixes: (a) put the
+        # real mannequin push on the active anchor, (b) drop the FP over-penalty
+        # so predicting mannequin isn't pure loss, (c) raise the miss penalty.
+        ft_anchor_weight=0.75,       # was 0.5 — let the dense anchor actually drive
+        ft_anchor_alpha=[1.0, 6.0, 2.5],  # was [1,2,2]; mannequin push ~ class_alpha intent
         tversky_weight=0.2,          # only used in "combo" mode
-        # FP-reduction step 1: alpha > beta makes Focal-Tversky punish false
-        # positives harder than misses (fp/img was too high). Per-class pair
-        # (mannequin, tent): the viz showed the global 0.8 shrinking tent blobs
-        # to ~half their GT cells while the mannequin channel still hedged —
-        # keep full FP pressure on mannequin, relax tent so it fills its box.
-        tversky_alpha=(0.8, 0.6),    # FP penalty per class (both modes)
-        tversky_beta=0.3,            # FN penalty (both modes)
+        # alpha (FP penalty) per class (mannequin, tent). Mannequin was 0.8 —
+        # too high for a hard small class: it made zero-prediction optimal.
+        # 0.55 keeps FP pressure without collapsing recall; tent stays 0.6.
+        # Raise beta (miss penalty) 0.3->0.45 so misses hurt ~ as much as FPs.
+        tversky_alpha=(0.55, 0.6),   # FP penalty per class (both modes)
+        tversky_beta=0.45,           # FN penalty (both modes)
         # smooth ~1 virtual TP cell in the Tversky index. The old eps=1e-6 made
         # the index saturate whenever a class was ABSENT from a frame: gradient
         # wrt FP measured ~1e-14, i.e. zero FP suppression exactly where FPs
@@ -123,10 +132,12 @@ def anet_cfg(**overrides):
         # objectness halo (rings around tents, blobs on cars) held down only by
         # the mild anchor + the conf_thresh crutch.
         ft_smooth=1.0,
-        # FP-reduction step 2: at eval/deploy, only count a foreground cell if its
-        # softmax prob clears this bar — kills marginal (ambiguous) predictions that
-        # dominate fp/img. 0 = plain argmax. Raise to cut FP, lower if recall drops.
-        conf_thresh=0.5,
+        # eval/deploy FP gate: demote a foreground cell to background if its
+        # softmax prob < this. 0.5 was hiding weak-but-correct mannequin cells
+        # (on good.pt it cost ~0.11 synth recall AND made a fresh model read as
+        # 0.000 while it was still learning) — 0.3 restores visibility and real
+        # recall. Raise later to trade recall for fp/img once mannequin trains.
+        conf_thresh=0.3,
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
         l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
         l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
