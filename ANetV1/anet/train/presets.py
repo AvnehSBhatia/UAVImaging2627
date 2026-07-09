@@ -104,7 +104,21 @@ def anet_cfg(**overrides):
         # loss_mode "focal_tversky": ONE size-invariant balanced term (Focal-Tversky)
         # + a gentle focal anchor. No focal-vs-Tversky tug-of-war -> no fp 0.3<->28
         # limit cycle. "combo" = legacy focal + separate Tversky (kept for ablation).
-        loss_mode="focal_tversky",
+        # loss_mode: "balanced" (class-balanced Focal-Tversky over {bg,mann,tent},
+        # one term, no anchor — the anti-oscillation form), "focal_tversky"
+        # (FT + focal anchor), or "combo" (legacy). ANET_LOSS_MODE overrides.
+        loss_mode=os.environ.get("ANET_LOSS_MODE") or "focal_tversky",
+        # "balanced" per-class FP (alpha) / miss (beta). bg/tent symmetric 0.5;
+        # mannequin gets beta>alpha (a recall push) since it's the hard
+        # under-detected class. All classes weigh equally regardless of cell
+        # count, so no per-class alpha juggling like the other modes need.
+        balanced_alpha=(0.5, 0.5, 0.5),   # (bg, mannequin, tent) FP penalty
+        balanced_beta=(0.5, 0.65, 0.5),   # (bg, mannequin, tent) miss penalty
+        # difficulty_temp: up-weight the worst-doing class (detached softmax over
+        # per-class losses). None = equal weight (stable default). Small (~0.3)
+        # focuses hard; large (~2) ~ equal. ANET_DIFF_TEMP overrides.
+        difficulty_temp=float(os.environ["ANET_DIFF_TEMP"])
+        if "ANET_DIFF_TEMP" in os.environ else None,
         ft_gamma=0.75,               # (1-TI)**gamma; <1 focuses hard classes, stays stable
         # MANNEQUIN-COLLAPSE FIX (2026-07-08): fresh runs drove mannequin to
         # pred_cells=0 (recall 0.000) while tent trained fine. Cause: in the

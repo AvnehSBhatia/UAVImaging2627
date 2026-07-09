@@ -100,6 +100,80 @@ def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=0.75,
     return total / len(classes)
 
 
+def balanced_tversky_loss(logits, target, alpha=(0.5, 0.5, 0.5),
+                          beta=(0.5, 0.5, 0.5), gamma=0.75, smooth=1.0,
+                          band=None, difficulty_temp=None):
+    """Class-balanced Focal-Tversky over ALL classes {bg, mannequin, tent}, per
+    image — one unified term, so there is no focal-vs-Tversky anchor to fight
+    (the fight that made the mannequin channel oscillate 0<->over-predict).
+
+    Per class c, per image (softmax probs p_c, GT mask g_c):
+        TP=Σ p_c·g_c   FP=Σ p_c·(1−g_c)   FN=Σ (1−p_c)·g_c
+        TI = (TP+s) / (TP + α_c·FP + β_c·FN + s)     # α_c = FP-per-right-cell, β_c = miss
+        L_c = (1 − TI)^γ
+    Aggregate = mean_c L_c, averaged over images.
+
+    Why every class weighs the same: each L_c is a BOUNDED [0,1] ratio that does
+    not scale with the class's cell count, and they are averaged with equal
+    weight. So a ~60-cell mannequin frame and a ~500k-cell background contribute
+    equally — the size bias that pins rare classes is gone by construction, no
+    per-class alpha juggling needed. Background is a real term here: bg-FP == a
+    missed target, bg-FN == a hallucinated target, so a balanced bg score puts
+    symmetric size-normalized pressure on both recall and precision.
+
+    band (B, n_fg, H, W) bool: per-foreground-class partial-coverage cells that
+    are labeled bg but genuinely contain object — dropped from that class's FP
+    (predicting it there is not a real false positive) and from bg's FN.
+
+    difficulty_temp: if set, up-weights the class currently doing worst via a
+    DETACHED softmax over per-class losses (z-score-style "focus the loser"
+    without the weight adding its own gradient dynamics — which would re-introduce
+    an oscillation). None -> plain equal weight (the stable default).
+    """
+    p = F.softmax(logits, 1)                       # (B, C, H, W)
+    C = p.shape[1]
+    per_class = []
+    for c in range(C):
+        pc = p[:, c]
+        gc = (target == c).float()
+        notg = 1.0 - gc
+        # a foreground class's band cells leave its FP; bg's band cells leave FN
+        if band is not None:
+            if c == 0:
+                gc_eff = gc * (1.0 - band.any(1).float())  # bg not penalized for
+                fn = ((1.0 - pc) * gc_eff).sum((1, 2))      # missing partial-object cells
+                fp = (pc * notg).sum((1, 2))
+                tp = (pc * gc).sum((1, 2))
+            else:
+                notg = notg * (1.0 - band[:, c - 1].float())
+                tp = (pc * gc).sum((1, 2))
+                fp = (pc * notg).sum((1, 2))
+                fn = ((1.0 - pc) * gc).sum((1, 2))
+        else:
+            tp = (pc * gc).sum((1, 2))
+            fp = (pc * notg).sum((1, 2))
+            fn = ((1.0 - pc) * gc).sum((1, 2))
+        a = _cls_param2(alpha, c)
+        b = _cls_param2(beta, c)
+        ti = (tp + smooth) / (tp + a * fp + b * fn + smooth)
+        per_class.append((1.0 - ti).clamp_min(0.0) ** gamma)   # (B,)
+    L = torch.stack(per_class, 1)                  # (B, C)
+    if difficulty_temp:
+        w = torch.softmax(L.detach().mean(0) / difficulty_temp, 0)  # (C,), detached
+        return (L.mean(0) * w).sum()               # sums to a class-weighted mean
+    return L.mean()
+
+
+def _cls_param2(v, c):
+    """alpha/beta indexing for balanced loss: full (bg, mann, tent) triple, a
+    (mann, tent) pair applied to the two fg classes (bg gets 0.5), or a scalar."""
+    if isinstance(v, (tuple, list)):
+        if len(v) == 3:
+            return v[c]
+        return 0.5 if c == 0 else v[c - 1]
+    return v
+
+
 def distill_kl(logits, teacher_probs, temperature=2.0):
     """teacher_probs (B,3,54,96) from the cached soft grids."""
     t = temperature

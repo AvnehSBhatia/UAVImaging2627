@@ -50,7 +50,8 @@ class _Heartbeat:
         if self._th is not None:
             self._th.join(timeout=0.2)
 
-from .losses import distill_kl, focal_loss, focal_tversky_loss, tversky_loss
+from .losses import (balanced_tversky_loss, distill_kl, focal_loss,
+                     focal_tversky_loss, tversky_loss)
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
 
 
@@ -272,7 +273,19 @@ class Trainer:
         amask = None
         if band is not None:
             amask = ~(band.any(1) & (grid == 0))
-        if getattr(c, "loss_mode", "combo") == "focal_tversky":
+        if getattr(c, "loss_mode", "combo") == "balanced":
+            # class-balanced Focal-Tversky over {bg, mannequin, tent}, one term.
+            # No anchor to fight -> no mannequin 0<->over-predict oscillation.
+            # balanced_alpha/beta (3-tuple bg,mann,tent | 2-tuple mann,tent | scalar)
+            ba = getattr(c, "balanced_alpha", None)
+            bb = getattr(c, "balanced_beta", None)
+            ba = tuple(ba) if isinstance(ba, (list, tuple)) else (ba if ba is not None else ta)
+            bb = tuple(bb) if isinstance(bb, (list, tuple)) else (bb if bb is not None else tb)
+            hard = balanced_tversky_loss(
+                cells, grid, alpha=ba, beta=bb,
+                gamma=getattr(c, "ft_gamma", 0.75), smooth=smooth, band=band,
+                difficulty_temp=getattr(c, "difficulty_temp", None))
+        elif getattr(c, "loss_mode", "combo") == "focal_tversky":
             # single balanced term (no focal-vs-Tversky fight) + a GENTLE per-cell
             # focal anchor for dense, stable gradient early on. The anchor uses a
             # mild alpha (it stabilizes; focal-Tversky does the class balancing).
