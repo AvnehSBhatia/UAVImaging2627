@@ -7,6 +7,20 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
+try:  # progress bars — degrade to a no-op wrapper if tqdm isn't installed
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(it=None, *a, **k):
+        return it if it is not None else _NullBar()
+
+    class _NullBar:
+        def update(self, *a, **k): pass
+        def set_postfix(self, *a, **k): pass
+        def set_description(self, *a, **k): pass
+        def close(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
 from .losses import distill_kl, focal_loss, focal_tversky_loss, tversky_loss
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
 
@@ -286,11 +300,20 @@ class Trainer:
             if epoch == 0 and self.cfg.train.num_workers > 0:
                 print(f"epoch 0: spawning {self.cfg.train.num_workers} dataloader "
                       "workers + fetching first batch...", flush=True)
+            # the FIRST step of epoch 0 blocks for minutes (compile + MIOpen
+            # autotune). tqdm shows elapsed time + a live bar so it never looks
+            # hung; the bar sits at 0/N with a climbing clock while it compiles.
+            first = epoch == 0 and self.device.type == "cuda"
+            bar = tqdm(total=n_batches, desc=f"epoch {epoch}",
+                       unit="step", dynamic_ncols=True, leave=True,
+                       initial=0)
+            if first:
+                bar.set_description(f"epoch {epoch} [compiling 1st step ~1-3min]")
             for step, batch in enumerate(self.train_loader):
-                if step == 0:
-                    print(f"epoch {epoch}: first batch loaded, forward...", flush=True)
                 with self._autocast():
                     loss = self._loss(batch) / accum
+                if step == 0 and first:
+                    bar.set_description(f"epoch {epoch}")
                 self.scaler.scale(loss).backward()
                 # copy the loss OUT of its buffer NOW: under cudagraphs (compile
                 # mode reduce-overhead) `loss` is a static output tensor that the
@@ -305,10 +328,9 @@ class Trainer:
                     if step == 0:
                         compiled = bool(getattr(self.cfg.train, "compile", False))
                         note = ((f" ({'compile + ' if compiled else ''}MIOpen/cuDNN "
-                                 "autotune — first steps are slow)")
+                                 "autotune done — steady state now)")
                                 if epoch == 0 and self.device.type == "cuda" else "")
-                        print(f"epoch {epoch}: first step loss={wsum:.4f}{note}",
-                              flush=True)
+                        bar.write(f"epoch {epoch}: first step loss={wsum:.4f}{note}")
                     if not math.isfinite(wsum):
                         # drop the pending accumulation window. With check>1 the
                         # window's earlier optimizer steps already ran, so a NaN
@@ -318,18 +340,21 @@ class Trainer:
                         win_n = 0
                         self.opt.zero_grad()
                         if nan_streak == 1 or nan_streak % 10 == 0:
-                            print(f"epoch {epoch} step {step}: non-finite loss "
-                                  f"(streak {nan_streak}) — skipping step", flush=True)
+                            bar.write(f"epoch {epoch} step {step}: non-finite loss "
+                                      f"(streak {nan_streak}) — skipping step")
                         if nan_streak * check >= 25:
+                            bar.close()
                             raise RuntimeError(
                                 "non-finite loss for >=25 consecutive steps — model "
                                 "has diverged; lower lr / check amp before rerunning")
+                        bar.update(1)
                         continue
                     nan_streak = 0
                     running, n = running + wsum, n + win_n
                     win_n = 0
-                if step > 0 and (step + 1) % 100 == 0:
-                    print(f"epoch {epoch}: {step + 1}/{n_batches} steps", flush=True)
+                    bar.set_postfix(loss=f"{running / max(n, 1):.4f}",
+                                    lr=f"{self.opt.param_groups[0]['lr']:.1e}")
+                bar.update(1)
                 if (step + 1) % accum == 0:
                     if clip:
                         if self.scaler.is_enabled():
@@ -339,7 +364,8 @@ class Trainer:
                     self.scaler.update()
                     self.opt.zero_grad()
                     self.sched.step()
-            stats = self.evaluate(self.val_loader)
+            bar.close()
+            stats = self.evaluate(self.val_loader, desc=f"epoch {epoch} eval")
             # SYNTHETIC mannequin recall is the mission metric (ARCH §10; overall
             # recall is ~94% VisDrone and pinned at 0), but selecting on it alone
             # saved a mannequin-maximal/tent-dead checkpoint (ep5 over-prediction).
@@ -380,11 +406,12 @@ class Trainer:
             # it hands blocks back to the driver, stalling the next epoch's first steps
 
     @torch.no_grad()
-    def evaluate(self, loader):
+    def evaluate(self, loader, desc="eval"):
         self.model.eval()
         cells_m, obj_m = CellConfusion(), ObjectMetrics()
         thresh = getattr(self.cfg.train, "conf_thresh", 0.0) or 0.0
-        for batch in loader:
+        for batch in tqdm(loader, desc=desc, unit="batch",
+                          dynamic_ncols=True, leave=False):
             img = self._prep_img(batch["image"].to(self.device, non_blocking=True))
             with self._autocast():
                 logits = self.model_eval(img)
