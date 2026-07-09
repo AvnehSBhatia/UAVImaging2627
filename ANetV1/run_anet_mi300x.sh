@@ -7,6 +7,9 @@
 # Env:
 #   DATA_ROOT   dataset root (default: <repo>/datasets/suas-synth-50k)
 #   FORCE=1     rerun even if runs/.stages/anet.done exists
+#   FOREGROUND=1  don't auto-detach (debug in this terminal)
+# Defaults below (ANET_*): workers=0, compile=0, batch=16/accum=4 — safe for
+# this container. Re-enable speed later: ANET_COMPILE=1 ANET_BATCH=32 ...
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -31,6 +34,14 @@ LOG_DIR="$ANET_DIR/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
 
 export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
+# Container-safe defaults for this MI300X box (override anytime):
+#   spawn workers + torch.compile + batch-32 repeatedly hung epoch-0, leaked
+#   semaphores, and left 60-115GB orphaned VRAM (amd-smi host PIDs unkillable
+#   from inside the container). In-process loader, eager train, batch-16 first.
+export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
+export ANET_COMPILE="${ANET_COMPILE:-0}"
+export ANET_BATCH="${ANET_BATCH:-16}"
+export ANET_ACCUM="${ANET_ACCUM:-4}"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1

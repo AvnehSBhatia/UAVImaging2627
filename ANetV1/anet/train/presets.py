@@ -36,9 +36,9 @@ def anet_cfg(**overrides):
         # workspace), ideally with MIOPEN_FIND_MODE=NORMAL on the first run to
         # build the find-db so later epochs stop probing.
         batch_size=int(os.environ["ANET_BATCH"]) if "ANET_BATCH" in os.environ
-        else (32 if IS_CUDA else 4),
+        else (16 if IS_ROCM else (32 if IS_CUDA else 4)),
         accum_steps=int(os.environ["ANET_ACCUM"]) if "ANET_ACCUM" in os.environ
-        else (2 if IS_CUDA else 4),
+        else (4 if IS_ROCM else (2 if IS_CUDA else 4)),
         lr=4.0e-3 if IS_CUDA else 3.0e-3,
         warmup_steps=300 if IS_CUDA else 0,
         grad_clip=1.0,
@@ -54,8 +54,9 @@ def anet_cfg(**overrides):
         #     trainer now setdefaults TORCHINDUCTOR_COMPILE_THREADS=1 before the
         #     first (lazy) compile, and the run script exports it too.
         # Robust fallback: any compile error (setup OR first-step) degrades to
-        # eager instead of dying. Fast off-switch: ANET_COMPILE=0 (or compile=False).
-        compile=IS_CUDA,
+        # eager instead of dying. ROCm defaults OFF (container hung epoch-0);
+        # opt in with ANET_COMPILE=1. NVIDIA stays ON.
+        compile=(IS_CUDA and not IS_ROCM),
         compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search
@@ -131,7 +132,7 @@ def anet_cfg(**overrides):
         # workers decode well ahead of the ~1-2s/step compute. num_workers=0 makes
         # the loader run in-process (no spawn, no semaphore warning at all).
         num_workers=int(os.environ["ANET_NUM_WORKERS"]) if "ANET_NUM_WORKERS" in os.environ
-        else (min(6, os.cpu_count() or 6) if IS_CUDA else 2),
+        else (0 if IS_ROCM else (min(6, os.cpu_count() or 6) if IS_CUDA else 2)),
         prefetch_factor=2 if IS_CUDA else 2,
         checkpoint_dir="runs/anet",
     )
