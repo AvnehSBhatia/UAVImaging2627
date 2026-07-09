@@ -1,6 +1,7 @@
 import csv
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -20,6 +21,34 @@ except ImportError:  # pragma: no cover
         def close(self): pass
         def __enter__(self): return self
         def __exit__(self, *a): pass
+
+
+class _Heartbeat:
+    """Prints an elapsed-seconds line from a daemon thread, so a long BLOCKING
+    call (first-step compile / MIOpen autotune / first forward) still visibly
+    ticks — tqdm can't animate during a single blocked iteration, which reads
+    as 'frozen'. Use as a context manager around the slow region."""
+    def __init__(self, msg, interval=5.0, writer=None):
+        self.msg, self.interval = msg, interval
+        self.writer = writer or (lambda m: print(m, flush=True))
+        self._stop = threading.Event()
+        self._th = None
+
+    def __enter__(self):
+        t0 = time.time()
+
+        def run():
+            while not self._stop.wait(self.interval):
+                self.writer(f"  … {self.msg}: {int(time.time() - t0)}s elapsed "
+                            "(alive — not hung)")
+        self._th = threading.Thread(target=run, daemon=True)
+        self._th.start()
+        return self
+
+    def __exit__(self, *a):
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=0.2)
 
 from .losses import distill_kl, focal_loss, focal_tversky_loss, tversky_loss
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
@@ -308,15 +337,23 @@ class Trainer:
                        unit="step", dynamic_ncols=True, leave=True,
                        initial=0)
             if first:
-                bar.set_description(f"epoch {epoch} [compiling 1st step ~1-3min]")
+                bar.set_description(f"epoch {epoch} [first step warming up]")
+            # heartbeat ticks from a daemon thread through the whole first step
+            # (loader wait + MIOpen autotune + optional compile), which is ONE
+            # blocking call tqdm can't animate — this is how you tell alive from
+            # hung. Started before the loop so it also covers the loader wait.
+            hb = _Heartbeat("first step warming up", interval=5.0) if first else None
+            if hb is not None:
+                compiled = bool(getattr(self.cfg.train, "compile", False))
+                print(f"epoch {epoch}: entering first step — MIOpen autotune"
+                      + (" + torch.compile" if compiled else "")
+                      + " (one-time, can take minutes; heartbeat every 5s)",
+                      flush=True)
+                hb.__enter__()
             for step, batch in enumerate(self.train_loader):
-                if step == 0:
-                    # heartbeat: if you see THIS, the loader is fine and the
-                    # first step is now compiling/autotuning (minutes on ROCm).
-                    # if you DON'T see this, the hang is in the dataloader.
-                    bar.write(f"epoch {epoch}: first batch loaded — first step "
-                              f"{'compiles' if first else 'runs'} now"
-                              + (" (compile+capture+MIOpen, minutes)" if first else ""))
+                if step == 0 and hb is not None:
+                    hb.writer(f"epoch {epoch}: first batch loaded — now in the "
+                              "first forward (loader OK)")
                 with self._autocast():
                     loss = self._loss(batch) / accum
                 if step == 0 and first:
@@ -329,6 +366,9 @@ class Trainer:
                 # forces a real copy this step; it's a scalar, so ~free.
                 loss_win += loss.detach().clone()
                 win_n += 1
+                if step == 0 and hb is not None:
+                    hb.__exit__()  # first step done — steps flow now, bar animates
+                    hb = None
                 if step == 0 or win_n >= check or step + 1 == n_batches:
                     wsum = loss_win.item() * accum  # the ONE sync per window
                     loss_win.zero_()
