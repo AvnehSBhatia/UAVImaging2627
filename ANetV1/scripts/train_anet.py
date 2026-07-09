@@ -5,6 +5,7 @@ No yaml, no flags — edit the cfg block below and run:
 Device-aware defaults (MI300X vs Mac) come from anet/train/presets.py.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -51,11 +52,17 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        # keep a SHORT warmup + lower peak lr: hitting a converged model with the
-        # full 4e-3 immediately made it thrash (mannequin 0.08<->0.63, fp 0.3<->28)
-        cfg.train.warmup_steps = 100
-        cfg.train.lr = min(cfg.train.lr, 2.0e-3)
-        print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, warmup=100)")
+        # default warm-start is gentle (short warmup, lr capped 2e-3) because
+        # hitting a CONVERGED model with 4e-3 thrashed it. But an EXPLICIT
+        # ANET_LR/ANET_WARMUP means the caller deliberately wants that peak
+        # (e.g. resuming a still-climbing model to push it over the argmax bar)
+        # — so respect it and don't clobber.
+        if "ANET_WARMUP" not in os.environ:
+            cfg.train.warmup_steps = 100
+        if "ANET_LR" not in os.environ:
+            cfg.train.lr = min(cfg.train.lr, 2.0e-3)
+        print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, "
+              f"warmup={cfg.train.warmup_steps})")
     else:
         model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
                        stem=cfg.train.stem,
