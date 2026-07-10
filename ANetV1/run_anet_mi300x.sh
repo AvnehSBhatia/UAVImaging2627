@@ -6,10 +6,14 @@
 #
 # Env:
 #   DATA_ROOT   dataset root (default: <repo>/datasets/suas-synth-50k)
-# Fast defaults (2026-07-08 memory/throughput work): batch 16 x accum 4
-# (effective 64 unchanged), compile ON (inductor fuses + rematerializes ->
-# ~10GB VRAM), 4 spawn workers over the memmap dataset cache (first run
-# builds it: ~70GB under $DATA_ROOT/.anet_cache, ~10 min one-time).
+# Fast defaults: batch 96 x accum 1. This net is LAUNCH-BOUND (thousands of
+# tiny kernels, ~1% util) so throughput is set by how many images amortize the
+# fixed per-step launch overhead — batch 96 runs ~140 steps/epoch @ ~1.5s
+# (~4 min), whereas the old batch-16 x accum-4 paid the launch cost 4x per
+# optimizer step and cratered to ~6.6s/step (~90 min/epoch). compile ON
+# (inductor fuses + rematerializes). In-process loader over the memmap cache
+# (first run builds it: ~70GB under $DATA_ROOT/.anet_cache, ~10 min one-time).
+# Drop to ANET_BATCH=64 if a bigger (hidden=24) model OOMs on eager fallback.
 # Escape hatches if the container misbehaves:
 #   ANET_COMPILE=0        eager (trainer also auto-falls-back on any error)
 #   ANET_CKPT=1           per-round checkpointing (pair with eager: caps VRAM)
@@ -36,8 +40,8 @@ export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 # for the launch-bound GPU. Set ANET_NUM_WORKERS>0 only if spawn is verified OK.
 export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
 export ANET_COMPILE="${ANET_COMPILE:-1}"
-export ANET_BATCH="${ANET_BATCH:-16}"
-export ANET_ACCUM="${ANET_ACCUM:-4}"
+export ANET_BATCH="${ANET_BATCH:-96}"
+export ANET_ACCUM="${ANET_ACCUM:-1}"
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
