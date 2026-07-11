@@ -582,6 +582,7 @@ class Trainer:
         )
         self._seed_norm_stats(getattr(self.cfg.train, "seed_stat_batches", 8) or 0)
         self._setup_fused()
+        n_batches = len(self.train_loader)  # a fused demotion rebuilds loaders
         use_prefetch = (self.device.type == "cuda"
                         and self.cfg.train.num_workers == 0
                         and (getattr(self.cfg.train, "prefetch", True)))
