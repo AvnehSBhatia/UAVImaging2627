@@ -392,6 +392,14 @@ class Trainer:
         if not (want and self.device.type == "cuda"
                 and getattr(self.model, "arch", "v8") == "v9"):
             return
+        import traceback
+
+        def _dump(prefix, e):
+            print(f"\n{'=' * 70}\n{prefix} ({type(e).__name__}: {e})\n"
+                  f"{traceback.format_exc()}{'=' * 70}\n", flush=True)
+
+        # FORWARD tier: import + parity. Failure here => the whole fused path is
+        # unusable, drop to the dense fallback (smaller batch).
         try:
             from .fused import (FusedStage1, fused_available, parity_backward,
                                 parity_forward)
@@ -404,10 +412,32 @@ class Trainer:
             ok_f, delta = parity_forward(self.model, img)
             if not ok_f:
                 raise RuntimeError(f"forward parity failed (max delta {delta:.3e})")
-            mode = os.environ.get("ANET_FUSED_BWD") or \
-                getattr(c, "fused_bwd", "triton")
-            if mode == "triton":
+        except Exception as e:
+            _dump("FUSED STAGE-1 FORWARD unavailable — PyTorch dense path", e)
+            fb = getattr(c, "fallback_batch", 0) or 0
+            if fb and c.batch_size > fb:
+                print(f"dense fallback: rebuilding loaders at batch {fb} "
+                      f"(was {c.batch_size}) to stay inside the VRAM budget",
+                      flush=True)
+                c.batch_size = fb
+                self._build_loaders(fb)  # both loaders, same worker/spawn setup
+            return
+
+        # BACKWARD tier: a triton-backward CRASH (not just a numeric mismatch)
+        # now demotes to chunked-autograd backward — the fused FORWARD and the
+        # large batch are KEPT (recovers most of the fused speed) instead of
+        # collapsing to dense/batch-32. parity_backward only reports numeric
+        # mismatch; a kernel compile/launch crash escapes it, so it's caught.
+        mode = os.environ.get("ANET_FUSED_BWD") or getattr(c, "fused_bwd", "triton")
+        if mode == "triton":
+            try:
                 ok_b, rel = parity_backward(self.model, img)
+            except Exception as e:
+                _dump("FUSED TRITON BACKWARD crashed — keeping the fused "
+                      "FORWARD, demoting only the backward to chunked-autograd "
+                      "(batch stays large)", e)
+                mode = "chunked"
+            else:
                 if not ok_b:
                     print(f"fused TRITON backward parity failed (worst rel "
                           f"{rel:.3e}) — demoting to chunked-autograd backward",
@@ -416,19 +446,12 @@ class Trainer:
                 else:
                     print(f"fused backward parity OK (worst rel {rel:.3e})",
                           flush=True)
+        try:
             self.model.fused_pool = FusedStage1(self.model, bwd_mode=mode)
             print(f"fused Stage-1 ON (bwd={mode}, fwd max delta {delta:.3e})",
                   flush=True)
         except Exception as e:
-            print(f"fused Stage-1 unavailable ({type(e).__name__}: {e}) — "
-                  "PyTorch dense path", flush=True)
-            fb = getattr(c, "fallback_batch", 0) or 0
-            if fb and c.batch_size > fb:
-                print(f"dense fallback: rebuilding loaders at batch {fb} "
-                      f"(was {c.batch_size}) to stay inside the VRAM budget",
-                      flush=True)
-                c.batch_size = fb
-                self._build_loaders(fb)  # both loaders, same worker/spawn setup
+            _dump(f"FusedStage1 construction failed (bwd={mode}) — dense path", e)
 
     def _build_loaders(self, batch_size):
         """(Re)build both loaders at batch_size. One code path, so the fused-

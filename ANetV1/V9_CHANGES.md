@@ -1,5 +1,20 @@
 # ANetV1 v9 — what changed, why, and what to expect
 
+> **v10 update (training fixes).** The first v9 run oscillated (argmax_fg 0↔185k
+> while the loss fell — "cheating the loss"). An 8-agent static audit (CPU
+> gradient probes, no training) found and fixed it — see ARCHITECTURE.md §14.5
+> (D49–D53). Headlines: **the loss's background term was normalized by the
+> foreground count** (`n_fg`), swinging the fg/bg balance 75–80× on
+> prediction-identical batches — now normalized by its own count (swing 1.00×,
+> verified). Peak LR 3e-3→1.5e-3. Aux probe dropped (measured 0.02% of encoder
+> gradient, polluted 19% of the logged loss). `ctx_norm` momentum 0.05→0.01
+> (small-N noise broadcast to all windows). Speed: `MIOPEN_FIND_MODE=NORMAL`,
+> stem convs fused 4→1 (bit-identical), `ANET_SAMPLES=6000` (~2.3× faster
+> epochs), fused-backward crash keeps the fast forward instead of dropping to
+> dense. `git pull` and restart from scratch (the v10 loss + stem change the
+> model; old v9 checkpoints load only for eval).
+
+
 Companion to `ARCHITECTURE.md` §14 and D39–D48. This is the summary-of-changes
 deliverable; the spec has the full rationale per decision.
 

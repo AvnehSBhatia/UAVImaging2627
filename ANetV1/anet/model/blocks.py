@@ -215,18 +215,25 @@ class EdgeDQStem4(nn.Module):
     def __init__(self):
         super().__init__()
         self.dq_in = nn.ModuleList([DualQuaternionRGB() for _ in self.ORIENTS])
-        self.edges = nn.ModuleList(
-            [nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False) for _ in self.ORIENTS]
-        )
+        # ONE fused groups=12 depthwise 7x7 instead of 4 separate groups=3 convs
+        # (v10 speed fix). Depthwise is per-channel-independent regardless of how
+        # channels are grouped into calls, so this is BIT-IDENTICAL (verified max
+        # abs diff 0.0) — but it is one MIOpen dispatch on a less pathological
+        # groups=12 shape instead of 4 dispatches on the worst-shaped groups=3
+        # conv in the model (the stem runs at full 540x960, 88.6% of grouped-conv
+        # FLOPs; the 4x groups=3 form was the dominant dense-path cost).
+        self.edge = nn.Conv2d(12, 12, 7, padding=3, groups=12, bias=False)
         with torch.no_grad():
-            for conv, o in zip(self.edges, self.ORIENTS):
-                conv.weight.copy_(sobel7(o).mul(0.5).expand(3, 1, 7, 7))
+            w = torch.cat([sobel7(o).mul(0.5).expand(3, 1, 7, 7)
+                           for o in self.ORIENTS], 0)
+            self.edge.weight.copy_(w)
         self.dq_out = nn.ModuleList(
             [DualQuaternionRGB() for _ in range(1 + len(self.ORIENTS))]
         )
 
     def forward(self, img):  # (B,3,H,W) -> (B,15,H,W): [colour, e_v, e_h, e_d1, e_d2]
-        groups = [img] + [e(dq(img)) for dq, e in zip(self.dq_in, self.edges)]
+        rotated = torch.cat([dq(img) for dq in self.dq_in], 1)   # (B,12,H,W)
+        groups = [img] + list(self.edge(rotated).split(3, dim=1))
         return torch.cat([dq(g) for dq, g in zip(self.dq_out, groups)], 1)
 
 

@@ -50,7 +50,11 @@ cfg = anet_cfg(
     stem="edge_dq4",         # 4-orientation Sobel-init edge stem (D41)
     hidden=32,               # embedding width (v9 default; ~21k params total)
     epochs=int(os.environ.get("ANET_EPOCHS", 40)),
-    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 3.0e-3,
+    # 1.5e-3 peak (was 3e-3): with the v10 loss fix removing the oscillation
+    # forcing function, LR is just the step-amplitude knob — and the cosine sits
+    # at ~100% of peak for the first ~8 epochs (stretched over 40), so a hot peak
+    # meant every early step took a full-amplitude swing at the argmax boundary.
+    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 1.5e-3,
     prior_fg=(float(os.environ["ANET_PRIOR_FG"]) or None)
     if "ANET_PRIOR_FG" in os.environ else 0.05,
     checkpoint_dir="runs/anet",

@@ -163,6 +163,14 @@ class ANetV1(nn.Module):
                 path_a_per_channel=sd["pools.0.weight"].shape[0] > 1,
                 aux_head="aux.weight" in sd,
                 **kwargs)
+            # migrate pre-v10 stems: 4 separate edge convs -> one fused groups=12
+            # (stem_mod.edges.{0..3}.weight -> stem_mod.edge.weight). Same params,
+            # just concatenated on the out-channel axis.
+            old_edges = sorted(k for k in sd if k.startswith("stem_mod.edges."))
+            if old_edges and "stem_mod.edge.weight" not in sd:
+                sd = dict(sd)
+                sd["stem_mod.edge.weight"] = torch.cat(
+                    [sd.pop(k) for k in old_edges], 0)
             model.load_state_dict(sd, strict=True)
             return model
         hidden = sd["encoder.mlp.0.weight"].shape[0]

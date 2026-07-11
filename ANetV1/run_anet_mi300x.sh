@@ -56,6 +56,11 @@ export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
 export ANET_BATCH="${ANET_BATCH:-96}"
 export ANET_ACCUM="${ANET_ACCUM:-1}"
+# cap draws/epoch so you get an eval/checkpoint every ~2-4 min instead of ~60.
+# The sampler redraws i.i.d. from a fixed distribution, so this is a pure speed
+# lever (does not change what any step sees). Raise ANET_EPOCHS to keep the
+# total step budget if this becomes the production recipe (13501/6000 ~ 2.25x).
+export ANET_SAMPLES="${ANET_SAMPLES:-6000}"
 
 # ---- compile: fuses the tail (neck/head/loss — dozens of tiny tensors) even
 # when the Triton Stage-1 is on; inductor breaks the graph around the custom
@@ -67,7 +72,17 @@ export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$ANET_DIR/.torchinduc
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$ANET_DIR/.triton}"
 
 # ---- ROCm/MIOpen hygiene
-export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"
+# NORMAL (was FAST): FAST picks a conv algorithm by heuristic and NEVER retries
+# when its workspace request is denied under memory pressure -> it drops to the
+# slow no-workspace fallback for that shape for the whole run (the log's
+# "IsEnoughWorkspace ... provided ptr: 0" spam on the stem's grouped convs).
+# NORMAL does ONE timed search per unique (static) conv shape and caches it to
+# the on-disk find-db -> low-minutes one-time cost, fast steady state. This is
+# the fix the presets.py comment already prescribed ("NORMAL once builds the
+# find-db if it cliffs"). NOT the same as cudnn.benchmark (that 27-min hang is a
+# different, disabled knob).
+export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-NORMAL}"
+export MIOPEN_USER_DB_PATH="${MIOPEN_USER_DB_PATH:-$ANET_DIR/.miopen}"
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
 export PYTHONUNBUFFERED=1

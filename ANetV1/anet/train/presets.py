@@ -95,10 +95,20 @@ def anet_cfg(**overrides):
         h1=48,                        # pre-pool token width (D42)
         neck_rounds=2,                # ConvNeck depth (D43)
         head_width=24,                # classifier width (D45)
-        aux_head=True,                # deep-supervision probe (D46, train-only)
-        aux_weight=0.3,
+        # aux deep-supervision probe (D46): DROPPED in v10. Measured (single
+        # forward+backward decomposition) it contributes 0.02% of the encoder
+        # gradient — the hard-loss path dominates ~4000x even when the head is
+        # confidently wrong (focal grad doesn't vanish on wrong-class), so it
+        # never achieved its "gradient path a collapsed head can't block" goal;
+        # meanwhile its private linear-probe weights fitting themselves were
+        # ~19% of the logged loss, decoupled from detection (part of why the
+        # loss fell while metrics oscillated). Off by default; env re-enables.
+        aux_head=(os.environ.get("ANET_AUX", "0").strip().lower() in ("1", "true", "yes")),
+        aux_weight=float(os.environ.get("ANET_AUX_W", 0.3)),
         ema_decay=0.998,              # weight EMA for eval/checkpoints (D48); 0=off
-        # focal_norm (D47) class weights (bg, mannequin, tent)
+        # focal_norm (v10) class weights (bg, mannequin, tent). Per-class MEAN
+        # normalization now, so weights are pure class-importance (no size-bias
+        # compensation needed): mannequin 2x the rare hard class.
         focal_norm_weights=(1.0, 2.0, 1.0),
         # fused Triton Stage-1 (D40): parity-checked at startup, demotes to
         # chunked-autograd backward, then to the PyTorch dense path (at
@@ -107,7 +117,10 @@ def anet_cfg(**overrides):
         fused=IS_CUDA,
         fused_bwd="triton",
         fallback_batch=32,
-        seed_stat_batches=8,          # DeployNorm stat seeding passes (D39)
+        # DeployNorm seeding (D39): 24 covers the full cumulative-average ramp
+        # (momentum locks to its 0.05 floor at step 20) before any real gradient,
+        # so training never normalizes against a half-formed running stat.
+        seed_stat_batches=24,
         prefetch=True,                # background-thread H2D pipeline
         # per-channel Path A kernels (D37): the pre-registered "mushy tent blob"
         # upgrade (ARCH §8.2 step 2), justified by the 000008 viz (tent recall
@@ -124,7 +137,13 @@ def anet_cfg(**overrides):
         use_checkpoint=(os.environ["ANET_CKPT"].strip().lower() in ("1", "true", "yes"))
         if "ANET_CKPT" in os.environ else not IS_CUDA,
         amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
-        samples_per_epoch=None if IS_CUDA else 6000,
+        # ANET_SAMPLES caps draws/epoch (was uncapped on CUDA -> full ~13.5k ->
+        # ~60 min/epoch dense). The WeightedRandomSampler redraws i.i.d. from a
+        # FIXED distribution every epoch, so capping changes only how often you
+        # eval/checkpoint, not what any step sees — a pure, safe speed lever.
+        # run_anet_mi300x.sh sets ANET_SAMPLES=6000 (~2.3x faster feedback).
+        samples_per_epoch=(int(os.environ["ANET_SAMPLES"]) if "ANET_SAMPLES" in os.environ
+                           else (None if IS_CUDA else 6000)),
         # generous early-stop so a fine-tune from good.pt has room to settle
         # (starts converged near mann 0.573; best.pt selection keeps the peak).
         # min 25 epochs, patience 12. ANET_MIN_EP / ANET_PATIENCE override.

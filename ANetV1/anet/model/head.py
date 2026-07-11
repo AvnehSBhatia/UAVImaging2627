@@ -79,7 +79,15 @@ class RegionHeadV9(nn.Module):
         super().__init__()
         self.local_norm = DeployNorm(dim)
         self.local_gate = CosineGate(dim)
-        self.ctx_norm = DeployNorm(dim)
+        # ctx is ONE d-vector per image (SlimContext already pooled space away),
+        # so ctx_norm sees only B samples/channel — ~20,000x fewer than every
+        # other DeployNorm (which see B*W*... ~ 1e5). At momentum 0.05 its
+        # running stats random-walk ~4% every step from pure sampling noise, and
+        # that noise folds into a scale/shift added IDENTICALLY to all ~5035
+        # windows of the image (head.py forward broadcast) — a globally-coherent
+        # logit wobble, exactly the shape of the 0<->185k argmax swing. Slower
+        # momentum averages the small sample harder (v10 stability fix).
+        self.ctx_norm = DeployNorm(dim, momentum=0.01)
         self.fc1 = nn.Linear(2 * dim, width)
         self.fc2 = nn.Linear(width, n_classes)
         if prior_fg:

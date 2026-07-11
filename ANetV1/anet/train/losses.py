@@ -186,51 +186,56 @@ def _cls_param2(v, c):
 
 
 def focal_norm_loss(logits, target, gamma=2.0, class_weights=(1.0, 2.0, 1.0),
-                    min_pos=1.0, min_pos_bg=8.0, mask=None):
-    """v9 default (D47): per-class positive-normalized focal loss — ONE smooth
-    per-cell term that is simultaneously size-invariant and oscillation-free.
+                    min_pos=1.0, min_pos_bg=64.0, mask=None):
+    """v10 (supersedes D47/D49): per-class MEAN-normalized focal loss — ONE
+    smooth per-cell term, size-invariant AND oscillation-free.
 
-    The Focal-Tversky stack failed two ways: the set-level ratio makes the
-    gradient per cell depend nonlinearly on the batch's TP/FP totals (spiky,
-    and the documented source of the fp 0.3<->28 and mannequin 0<->overshoot
-    limit cycles), and pairing it with a focal anchor created a two-term
-    tug-of-war. This loss keeps focal's dense smooth gradient and gets size
-    invariance the CenterNet/FCOS way — normalize each class's summed focal
-    term by that class's positive-cell count in the BATCH:
+    D47's bug (measured, not theorized): every FOREGROUND class was normalized
+    by its OWN cell count (a bounded per-class mean — correct, stable), but the
+    BACKGROUND term was normalized by n_fg — the batch's total FOREGROUND cell
+    count, a class-foreign, wildly batch-varying quantity. Background is ~99.9%
+    of every grid, so that one denominator IS the entire fg-vs-bg balance for
+    the step. Single-step CPU probe, two batches with IDENTICAL prediction
+    quality (one with a 3-cell mannequin, one with a 600-cell tent): the
+    background loss value swung 79.6x (1.0085 -> 0.0127) and the per-bg-cell
+    gradient swung ~75x (0.2814 -> 0.0038 in an all-foreground state) purely
+    from which object the sampler drew. That asymmetry is the argmax_fg
+    0<->185k limit cycle: a big-object batch mutes the corrective background
+    pushback ~75x, an over-prediction excursion runs unchecked, then a
+    background-heavy batch swings the correction ~75x harder and collapses the
+    head to predict-nothing. Mean loss falls smoothly through it because the bg
+    term's ABSOLUTE scale shrinks whenever n_fg is large regardless of
+    accuracy — exactly "cheating the loss".
 
-        L = sum_c w_c * [ sum_{cells: t=c} FL(cell) ] / max(N_c, min_pos)
-          + w_bg    * [ sum_{t=0, mask}  FL(cell) ] / max(N_fg_total, min_pos)
+    Fix: normalize EVERY class (background included) by ITS OWN cell count,
+    like the foreground classes always were —
 
-    Every positive cell of a rare class carries O(1) gradient no matter how
-    few there are (a 60-cell mannequin and a 500-cell tent weigh the same per
-    class), and the background push scales with how much foreground actually
-    exists — at prior-bias init the foreground pull dominates, so recall
-    rises first and precision pressure grows as predictions appear.
-    Batch-level counts (not per-image) keep the normalizer steady.
+        L = sum_c w_c * [ sum_{cells: t=c} FL(cell) ] / max(N_c, floor_c)
 
-    Floors are asymmetric on purpose: min_pos=1 keeps a 1-4-cell mannequin
-    (exactly the worst-decile regime the decision metric targets) at full
-    per-class pull — flooring foreground at 8 measurably inverted the fg/bg
-    balance whenever a small batch's only foreground was one tiny object.
-    min_pos_bg=8 still bounds the background push in all-background batches
-    (n_fg=0). mask drops boundary-band background cells."""
+    n_bg is ~1e5 cells in a real batch, so its normalizer is near-constant
+    (measured <6% swing vs. the old term's 79.6x) — the forcing function is
+    removed by construction, and fg:bg pull is now batch-invariant (the
+    RetinaNet/CenterNet symmetry property, restored). Each L_c is a bounded
+    per-cell mean weighted by w_c, so total gradient magnitude is comparable
+    across classes and FP are penalized proportionally (n_bg cells each push
+    a small 1/n_bg gradient that SUMS to a class-comparable total).
+
+    min_pos=1 keeps a 1-4-cell mannequin (the worst-decile regime) at full
+    per-class pull. min_pos_bg is now defensive only (background is never
+    scarce); FP control lives in class_weights[0], not the floor."""
     assert len(class_weights) == logits.shape[1], \
         f"class_weights must have {logits.shape[1]} entries (bg, mann, tent)"
     logp = F.log_softmax(logits, 1)
     logpt = logp.gather(1, target.unsqueeze(1)).squeeze(1)
     fl = -((1.0 - logpt.exp()) ** gamma) * logpt  # (B, H, W)
     total = logits.new_zeros(())
-    n_fg = (target > 0).float().sum()
     for c, w in enumerate(class_weights):
         m = target == c
-        if c == 0:
-            if mask is not None:
-                m = m & mask
-            total = total + w * (fl * m.float()).sum() / \
-                torch.clamp(n_fg, min=min_pos_bg)
-        else:
-            n_c = m.float().sum()
-            total = total + w * (fl * m.float()).sum() / torch.clamp(n_c, min=min_pos)
+        if c == 0 and mask is not None:
+            m = m & mask  # drop boundary-band bg cells from BOTH sum and count
+        n_c = m.float().sum()
+        floor = min_pos_bg if c == 0 else min_pos
+        total = total + w * (fl * m.float()).sum() / torch.clamp(n_c, min=floor)
     return total
 
 
