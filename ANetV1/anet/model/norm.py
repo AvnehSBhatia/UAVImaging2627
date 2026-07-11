@@ -24,11 +24,28 @@ Cold start: the first `forward` seeds the buffers from the first batch
 no-grad seeding passes before step 0 (`Trainer._seed_norm_stats`) so training
 never normalizes against init-garbage stats.
 
+Buffer updates are DEFERRED: observe() only stashes the batch stats; the
+trainer calls apply_norm_updates(model) after each backward(). Mutating the
+buffers inside the forward->backward window breaks torch.compile — AOT
+autograd's partitioner saves the buffer tensors themselves and rematerializes
+the fold in backward, so an in-step mutation trips the version counter
+(reproduced; eager hides it because fold() clones). Anyone training a model
+outside the Trainer must call apply_norm_updates(model) after backward, or
+the stats silently never move.
+
 Folds into adjacent convs at export exactly like BatchNorm (same buffers).
 """
 
 import torch
 import torch.nn as nn
+
+
+def apply_norm_updates(model):
+    """Apply every DeployNorm's stashed batch stats to its running buffers.
+    Call after backward() (the trainer does) — never inside the step."""
+    for m in model.modules():
+        if isinstance(m, DeployNorm):
+            m.apply_pending()
 
 
 class DeployNorm(nn.Module):
@@ -41,6 +58,7 @@ class DeployNorm(nn.Module):
         self.register_buffer("steps", torch.zeros((), dtype=torch.long))
         self.momentum = momentum
         self.eps = eps
+        self._pending = None  # (mean, var) stashed by observe(), applied post-step
 
     # ------------------------------------------------------------- statistics
     @torch.no_grad()
@@ -66,22 +84,32 @@ class DeployNorm(nn.Module):
 
     @torch.no_grad()
     def observe(self, x, channels_last=False):
-        """Update running stats without normalizing. channels_last=False reads
-        (B, C, H, W) / (N, C); channels_last=True reads (..., C)."""
-        self._update(*self._stats(x, channels_last))
+        """Stash this batch's stats for the post-backward update.
+        channels_last=False reads (B, C, H, W) / (N, C); True reads (..., C)."""
+        self._pending = self._stats(x, channels_last)
 
     @torch.no_grad()
     def observe_parts(self, *parts):
-        """Update from channel-partitioned views of the same token set (e.g.
-        the RGB stream + the frozen channels, in channel order): per-part
-        stats, ONE EMA step — identical semantics to the fused kernel's
+        """Stash stats from channel-partitioned views of the same token set
+        (e.g. the RGB stream + the frozen channels, in channel order): per-
+        part stats, ONE EMA step — identical semantics to the fused kernel's
         concatenated stat update."""
         means, vs = [], []
         for x in parts:
             m, v = self._stats(x, channels_last=False)
             means.append(m)
             vs.append(v)
-        self._update(torch.cat(means), torch.cat(vs))
+        self._pending = (torch.cat(means), torch.cat(vs))
+
+    def set_pending(self, mean, var):
+        """Fused-kernel stat hook: stash externally computed batch stats."""
+        self._pending = (mean, var)
+
+    @torch.no_grad()
+    def apply_pending(self):
+        if self._pending is not None:
+            self._update(*self._pending)
+            self._pending = None
 
     @torch.no_grad()
     def update_from_sums(self, s, ss, n):

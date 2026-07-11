@@ -725,7 +725,9 @@ class FusedStage1:
         if collect and stats:
             with torch.no_grad():
                 # every program contributes 400 tokens per channel, so the
-                # per-channel count is identical for all three stat groups
+                # per-channel count is identical for all three stat groups.
+                # Stashed as pending — applied post-backward by the trainer
+                # (in-step buffer mutation breaks torch.compile, see norm.py)
                 def mv(s, q, n):
                     mean = s / n
                     return mean, (q / n - mean * mean).clamp_min(0.0)
@@ -734,11 +736,10 @@ class FusedStage1:
                 fmean, fvar = mv(*stats["frozen"])    # (nfro + 2,)
                 for i, r in enumerate(enc.rounds):
                     rmean, rvar = mv(rs[i], rq[i], n)
-                    m = torch.cat([rmean, fmean])
-                    v = torch.cat([rvar, fvar])
-                    r.norm._update(m, v)
+                    r.norm.set_pending(torch.cat([rmean, fmean]),
+                                       torch.cat([rvar, fvar]))
                 pmean, pvar = mv(*stats["pool"])
-                enc.pool_norm._update(pmean, pvar)
+                enc.pool_norm.set_pending(pmean, pvar)
         return pooled
 
 

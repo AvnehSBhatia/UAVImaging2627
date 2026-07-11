@@ -50,6 +50,7 @@ class _Heartbeat:
         if self._th is not None:
             self._th.join(timeout=0.2)
 
+from ..model.norm import apply_norm_updates
 from .losses import (balanced_tversky_loss, distill_kl, focal_loss,
                      focal_norm_loss, focal_tversky_loss, tversky_loss)
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
@@ -377,6 +378,7 @@ class Trainer:
             with self._autocast():
                 self.model(self._prep_img(
                     batch["image"].to(self.device, non_blocking=True)))
+            apply_norm_updates(self.model)  # sequential seeding (pending -> buffers)
 
     def _setup_fused(self):
         """Install the fused Triton Stage-1 with startup parity verification
@@ -624,6 +626,10 @@ class Trainer:
                 if step == 0 and first:
                     bar.set_description(f"epoch {epoch}")
                 self.scaler.scale(loss).backward()
+                # DeployNorm stat updates run AFTER backward: mutating the
+                # buffers inside the fwd->bwd window trips AOT autograd's
+                # saved-tensor version check under torch.compile (norm.py)
+                apply_norm_updates(self.model)
                 # copy the loss OUT of its buffer NOW: under cudagraphs (compile
                 # mode reduce-overhead) `loss` is a static output tensor that the
                 # NEXT replay overwrites, so a plain view-add would read stale
