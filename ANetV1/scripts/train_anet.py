@@ -1,8 +1,28 @@
-"""Experiment 2: ANetV1 from scratch.
+"""Experiment 2: ANetV1 from scratch — v9 architecture (see ARCHITECTURE.md
+section 14 and V9_CHANGES.md).
 
 No yaml, no flags — edit the cfg block below and run:
     python scripts/train_anet.py
 Device-aware defaults (MI300X vs Mac) come from anet/train/presets.py.
+
+What v9 changes (summary; full rationale in the docs):
+  - DeployNorm (D39): training normalizes with the same running-stat affine
+    the deploy graph uses -> the encoder is tile-local and fusable.
+  - Fused Triton Stage-1 (D40): the whole per-token encoder runs in one
+    kernel per direction; parity-checked at startup against the reference
+    path, with automatic demotion (triton bwd -> chunked-autograd bwd ->
+    PyTorch dense at a VRAM-safe batch).
+  - Sobel-init 4-orientation stem (D41), fc2 after the pool (D42), ConvNeck
+    cross-window context (D43), SlimContext (D44, Path-B 256-d expansions
+    removed), 24-wide head (D45), aux deep-supervision probe (D46).
+  - focal_norm loss (D47): one smooth per-cell term, per-class positive-
+    normalized. No Tversky/anchor tug-of-war, no limit cycles.
+  - Weight EMA for eval + checkpoints (D48).
+
+Env overrides (all optional): ANET_BATCH, ANET_ACCUM, ANET_LR, ANET_WARMUP,
+ANET_EPOCHS, ANET_COMPILE, ANET_FUSED, ANET_FUSED_BWD, ANET_CACHE,
+ANET_NUM_WORKERS, ANET_PRIOR_FG, ANET_CONF, ANET_INIT_FROM, ANET_PATIENCE,
+ANET_MIN_EP, ANET_LOSS_MODE, DATA_ROOT.
 """
 
 import os
@@ -20,14 +40,21 @@ from anet.train.trainer import Trainer  # noqa: E402
 
 # --------------------------------------------------------------------------
 # EDIT HERE — anything not listed keeps its preset default.
-# To resume/fine-tune from a checkpoint, set init_from below (or export
-# ANET_INIT_FROM=runs/anet/last.pt). Resume warm-starts the weights, skips
-# warmup, and starts a fresh cosine over `epochs` — lower epochs/lr to fine-tune.
+# To resume/fine-tune from a v9 checkpoint, set init_from below (or export
+# ANET_INIT_FROM=runs/anet/last.pt). v8 checkpoints (e.g. runs/anet/good.pt)
+# still load through from_state_dict for evaluation, but cannot warm-start a
+# v9 model (different encoder layout).
 # --------------------------------------------------------------------------
 cfg = anet_cfg(
-    hidden=24,               # 16 = 17,037-param spec model; 24 = capacity bump (~24k)
+    arch="v9",
+    stem="edge_dq4",         # 4-orientation Sobel-init edge stem (D41)
+    hidden=32,               # embedding width (v9 default; ~21k params total)
+    epochs=int(os.environ.get("ANET_EPOCHS", 40)),
+    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 3.0e-3,
+    prior_fg=(float(os.environ["ANET_PRIOR_FG"]) or None)
+    if "ANET_PRIOR_FG" in os.environ else 0.05,
     checkpoint_dir="runs/anet",
-    # init_from="runs/anet/last.pt",   # uncomment to resume, or use ANET_INIT_FROM
+    # init_from="runs/anet/last.pt",   # uncomment to resume, or ANET_INIT_FROM
 )
 
 
@@ -38,7 +65,7 @@ def build_datasets(cfg, teacher_dir=None):
         mannequin_weight=cfg.data.mannequin_weight,
         tent_weight=cfg.data.tent_weight,
         uint8=getattr(cfg.data, "uint8", False),  # Trainer normalizes on-GPU
-        band_lo=getattr(cfg.data, "band_lo", None),  # boundary ignore band for the loss
+        band_lo=getattr(cfg.data, "band_lo", None),  # boundary ignore band
         cache=getattr(cfg.data, "cache", False),  # memmap preprocessing cache
     )
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
@@ -52,26 +79,43 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        # default warm-start is gentle (short warmup, lr capped 2e-3) because
-        # hitting a CONVERGED model with 4e-3 thrashed it. But an EXPLICIT
-        # ANET_LR/ANET_WARMUP means the caller deliberately wants that peak
-        # (e.g. resuming a still-climbing model to push it over the argmax bar)
-        # — so respect it and don't clobber.
+        if model.arch != "v9":
+            raise SystemExit(
+                f"{init} is a {model.arch} checkpoint — v9 cannot warm-start "
+                "from it (different encoder). Remove init_from to train from "
+                "scratch, or evaluate it with scripts/evaluate_all.py instead.")
+        # gentle warm start unless the caller explicitly asked for more
         if "ANET_WARMUP" not in os.environ:
             cfg.train.warmup_steps = 100
         if "ANET_LR" not in os.environ:
-            cfg.train.lr = min(cfg.train.lr, 2.0e-3)
+            cfg.train.lr = min(cfg.train.lr, 1.5e-3)
         print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, "
               f"warmup={cfg.train.warmup_steps})")
     else:
-        model = ANetV1(use_checkpoint=cfg.train.use_checkpoint, hidden=cfg.train.hidden,
-                       stem=cfg.train.stem,
-                       path_a_per_channel=cfg.train.path_a_per_channel,
-                       prior_fg=getattr(cfg.train, "prior_fg", None))
+        model = ANetV1(
+            arch="v9",
+            use_checkpoint=cfg.train.use_checkpoint,
+            dense=True,
+            hidden=cfg.train.hidden,
+            h1=cfg.train.h1,
+            stem=cfg.train.stem,
+            neck_rounds=cfg.train.neck_rounds,
+            head_width=cfg.train.head_width,
+            aux_head=cfg.train.aux_head,
+            path_a_per_channel=cfg.train.path_a_per_channel,
+            prior_fg=getattr(cfg.train, "prior_fg", None),
+        )
     n_params = sum(p.numel() for p in model.parameters())
-    tw = cfg.train.tversky_weight
-    print(f"ANetV1: {n_params:,} params (hidden={model.encoder.hidden}, stem={model.stem}) | "
-          f"tversky_w={tw} | train {len(train_ds)} | val {len(val_ds)} | data {cfg.data.root}")
+    n_aux = model.aux.weight.numel() + model.aux.bias.numel() \
+        if getattr(model, "aux", None) is not None else 0
+    print(f"ANetV1 {model.arch}: {n_params:,} params "
+          f"({n_params - n_aux:,} deployed + {n_aux} aux) | "
+          f"hidden={model.encoder.hidden} h1={model.encoder.h1} "
+          f"stem={model.stem} | "
+          f"loss={cfg.train.loss_mode} lr={cfg.train.lr} "
+          f"epochs={cfg.train.epochs} | "
+          f"train {len(train_ds)} | val {len(val_ds)} | data {cfg.data.root}")
+    assert n_params < 40_000, "param budget exceeded (must stay under 40k)"
     Trainer(model, train_ds, val_ds, cfg).train()
 
 

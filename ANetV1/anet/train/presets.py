@@ -54,7 +54,11 @@ def anet_cfg(**overrides):
         sched=os.environ.get("ANET_SCHED") or "cosine",
         plateau_patience=3, plateau_factor=0.5,   # ReduceLROnPlateau params
         restart_epochs=5,                          # T_0 for cosine warm restarts
-        grad_clip=1.0,
+        # 10.0 for focal_norm (measured grad norms 25-180 in early training;
+        # clip 1.0 would bind on every step and distort the loss's relative
+        # term scales — Adam absorbs uniform scaling but not a varying one).
+        # Legacy v8 fine-tunes tuned against 1.0 should override inline.
+        grad_clip=10.0,
         # torch.compile ON for CUDA/ROCm: this net is launch-bound (thousands of
         # tiny kernels at ~1% util), and inductor fusing the elementwise chains
         # into a few Triton kernels is the biggest single lever. Two past crashes
@@ -85,6 +89,26 @@ def anet_cfg(**overrides):
         nan_check_every=25 if IS_CUDA else 1,
         hidden=16,                    # 16 = spec width; 24 = capacity bump (ARCH §8.2)
         stem="edge_dq",               # v7 default (D33); "highpass" = 3x3 variant (D32)
+        # ----------------------------------------------------------- v9 keys
+        # (harmless for v8 runs; scripts/train_anet.py selects arch="v9")
+        arch="v8",
+        h1=48,                        # pre-pool token width (D42)
+        neck_rounds=2,                # ConvNeck depth (D43)
+        head_width=24,                # classifier width (D45)
+        aux_head=True,                # deep-supervision probe (D46, train-only)
+        aux_weight=0.3,
+        ema_decay=0.998,              # weight EMA for eval/checkpoints (D48); 0=off
+        # focal_norm (D47) class weights (bg, mannequin, tent)
+        focal_norm_weights=(1.0, 2.0, 1.0),
+        # fused Triton Stage-1 (D40): parity-checked at startup, demotes to
+        # chunked-autograd backward, then to the PyTorch dense path (at
+        # fallback_batch to stay inside a 20 GB VRAM budget). ANET_FUSED=0 and
+        # ANET_FUSED_BWD=triton|chunked override.
+        fused=IS_CUDA,
+        fused_bwd="triton",
+        fallback_batch=32,
+        seed_stat_batches=8,          # DeployNorm stat seeding passes (D39)
+        prefetch=True,                # background-thread H2D pipeline
         # per-channel Path A kernels (D37): the pre-registered "mushy tent blob"
         # upgrade (ARCH §8.2 step 2), justified by the 000008 viz (tent recall
         # ~half, low-contrast tent nearly missed, mannequin/car scale confusion).
@@ -124,7 +148,10 @@ def anet_cfg(**overrides):
         # loss_mode: "balanced" (class-balanced Focal-Tversky over {bg,mann,tent},
         # one term, no anchor — the anti-oscillation form), "focal_tversky"
         # (FT + focal anchor), or "combo" (legacy). ANET_LOSS_MODE overrides.
-        loss_mode=os.environ.get("ANET_LOSS_MODE") or "focal_tversky",
+        # v9 default "focal_norm" (D47). "focal_tversky" / "balanced" / "combo"
+        # are kept for v8 fine-tunes from good.pt (the loss must match what
+        # trained the checkpoint) and for ablation.
+        loss_mode=os.environ.get("ANET_LOSS_MODE") or "focal_norm",
         # "balanced" per-class FP (alpha) / miss (beta). bg/tent symmetric 0.5;
         # mannequin gets beta>alpha (a recall push) since it's the hard
         # under-detected class. All classes weigh equally regardless of cell
@@ -181,8 +208,13 @@ def anet_cfg(**overrides):
         # working value; lower reveals sub-threshold predictions. ANET_CONF sets it.
         conf_thresh=float(os.environ["ANET_CONF"]) if "ANET_CONF" in os.environ else 0.5,
         init_from=os.environ.get("ANET_INIT_FROM"),  # resume/fine-tune from a checkpoint
-        l2_score_reg=1.0e-4,          # cosine-frequency bound (D24)
-        l1_kernel_reg=1.0e-4,         # sparse pyramid kernels (D24)
+        # D24 coefficients, rescaled ~30x for focal_norm (D47): the new loss
+        # is ~27-32x larger in magnitude than the old per-cell-mean focal, so
+        # 1e-4 silently diluted the deployment-critical cosine-frequency bound
+        # (int8 LUT accuracy) and Path-A sparsity by the same factor. Legacy
+        # loss modes (v8 fine-tunes) should override these back to 1e-4.
+        l2_score_reg=3.0e-3,          # cosine-frequency bound (D24)
+        l1_kernel_reg=3.0e-3,         # sparse pyramid kernels (D24)
         # ROCm default 0 (IN-PROCESS): spawn workers repeatedly DEADLOCK epoch-0
         # on this MIOpen/HIP container (fork copies locked native mutexes; the
         # first batch never arrives, needs kill -9). With data.cache an item is a

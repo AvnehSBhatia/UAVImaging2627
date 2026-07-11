@@ -3,11 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from .blocks import DualQuaternionRGB, EdgeDQStem
+from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
+from .context import SlimContext
 from .encoder import WindowEncoder
 from .globalmix import GlobalCosineMix
-from .head import RegionHead
+from .head import RegionHead, RegionHeadV9, prior_bias_
+from .neck import ConvNeck
 from .pyramid import GatedGlobalPool, ScalarKernelPool
+from .tile_encoder import TileEncoder
 
 
 class ANetV1(nn.Module):
@@ -27,7 +30,8 @@ class ANetV1(nn.Module):
     PHASES = ((0, 0), (0, 10), (10, 0), (10, 10))
 
     def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
-                 path_a_per_channel=True, prior_fg=None):
+                 path_a_per_channel=True, prior_fg=None, arch="v8", h1=48,
+                 neck_rounds=2, head_width=24, aux_head=False):
         super().__init__()
         self.prior_fg = prior_fg
         self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
@@ -35,8 +39,13 @@ class ANetV1(nn.Module):
         self.n_win = self.nh * self.nw  # 5035
         self.use_checkpoint = use_checkpoint
         self.dense = dense
+        self.arch = arch
         self.stem = stem
         self.path_a_per_channel = path_a_per_channel
+        # trainer-installed fused Stage-1 (Triton, D40): callable
+        # (B,feat,540,960) -> (B,h1,53,95) pooled window features, replacing
+        # encoder.pool_features_dense + phase plumbing. None = PyTorch path.
+        self.fused_pool = None
 
         # hidden=16 is the 17k spec model; hidden=24 is the pre-registered
         # capacity mitigation (ARCHITECTURE §8 risk 2, ~24k params with the
@@ -50,7 +59,10 @@ class ANetV1(nn.Module):
         #   edge_dq  (D33): oriented dual-quaternion edge front-end -> 9 feat channels
         # Both keep the 3 colour channels first, so the encoder's colour-only
         # residual update (MixRound `:3`) and frozen-evidence channels are unchanged.
-        if stem == "edge_dq":
+        if stem == "edge_dq4":
+            self.stem_mod = EdgeDQStem4()
+            self.feat = EdgeDQStem4.out_channels  # 15
+        elif stem == "edge_dq":
             self.stem_mod = EdgeDQStem()
             self.feat = EdgeDQStem.out_channels  # 9
         elif stem == "highpass":
@@ -61,25 +73,49 @@ class ANetV1(nn.Module):
                 self.grad.weight[:, :, 1, 1] += 1.0
             self.feat = 6
         else:
-            raise ValueError(f"unknown stem {stem!r} (highpass|edge_dq)")
+            raise ValueError(f"unknown stem {stem!r} (highpass|edge_dq|edge_dq4)")
         self.in_dim = self.feat + 2  # + (u,v) window-relative coords
-        self.encoder = WindowEncoder(hidden, in_dim=self.in_dim)
-        self.pools = nn.ModuleList(
-            [ScalarKernelPool(d, k, per_channel=path_a_per_channel) for k in (3, 7, 11)]
-        )
-        # learned per-path transform after Path A k3/k7/k11 (D36): one generalized
-        # DQ per scale. A quaternion rotates a 3-vector, so on the d-dim map it's a
-        # learned 1x1 conv (identity-init -> starts as a no-op, bakes to a constant
-        # 1x1 conv at export). Lets each scale recombine its channels before both
-        # Path B and the head consume it.
-        self.path_dq = nn.ModuleList([nn.Conv2d(d, d, 1) for _ in range(3)])
-        with torch.no_grad():
-            for conv in self.path_dq:
-                conv.weight.copy_(torch.eye(d).reshape(d, d, 1, 1))
-                conv.bias.zero_()
-        self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
-        self.mix = GlobalCosineMix(pad_to=d)
-        self.head = RegionHead(dim=d, prior_fg=prior_fg)
+
+        if arch == "v9":
+            self.encoder = TileEncoder(hidden=hidden, h1=h1, in_dim=self.in_dim)
+            self.neck = ConvNeck(d, rounds=neck_rounds)
+            self.pools = nn.ModuleList(
+                [ScalarKernelPool(d, k, per_channel=path_a_per_channel)
+                 for k in (3, 7, 11)]
+            )
+            self.path_dq = nn.ModuleList([nn.Conv2d(d, d, 1) for _ in range(3)])
+            with torch.no_grad():
+                for conv in self.path_dq:
+                    conv.weight.copy_(torch.eye(d).reshape(d, d, 1, 1))
+                    conv.bias.zero_()
+            self.context = SlimContext(d)
+            self.head = RegionHeadV9(dim=d, width=head_width, prior_fg=prior_fg)
+            # train-only deep supervision (D46): a linear probe on the raw
+            # embedding map gives the encoder a direct gradient path that
+            # cannot be blocked by a collapsed head. Dropped at export/eval.
+            self.aux = nn.Conv2d(d, 3, 1) if aux_head else None
+            if aux_head and prior_fg:
+                prior_bias_(self.aux, prior_fg)
+        elif arch == "v8":
+            self.encoder = WindowEncoder(hidden, in_dim=self.in_dim)
+            self.pools = nn.ModuleList(
+                [ScalarKernelPool(d, k, per_channel=path_a_per_channel) for k in (3, 7, 11)]
+            )
+            # learned per-path transform after Path A k3/k7/k11 (D36): one generalized
+            # DQ per scale. A quaternion rotates a 3-vector, so on the d-dim map it's a
+            # learned 1x1 conv (identity-init -> starts as a no-op, bakes to a constant
+            # 1x1 conv at export). Lets each scale recombine its channels before both
+            # Path B and the head consume it.
+            self.path_dq = nn.ModuleList([nn.Conv2d(d, d, 1) for _ in range(3)])
+            with torch.no_grad():
+                for conv in self.path_dq:
+                    conv.weight.copy_(torch.eye(d).reshape(d, d, 1, 1))
+                    conv.bias.zero_()
+            self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
+            self.mix = GlobalCosineMix(pad_to=d)
+            self.head = RegionHead(dim=d, prior_fg=prior_fg)
+        else:
+            raise ValueError(f"unknown arch {arch!r} (v8|v9)")
 
         # window-relative pixel coords, row-major to match F.unfold token order
         r = torch.arange(self.WIN, dtype=torch.float32)
@@ -111,8 +147,24 @@ class ANetV1(nn.Module):
 
     @classmethod
     def from_state_dict(cls, sd, **kwargs):
-        """Rebuild a model with hidden/stem/Path-A inferred from checkpoint shapes
-        (so pre-D37 shared-scalar checkpoints and per-channel ones both load)."""
+        """Rebuild a model with arch/hidden/stem/Path-A inferred from checkpoint
+        shapes (v8 pre/post-D37 checkpoints and v9 checkpoints all load)."""
+        if any(k.startswith("neck.") for k in sd):  # v9 signature
+            stem = "edge_dq4" if any(k.startswith("stem_mod.dq_in.") for k in sd) \
+                else ("edge_dq" if any(k.startswith("stem_mod.") for k in sd)
+                      else "highpass")
+            model = cls(
+                arch="v9", stem=stem,
+                hidden=sd["encoder.fc2.weight"].shape[0],
+                h1=sd["encoder.fc1.weight"].shape[0],
+                neck_rounds=sum(1 for k in sd if k.startswith("neck.dw.")
+                                and k.endswith(".weight")),
+                head_width=sd["head.fc1.weight"].shape[0],
+                path_a_per_channel=sd["pools.0.weight"].shape[0] > 1,
+                aux_head="aux.weight" in sd,
+                **kwargs)
+            model.load_state_dict(sd, strict=True)
+            return model
         hidden = sd["encoder.mlp.0.weight"].shape[0]
         stem = "edge_dq" if any(k.startswith("stem_mod.") for k in sd) else "highpass"
         per_channel = sd["pools.0.weight"].shape[0] > 1
@@ -131,7 +183,7 @@ class ANetV1(nn.Module):
         return fn(*args)
 
     def _features(self, img):  # (B,3,540,960) -> (B,feat,540,960)
-        if self.stem == "edge_dq":
+        if self.stem in ("edge_dq", "edge_dq4"):
             return self.stem_mod(img)
         rgb = self.quat(img)
         return torch.cat([rgb, self.grad(rgb)], 1)
@@ -188,13 +240,17 @@ class ANetV1(nn.Module):
         b = feat.shape[0]
         win = F.unfold(feat, self.WIN, stride=self.STRIDE)  # (B, feat*400, 5035)
         win = win.reshape(b, self.feat, self.WIN * self.WIN, self.n_win).permute(0, 3, 2, 1)
-        x = torch.cat([win, self.uv.expand(b, self.n_win, -1, -1)], -1)
+        # uv cast to the stream dtype: cat's type promotion would silently
+        # upcast the whole token stream to fp32 under bf16 autocast (same bug
+        # class as _map_dense_all's uv_tile, fixed there earlier)
+        x = torch.cat([win, self.uv.to(win.dtype).expand(b, self.n_win, -1, -1)], -1)
         emb = self._ckpt(self.encoder, x.reshape(-1, self.WIN * self.WIN, self.in_dim))
         return emb.reshape(b, self.n_win, -1).permute(0, 2, 1).reshape(b, -1, self.nh, self.nw)
 
     def _tail(self, m16):  # (B,hidden,53,95) embedding map -> (B,3,54,96) cells
         b = m16.shape[0]
-        m = torch.cat([m16, self.xy_map.expand(b, -1, -1, -1)], 1)  # (B,18,53,95)
+        # xy cast to the stream dtype (bf16 fp32-promotion guard, as in v9)
+        m = torch.cat([m16, self.xy_map.to(m16.dtype).expand(b, -1, -1, -1)], 1)
 
         maps = [dq(p(m)) for p, dq in zip(self.pools, self.path_dq)]  # Path A + per-path DQ (D14, D36)
         states = torch.stack([gp(mp) for gp, mp in zip(self.globals_, maps)], 1)  # (B,3,256)
@@ -206,11 +262,62 @@ class ANetV1(nn.Module):
         ltoks = torch.cat([own, local], 2)  # (B, W, 4, 18) — per-window stream (D31)
 
         wlogits = self.head(ltoks, gtoks).permute(0, 2, 1).reshape(b, 3, self.nh, self.nw)
-        cells = F.conv_transpose2d(wlogits, self.cell_kernel, groups=3)
-        return cells / self.cell_counts  # (B, 3, 54, 96)
+        cells = F.conv_transpose2d(wlogits, self.cell_kernel.to(wlogits.dtype), groups=3)
+        return cells / self.cell_counts.to(wlogits.dtype)  # (B, 3, 54, 96)
+
+    # ------------------------------------------------------------------- v9
+    def _phase_batch(self, feat, pad_mode):  # (B,feat,540,960) -> (4B,in_dim,540,960)
+        crops = []
+        for oy, ox in self.PHASES:
+            hp = ((self.IMG_H - oy) // self.WIN) * self.WIN
+            wp = ((self.IMG_W - ox) // self.WIN) * self.WIN
+            crops.append(F.pad(feat[:, :, oy: oy + hp, ox: ox + wp],
+                               (0, self.IMG_W - wp, 0, self.IMG_H - hp), mode=pad_mode))
+        x = torch.cat(crops, 0)  # (4B, feat, 540, 960), phase-major
+        uv = self.uv_tile.to(x.dtype).expand(x.shape[0], -1, -1, -1)
+        return torch.cat([x, uv], 1)
+
+    def _interleave(self, e, b):  # (4B, C, 27, 48) -> (B, C, 53, 95)
+        ph, pw = self.nh // 2 + 1, self.nw // 2 + 1
+        e = e.reshape(4, b, -1, ph, pw).permute(1, 2, 0, 3, 4)
+        m = F.pixel_shuffle(e.flatten(1, 2), 2)
+        return m[:, :, : self.nh, : self.nw]
+
+    def _embed_map_v9(self, feat):  # (B,feat,540,960) -> (B,hidden,53,95)
+        if self.fused_pool is not None:
+            pooled = self.fused_pool(feat)  # fused Triton Stage 1 (D40)
+        else:
+            x = self._phase_batch(feat, "replicate" if self.training else "constant")
+            p = self.encoder.pool_features_dense(
+                x, ckpt=self.use_checkpoint and self.training)  # (4B, h1, 27, 48)
+            pooled = self._interleave(p, feat.shape[0])
+        return self.encoder.embed(pooled)
+
+    def _tail_v9(self, m_emb):  # (B,hidden,53,95) -> cells (+ aux cells in train)
+        b = m_emb.shape[0]
+        m0 = torch.cat([m_emb, self.xy_map.expand(b, -1, -1, -1).to(m_emb.dtype)], 1)
+        m = self.neck(m0)
+        maps = [dq(p(m)) for p, dq in zip(self.pools, self.path_dq)]
+        ctx = self.context(maps)  # (B, d)
+        emb = m.flatten(2).permute(0, 2, 1)  # (B, W, d)
+        own = emb.unsqueeze(2)
+        local = torch.stack([mp.flatten(2).permute(0, 2, 1) for mp in maps], 2)
+        ltoks = torch.cat([own, local], 2)  # (B, W, 4, d)
+        wlogits = self.head(ltoks, ctx).permute(0, 2, 1).reshape(b, 3, self.nh, self.nw)
+        cells = self._cells(wlogits)
+        if self.training and self.aux is not None:
+            aux_cells = self._cells(self.aux(m0))
+            return cells, aux_cells
+        return cells
+
+    def _cells(self, wlogits):  # (B,3,53,95) window logits -> (B,3,54,96) cells
+        cells = F.conv_transpose2d(wlogits, self.cell_kernel.to(wlogits.dtype), groups=3)
+        return cells / self.cell_counts.to(wlogits.dtype)
 
     def forward(self, img):
         feat = self._features(img)
+        if self.arch == "v9":
+            return self._tail_v9(self._embed_map_v9(feat))
         if self.dense:
             # same single-pass batched encoder in both modes; only the phase-pad
             # mode differs (replicate keeps BN batch stats clean in training,
@@ -221,7 +328,10 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
-        l2 = self.encoder.reg_l2() + self.mix.reg_l2() + self.head.reg_l2()
+        if self.arch == "v9":
+            l2 = self.encoder.reg_l2() + self.context.reg_l2() + self.head.reg_l2()
+        else:
+            l2 = self.encoder.reg_l2() + self.mix.reg_l2() + self.head.reg_l2()
         l1 = sum(p.reg_l1() for p in self.pools)
         return l2, l1
 

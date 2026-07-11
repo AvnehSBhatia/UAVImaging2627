@@ -137,13 +137,24 @@ def bounded_cos_score(s1, s2, s3, phi):
 
 
 def sobel7(orient):
-    """7x7 separable Sobel/Scharr edge kernel. 'v' -> d/dx (fires on vertical
-    edges), 'h' -> d/dy (horizontal edges). Used to init the oriented edge convs
-    (learnable from there)."""
+    """7x7 oriented edge kernel. 'v' -> d/dx (fires on vertical edges),
+    'h' -> d/dy (horizontal edges), 'd1'/'d2' -> the two 45-degree diagonals
+    (normalized combinations of the axis pair). Used to init the oriented edge
+    convs (learnable from there)."""
     smooth = torch.tensor([1.0, 4.0, 8.0, 10.0, 8.0, 4.0, 1.0])
     smooth = smooth / smooth.sum()
     deriv = torch.tensor([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]) / 6.0
-    return torch.outer(smooth, deriv) if orient == "v" else torch.outer(deriv, smooth)
+    kv = torch.outer(smooth, deriv)
+    kh = torch.outer(deriv, smooth)
+    if orient == "v":
+        return kv
+    if orient == "h":
+        return kh
+    if orient == "d1":
+        return (kv + kh) / math.sqrt(2.0)
+    if orient == "d2":
+        return (kv - kh) / math.sqrt(2.0)
+    raise ValueError(f"unknown orientation {orient!r}")
 
 
 class EdgeDQStem(nn.Module):
@@ -172,13 +183,50 @@ class EdgeDQStem(nn.Module):
         self.edge_v = nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False)
         self.edge_h = nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False)
         with torch.no_grad():
-            self.edge_v.weight.mul_(0.2)
-            self.edge_h.weight.mul_(0.2)
+            # Sobel-7 init per the spec (D33). The previous code scaled the
+            # DEFAULT kaiming noise by 0.2 instead — the stem started with no
+            # oriented-edge structure at all and had to discover edges through
+            # the encoder's weak early gradients (a measured contributor to the
+            # mannequin cold-start). 0.5x keeps the response moderate at init.
+            self.edge_v.weight.copy_(sobel7("v").mul(0.5).expand(3, 1, 7, 7))
+            self.edge_h.weight.copy_(sobel7("h").mul(0.5).expand(3, 1, 7, 7))
         # "one more learned DQ" after stacking, per stacked image (block-diagonal)
         self.dq_out = nn.ModuleList([DualQuaternionRGB() for _ in range(3)])
 
     def forward(self, img):  # (B,3,H,W) -> (B,9,H,W): [colour, tex1, tex2]
         groups = (img, self.edge_v(self.dq_v(img)), self.edge_h(self.dq_h(img)))
+        return torch.cat([dq(g) for dq, g in zip(self.dq_out, groups)], 1)
+
+
+class EdgeDQStem4(nn.Module):
+    """v9 stem (D41): four oriented-edge dual-quaternion branches instead of
+    two. Mannequins lie at arbitrary yaw; the v/h pair leaves 45-degree limbs
+    at ~0.7x response, so the two diagonal operators close the orientation
+    gap. Same structure as EdgeDQStem otherwise: raw colour group + 4x
+    (DQ colour rotation -> learnable depthwise 7x7 edge conv, Sobel-init at
+    0/90/45/135 degrees) -> each 3-channel group re-framed by its own DQ.
+    15 output channels; first 3 = colour (the only channels the encoder's
+    residual update touches), 12 frozen edge-evidence channels. All plain
+    convs at export (D5-style, Hailo-native)."""
+
+    out_channels = 15
+    ORIENTS = ("v", "h", "d1", "d2")
+
+    def __init__(self):
+        super().__init__()
+        self.dq_in = nn.ModuleList([DualQuaternionRGB() for _ in self.ORIENTS])
+        self.edges = nn.ModuleList(
+            [nn.Conv2d(3, 3, 7, padding=3, groups=3, bias=False) for _ in self.ORIENTS]
+        )
+        with torch.no_grad():
+            for conv, o in zip(self.edges, self.ORIENTS):
+                conv.weight.copy_(sobel7(o).mul(0.5).expand(3, 1, 7, 7))
+        self.dq_out = nn.ModuleList(
+            [DualQuaternionRGB() for _ in range(1 + len(self.ORIENTS))]
+        )
+
+    def forward(self, img):  # (B,3,H,W) -> (B,15,H,W): [colour, e_v, e_h, e_d1, e_d2]
+        groups = [img] + [e(dq(img)) for dq, e in zip(self.dq_in, self.edges)]
         return torch.cat([dq(g) for dq, g in zip(self.dq_out, groups)], 1)
 
 

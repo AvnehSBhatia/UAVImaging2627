@@ -1,8 +1,20 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks import CosineGate, ManualBatchNorm
+from .norm import DeployNorm
+
+
+def prior_bias_(fc, prior_fg, n_classes=3):
+    """RetinaNet-style prior init: start each foreground class at probability
+    ~prior_fg so the head is off the saturated all-background point."""
+    b = math.log(prior_fg / max(1.0 - (n_classes - 1) * prior_fg, 1e-6))
+    with torch.no_grad():
+        fc.bias.zero_()
+        fc.bias[1:] = b  # class 0 = background stays at 0
 
 
 class RegionHead(nn.Module):
@@ -51,3 +63,38 @@ class RegionHead(nn.Module):
 
     def reg_l2(self):
         return self.local_gate.reg_l2() + self.ctx_gate.reg_l2()
+
+
+class RegionHeadV9(nn.Module):
+    """v9 head (D45). Keeps D31's split streams — per-window evidence is
+    pooled separately from the frame context and owns half the classifier
+    input unconditionally — but widens the classifier from the 8-d choke to
+    `width` (default 24): the per-cell decision is where the discrimination
+    the encoder built must survive, and 8 dims with a Tanh was the narrowest
+    point in the entire network. The context stream is now the SlimContext
+    vector (one d-dim vector per frame), so no context pooling is needed.
+    Tanh kept before the final layer (int8 calibration, D20)."""
+
+    def __init__(self, dim, width=24, n_classes=3, prior_fg=None):
+        super().__init__()
+        self.local_norm = DeployNorm(dim)
+        self.local_gate = CosineGate(dim)
+        self.ctx_norm = DeployNorm(dim)
+        self.fc1 = nn.Linear(2 * dim, width)
+        self.fc2 = nn.Linear(width, n_classes)
+        if prior_fg:
+            prior_bias_(self.fc2, prior_fg, n_classes)
+
+    def forward(self, ltoks, ctx):  # (B,W,4,d), (B,d) -> (B,W,3)
+        b, w, t, c = ltoks.shape
+        ln = self.local_norm.forward_tokens(ltoks)
+        loc = (self.local_gate(ln).unsqueeze(-1) * ln).mean(2)  # (B, W, d)
+        cn = self.ctx_norm.forward_tokens(ctx)  # (B, d)
+        # fc1(cat[loc, ctx]) as split matmuls + broadcast add (CoreML-safe, D31)
+        h = loc @ self.fc1.weight[:, :c].t() + \
+            (cn @ self.fc1.weight[:, c:].t() + self.fc1.bias).unsqueeze(1)
+        h = torch.tanh(F.silu(h))
+        return self.fc2(h)
+
+    def reg_l2(self):
+        return self.local_gate.reg_l2()

@@ -1,10 +1,10 @@
 # ANetV1 — Full Architecture Specification & Design Record
 
-**Status:** v6 (final locked spec) · 2026-07-05
+**Status:** v9 (training-stack rebuild) · 2026-07-10 — v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9 (D39–D48) rebuilds the training path (fused Triton Stage 1, DeployNorm, focal_norm loss) and rebalances the parameter budget (SlimContext, ConvNeck, wide head). §3–§5 describe the v6–v8 model; §14 is the v9 delta.
 **Task:** per-region classification of UAV survey frames into {mannequin, tent, nothing} (SUAS-style search area)
 **Deployment target:** Raspberry Pi 5 + AI HAT+ (Hailo-8, 26 TOPS int8) at ≥30 FPS
 **Training target:** Apple Silicon (MPS), PyTorch
-**Headline figures:** 17,037 parameters (~68 KB fp32 / ~17 KB int8) · ~2.5 GFLOPs/frame @ 960×540 · est. 170–350 FPS on the HAT
+**Headline figures:** v9 default: 20,706 deployed parameters (~83 KB fp32 / ~21 KB int8) · ~3.5 GFLOPs/frame @ 960×540 (v6 locked spec was 17,037 params / ~2.5 GFLOPs) · est. 150–300 FPS on the HAT
 
 ---
 
@@ -322,6 +322,26 @@ Every decision, its alternatives, and why. Numbered in rough pipeline-then-histo
 
 **D38 — Training throughput on CUDA/ROCm (launch-bound, not compute-bound; core arch untouched).** The MI300X sat at ~1% util spending ~430 s/epoch on a 20k-param net — the wall was kernel *dispatch*, not FLOPs. Two fixes, neither changing model semantics: (1) **single batched Stage-1 pass in training** — the training map used to launch the whole 96%-FLOP encoder four times in a Python phase loop (`_map_dense`); now all four stride-2 phases ride the batch dim through ONE `encoder.forward_dense` (unified `_map_dense_all`), exactly the D34.3 trick already used at eval. The only subtlety is BN: eval folds frozen stats so padding is free, but training BN reads *batch* stats, so the phase crops are **edge-replicate**-padded (not zero) — the ~3% padded tiles are then in-distribution and don't skew the (now larger, joint 4-phase) BN batch the valid tiles normalise against. Bit-identical to the windowed reference at eval (asserted); training-equivalent, ~4× fewer Stage-1 dispatches. (2) **`torch.compile` on for CUDA/ROCm** (`mode="default"`): inductor fuses the elementwise chains — cos/tanh/sigmoid/SiLU, the folded BN affine, the gated-pool multiplies — into a handful of Triton kernels, the actual "fused kernels/ops" win. `reduce-overhead` (HIP-graph capture) is *not* the default: it aliases the compiled output buffer and fights grad-accum + the on-GPU loss accumulation (`loss_win += loss.detach()`), which crashed the build; `default` fuses without that hazard. Host-OOM while compiling the backward graph (inductor forks one full-torch worker per thread) is fixed by `TORCHINDUCTOR_COMPILE_THREADS=1` (set before the first lazy compile and in the run script), with a warm on-disk cache. Any compile error — setup or first-step — degrades to eager instead of dying; `ANET_COMPILE=0` is the fast off-switch. Also `set_float32_matmul_precision("high")` for the fp32 GEMMs outside autocast. The Hailo export path and model math are untouched.
 
+**D39 — DeployNorm: deploy-form normalization (v9).** BatchNorm's training mode normalizes with *batch* statistics, which (a) couples every 20×20 tile to every other tile in the batch — the single reason the encoder could not be fused into one kernel (each round forced a full-resolution HBM round trip so the next round could see batch stats); (b) triggered the MIOpen int32 overflow at batch ≥ 44, silently dropping to the primitive-op path that materializes fp32 copies of ~19 GB tensors (the observed ~120 GB at batch 96); (c) double-updated stats under checkpointing. DeployNorm normalizes with the RUNNING statistics — exactly the affine the deploy graph uses after BN folding — and updates them as a detached EMA of observed batch stats (momentum ramp seeds from the first batches; the trainer additionally runs 8 no-grad seeding passes before step 0). Consequences: the training forward IS the deployment forward (train-what-you-deploy with no BN train/eval gap left at all); normalization is a constant per-channel affine within a step, so the encoder is tile-local and fusable; no gradient flows through statistics. At batch 96 the stats are averages over ~10⁸ tokens per step — the EMA is glassy smooth and the one-step lag is noise. Folds at export identically to BN (same buffers).
+
+**D40 — Fused Triton Stage-1 training kernels.** The D35 Metal kernel proved the architecture is threadgroup-shaped at eval; v9 does the same for *training* on ROCm/CUDA: one Triton kernel per direction runs the entire per-token Stage 1 — 3 mixing rounds (per-tile blur as a banded-matrix `tl.dot`, cosine gates, gated tile means, SiLU residuals), fc1, and the cosine-gated pool — in registers, reading the 15-channel stem map once (phase offsets computed in-kernel; the 4-phase crops are never materialized) and writing the (B, 48, 53, 95) pooled grid. The backward kernel saves nothing but the stem map: it recomputes each tile in registers and emits d_feat (atomics — phases overlap) plus all parameter grads (slot-spread atomics; σ grads are projected onto ∂K/∂σ in-kernel so the blur-kernel gradient is one scalar per round). DeployNorm batch stats are accumulated by the forward kernel via slotted atomics and EMA-applied after the step. **Verification is layered and automatic at startup** (`Trainer._setup_fused`): fused forward is parity-checked against the PyTorch dense path on real frames; the Triton backward is parity-checked against a chunked-autograd backward (autograd through a pure-torch mirror of the identical folded-parameter math, `pool_from_params` — asserted to 1e-8 against the dense path in the smoke test); any mismatch demotes one level (triton bwd → chunked bwd → PyTorch dense at a VRAM-safe batch), loudly. Fused-path activations at batch 96 are ~6–9 GB vs ~120 GB before.
+
+**D41 — Sobel-init 4-orientation stem.** Two bugs/gaps in one: the D33 stem's "Sobel-7 init" was actually `weight.mul_(0.2)` on default kaiming noise — the stem started with NO oriented-edge structure and had to discover edges through the encoder's weak early gradients (a measured contributor to the mannequin cold start); and the v/h pair leaves 45°-oriented limbs at ~0.7× response while mannequins lie at arbitrary yaw. v9: four depthwise 7×7 edge convs genuinely initialised to oriented Sobel-7 operators at 0/90/45/135° (×0.5), each behind its own DQ colour rotation, all learnable → 15 stem channels (3 colour + 12 frozen edge evidence). The v8 `EdgeDQStem` init is also fixed to true Sobel for reproducibility of the ablation.
+
+**D42 — fc2 after the pool.** The per-token stage becomes fc1 (17→48) + gate + pool; the 48→32 layer runs on the 5,035 pooled windows instead of 2·10⁶ full-resolution positions. Removes ~45% of full-res FLOPs and the largest activation tensor. Capacity argument: h1=48 > hidden=32 keeps the pre-pool width, and the cosine gate is still a second data-dependent nonlinearity applied at token level before the 300:1 crush; the aux probe (D46) watches whether the encoder still separates classes.
+
+**D43 — ConvNeck: cross-window context on the embedding grid.** Two residual depthwise-5×5 + pointwise rounds on the (53×95, d=34) embedding map (~4.2k params, Hailo's favourite ops, near-identity init so the cold start is undisturbed). The v8 head saw other windows only through fixed-shape Path-A box averages; the 000008 viz showed features firing on objects the head couldn't resolve at scale. The neck gives every window a *trainable* 50–110 px receptive field before Path A / the head read it.
+
+**D44 — SlimContext replaces the Path-B expansions.** The three 18→256 expansions were 14.6k params (60–84% of the model) feeding one per-frame vector that D31 showed was actively diluting per-window evidence. v9 keeps the signature pieces — per-scale gated global pooling and the multi-cosine state weave (still CPU-sized: three d-dim states) — but states stay at width d and the mixed vector feeds the classifier directly. ~1.3k params. The freed budget went to the neck, the wider head, and hidden=32.
+
+**D45 — Head classifier widened 8 → 24.** Linear(2d→24) → SiLU → Tanh → Linear(24→3), prior-bias init (RetinaNet §4.1) at p=0.05. The 8-d Tanh choke was the narrowest point in the network — everything the encoder discriminates had to survive 8 dims. Split local/context streams (D31) kept.
+
+**D46 — Aux deep-supervision probe (train-only).** A 1×1 conv (d→3, 105 params) on the pre-neck embedding map, overlap-averaged to cells, added to the loss at weight 0.3. Direct gradient path to the encoder that a collapsed head cannot block — the linear-probe experiments repeatedly showed signal in the embeddings that the head lost; now that probe trains *with* the model. Dropped at eval/export: zero deploy cost.
+
+**D47 — focal_norm loss.** The Focal-Tversky stack failed structurally, twice over: set-level ratios make each cell's gradient depend nonlinearly on batch TP/FP totals (spiky; the documented source of the fp 0.3↔28 and mannequin 0↔overshoot limit cycles), and the FT + focal-anchor pairing is a two-term tug-of-war (re-created every time the anchor was re-tuned). In the observed failure it actively pushed tent soft-prob from its 0.1 prior init down to 0.003. v9 uses ONE smooth per-cell term with CenterNet/FCOS-style size invariance: per-class summed focal normalized by that class's positive-cell count in the batch (background normalized by total foreground count, boundary-band cells masked). Every positive cell of a rare class carries O(1) gradient regardless of rarity; at prior init the foreground pull dominates ~40:1 so recall rises first and precision pressure grows as predictions appear. Class weights (1, 2, 1).
+
+**D48 — Weight EMA (decay 0.998) for eval and checkpoints.** The object-recall selection metric is noisy epoch-to-epoch; the EMA weights are what get evaluated, selected, and saved (best.pt/last.pt), so what's flown is a smoothed model, not the last optimizer step. Raw weights keep training.
+
 ---
 
 ## 8. Known risks and pre-registered mitigations
@@ -402,6 +422,7 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 | v6 | **960×540** (dataset-derived target sizes); 16×16 global token split fix; final param/compute lock; 3-experiment plan with YOLO26n teacher | gen2 config measurements; implementation |
 | v7 | **Split-stream head** (local vs context pooled separately, D31); **high-pass texture stem** (depthwise 3×3, tokens 5→8, D32); 17,392 params | trained v6 hit 0.000 mannequin cell recall: head logits constant per frame (global-token dilution), linear-probe lift ×1.4 (no edge/texture features) — risks 2/6 triggered |
 | v8 | **EdgeDQ stem default** (D33); **per-scale 1×1 conv after Path A** (D36); **per-channel Path A** (D37, ~24–25k params); **CUDA/ROCm training throughput** (batched Stage-1 pass + `torch.compile`, D38) — model math and Hailo export unchanged | `runs/viz/000008`: tent cell-recall ~½, low-contrast tent missed, mannequin/car scale confusion (features fire, head can't resolve scale); MI300X launch-bound at ~1% util |
+| v9 | **DeployNorm** (D39); **fused Triton Stage-1 train kernels** (D40); **Sobel-init 4-orientation stem** (D41); **fc2 post-pool** (D42); **ConvNeck** (D43); **SlimContext replaces Path-B expansions** (D44); **24-wide head** (D45); **aux deep-supervision probe** (D46); **focal_norm loss** (D47); **weight EMA** (D48). ~20.7k deployed params. See §14. | from-scratch v8 runs: mannequin AND tent recall 0.000 at epoch 3 (tent soft-prob actively pushed 0.1→0.003 by the FT loss), 517 s epochs, ~120 GB VRAM at batch 96 (MIOpen int32 → primitive-BN fp32 fallback), stem "Sobel init" was actually random noise ×0.2 |
 
 ---
 
@@ -415,3 +436,58 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 - **Export:** `export_onnx()` bakes quaternion → 1×1 conv, σ → fixed 9×9 depthwise kernels; BN folding left to the DFC. The Hailo graph proper is the 4-phase dense variant (separate builder, after the compile spike).
 - **Fast local inference:** fastest path is the fused Metal kernel (D35): `anet.metal.MetalANet.from_checkpoint(...)` → **~7.4 ms/img / 134 img/s** (hidden=24, M-series GPU), exact parity; needs MPS + the edge_dq stem. Portable path: `scripts/export_onnx.py --ckpt runs/anet/best.pt` produces a self-contained ONNX (sidecar weights re-inlined — the ORT CoreML partitioner can't read `.onnx.data`); `anet.onnxrt.OnnxANet` runs it at ~21 ms/img (hidden=24) / ~17 ms (hidden=16) via the CoreML EP (D34), vs ~47 ms eager MPS and ~436 ms eager CPU. ONNX profile (copy-free): stem 2.5 ms, 3 rounds ~7.3 ms, per-token MLP + pool ~11 ms (activation-bandwidth floor — the wall D35 removes), tail ≈ 0. fp16, ANE, and multi-stream all measured slower or flat (D34).
 - **Determinism note:** the deployed model is fully deterministic; no runtime randomness anywhere (D7 removed the only stochastic proposal).
+
+---
+
+## 14. v9 — training-stack rebuild (D39–D48)
+
+Driver: from-scratch v8 runs on MI300X hit **0.000 mannequin AND tent recall by epoch 3** (the FT loss actively pushed tent soft-prob from its 0.1 prior init to 0.003), at **517 s/epoch** and **~120 GB VRAM** at batch 96 (MIOpen int32 overflow silently dropped BN to a primitive path materializing fp32 copies), and the D33 stem's "Sobel init" turned out to be random noise ×0.2. v9 keeps every signature mechanism (DQ colour transforms, gaussian-lens cosine gates, cosine-gated pooling, multi-cosine weave, cell overlap-averaging) and rebuilds what carried them.
+
+### 14.1 Pipeline delta (vs §3)
+
+```
+960×540×3
+├─ STAGE 0 · EdgeDQStem4 (D41): raw ∥ 4× (DQ → 7×7 Sobel-init edge conv at
+│    0/90/45/135°), each group re-framed by its own DQ → 15 ch; tokens 17-d
+├─ STAGE 1 · TileEncoder (D39/D40/D42), per 20×20 window:
+│    3 × mixing round (DeployNorm affine, gaussian-lens cosine gate,
+│      gated tile mean → RGB residual, SiLU)                — unchanged math
+│    → fc1 17→48 + SiLU per token → DeployNorm affine
+│    → cosine-gated pool over 400 tokens → 48-d
+│    → fc2 48→32 + SiLU per WINDOW (D42)  → (B, 32, 53, 95)
+│    [trains as ONE Triton kernel per direction (D40); PyTorch dense path
+│     and windowed token path kept, parity-asserted]
+├─ concat global (x,y) → 34 ch → ConvNeck ×2 (D43): residual dw5×5 + pw
+├─ Path A k3/7/11 per-channel + per-scale 1×1 (D13/D36/D37)  — unchanged
+├─ SlimContext (D44): 3 × gated global pool → 34-d states → multi-cosine
+│    weave → one 34-d context vector (Path-B 18→256 expansions REMOVED)
+└─ RegionHeadV9 (D45): local stream {emb, 3×PathA} cosine-gate-pooled ∥
+     context vector → Linear(68→24) → SiLU → Tanh → Linear(24→3)
+     → cell overlap-average (D21)                            — unchanged
+   [+ train-only aux probe: 1×1 conv 34→3 on the pre-neck map (D46)]
+```
+
+### 14.2 Parameter budget (v9 defaults: hidden=32, h1=48, d=34)
+
+| Block | Params |
+|---|---|
+| EdgeDQStem4 | 660 |
+| TileEncoder (3 rounds + fc1 + pool + fc2) | 2,934 |
+| Path A per-channel + path_dq | 9,656 |
+| ConvNeck ×2 | 4,216 |
+| SlimContext | 1,270 |
+| RegionHeadV9 | 1,970 |
+| **Deployed total** | **20,706** |
+| aux probe (train-only) | 105 |
+
+Under the 40k budget with headroom; the deleted Path-B expansions paid for the neck, the wide head, and hidden 24→32.
+
+### 14.3 Training configuration (v9 defaults)
+
+AdamW lr 3e-3, cosine + 300-step warmup, bf16 autocast, batch 96 × accum 1 (fused) / 32 (dense fallback), grad clip 10.0 (focal_norm grad norms run 25–180; a 1.0 clip would bind every step), **focal_norm** loss (D47, γ=2, weights 1/2/1, fg floor 1 / bg floor 8) + 0.3 × aux (D46), D24 reg coefficients rescaled to 3e-3 (the new loss is ~30× larger than the per-cell-mean focal the old 1e-4 was tuned against), prior-bias init p=0.05, boundary band ignore (band_lo 0.05), balanced sampler + vd_weight 0.4 (unchanged), weight EMA 0.998 with cold-start debias ramp, parameters only (D48), 40 epochs, early stop patience 12 / min 25, DeployNorm seeding 8 batches (D39). Startup runs fused parity checks and demotes automatically (D40).
+
+### 14.4 Compatibility and deployment split
+
+- `runs/anet/good.pt` and all v8 checkpoints still load via `from_state_dict` (shape-sniffed) for evaluation; they cannot warm-start a v9 model (different encoder layout).
+- Export: the v9 eval forward is plain convs/matmuls + constant affines — the Hailo-legal op set (depthwise convs, 1×1 convs, sigmoid/tanh/cos LUT forms) — with ONE exception, inherited from v8: **SlimContext's weave softmax (3 scalars per frame) is the D17 CPU stage.** The Hailo graph builder must split at the three gated-pool states exactly as v8 split at Path B's states: NPU computes the pooled states, the weave + softmax + mix run on the Pi CPU in fp32 (microseconds on 3×34 floats), and the mixed context vector re-enters the head's context matmul on-CPU too (the head fc1 is per-frame for the context half — trivially CPU). The monolithic ONNX export (one Softmax node) is for ORT/local eval, not the DFC.
+- The v8 code paths are intact behind `arch="v8"` for ablation. `anet/metal.py` (D35) and `scripts/profile_step.py` remain v8-only.

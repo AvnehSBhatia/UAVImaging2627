@@ -51,8 +51,129 @@ class _Heartbeat:
             self._th.join(timeout=0.2)
 
 from .losses import (balanced_tversky_loss, distill_kl, focal_loss,
-                     focal_tversky_loss, tversky_loss)
+                     focal_norm_loss, focal_tversky_loss, tversky_loss)
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
+
+
+class ModelEMA:
+    """EMA of the PARAMETERS, evaluated and checkpointed instead of the raw
+    weights (v9, D48): the object-recall selection metric is noisy epoch to
+    epoch, and averaging removes the last-steps jitter from what gets flown.
+
+    Parameters only, deliberately: DeployNorm's running buffers are already
+    EMAs of data statistics — shadowing them from before stat-seeding and
+    re-smoothing at decay 0.998 (~100x slower) would make every early-epoch
+    eval normalize against stale garbage. The live buffers are used as-is.
+    A warmup ramp (timm-style) debiases the cold start so epoch-0 eval isn't
+    ~20-50% random-init weights."""
+
+    def __init__(self, model, decay=0.998):
+        self.decay = decay
+        self.updates = 0
+        self.shadow = {k: p.detach().clone()
+                       for k, p in model.named_parameters()}
+        self._backup = None
+
+    def _decay_now(self):
+        # ramp: ~n/(n+10) early (tracks the live weights), -> decay later
+        self.updates += 1
+        return min(self.decay, self.updates / (self.updates + 10.0))
+
+    @torch.no_grad()
+    def update(self, model):
+        d = self._decay_now()
+        for k, p in model.named_parameters():
+            self.shadow[k].lerp_(p.detach(), 1.0 - d)
+
+    @torch.no_grad()
+    def swap_in(self, model):
+        """Load EMA weights into the model in place (optimizer/compile refs
+        stay valid); swap_out restores."""
+        self._backup = {}
+        for k, p in model.named_parameters():
+            self._backup[k] = p.detach().clone()
+            p.copy_(self.shadow[k])
+
+    @torch.no_grad()
+    def swap_out(self, model):
+        if self._backup is None:
+            return
+        for k, p in model.named_parameters():
+            p.copy_(self._backup[k])
+        self._backup = None
+
+
+class CudaPrefetcher:
+    """Background-thread batch pipeline for the in-process loader (ROCm boxes
+    where spawn workers deadlock, D38): the next batch's memmap memcpy +
+    pinned H2D copy run on a side thread/stream while the GPU crunches the
+    current one. Without it the ~150 MB/step of loader work serializes with
+    the training step."""
+
+    def __init__(self, loader, device, depth=2):
+        self.loader = loader
+        self.device = device
+        self.depth = depth
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        import queue
+        q = queue.Queue(maxsize=self.depth)
+        stream = torch.cuda.Stream()
+        stop = object()
+        cancel = threading.Event()
+
+        def put(item):
+            # bounded put that honors cancellation, so an abandoned consumer
+            # (exception/early-stop escaping the epoch loop) can't leave the
+            # worker blocked forever holding GPU batches + the loader iterator
+            while not cancel.is_set():
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def worker():
+            try:
+                for cpu in self.loader:
+                    if cancel.is_set():
+                        return
+                    with torch.cuda.stream(stream):
+                        gpu = {k: (v.to(self.device, non_blocking=True)
+                                   if torch.is_tensor(v) else v)
+                               for k, v in cpu.items()}
+                        ev = torch.cuda.Event()
+                        ev.record(stream)
+                    if not put((gpu, ev)):
+                        return
+            except Exception as e:  # surface loader errors on the main thread
+                put(e)
+            put(stop)
+
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+        try:
+            while True:
+                item = q.get()
+                if item is stop:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                batch, ev = item
+                torch.cuda.current_stream().wait_event(ev)
+                yield batch
+        finally:
+            cancel.set()
+            while not q.empty():  # release any queued GPU batches
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+            th.join(timeout=2.0)
 
 
 def pick_device():
@@ -84,26 +205,8 @@ class Trainer:
         # child, which deadlocks in C — Ctrl+C can't interrupt it (needs kill -9).
         # Forcing "spawn" starts each worker as a fresh interpreter, so there is no
         # inherited GPU/threading state and the deadlock class is impossible.
-        n_samples = getattr(cfg.train, "samples_per_epoch", None) or len(train_ds)
-        sampler = WeightedRandomSampler(
-            train_ds.sample_weights(), num_samples=n_samples, replacement=True
-        )
-        nw = cfg.train.num_workers
-        common = dict(
-            batch_size=cfg.train.batch_size,
-            num_workers=nw,
-            persistent_workers=nw > 0,
-            pin_memory=self.device.type == "cuda",
-        )
-        if nw > 0:
-            mp_ctx = getattr(cfg.train, "mp_context", None)
-            if mp_ctx is None and self.device.type == "cuda":
-                mp_ctx = "spawn"
-            if mp_ctx:
-                common["multiprocessing_context"] = mp_ctx
-            common["prefetch_factor"] = getattr(cfg.train, "prefetch_factor", 2)
-        self.train_loader = DataLoader(train_ds, sampler=sampler, drop_last=True, **common)
-        self.val_loader = DataLoader(val_ds, shuffle=False, **common)
+        self._train_ds, self._val_ds = train_ds, val_ds
+        self._build_loaders(cfg.train.batch_size)
 
         self.model = model.to(self.device)
 
@@ -251,6 +354,107 @@ class Trainer:
         self.out_dir = Path(cfg.train.checkpoint_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.best = -1.0
+        decay = getattr(cfg.train, "ema_decay", 0.0) or 0.0
+        self.ema = ModelEMA(self.model, decay) if decay else None
+
+    # ------------------------------------------------------------- v9 setup
+    @torch.no_grad()
+    def _seed_norm_stats(self, n_batches=8):
+        """Run a few forward-only batches through the dense path so every
+        DeployNorm buffer holds real data statistics before step 0 (D39).
+        No autograd graph -> memory is a fraction of a training step."""
+        if not any(m.__class__.__name__ == "DeployNorm" for m in self.model.modules()):
+            return
+        self.model.train()
+        print(f"seeding DeployNorm stats ({n_batches} forward-only batches)...",
+              flush=True)
+        it = iter(self.train_loader)
+        for _ in range(n_batches):
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            with self._autocast():
+                self.model(self._prep_img(
+                    batch["image"].to(self.device, non_blocking=True)))
+
+    def _setup_fused(self):
+        """Install the fused Triton Stage-1 with startup parity verification
+        and layered demotion: triton bwd -> chunked-autograd bwd -> PyTorch
+        dense (with a safe batch size)."""
+        c = self.cfg.train
+        want = getattr(c, "fused", False)
+        env = os.environ.get("ANET_FUSED")
+        if env is not None:
+            want = env.strip().lower() in ("1", "true", "yes")
+        if not (want and self.device.type == "cuda"
+                and getattr(self.model, "arch", "v8") == "v9"):
+            return
+        try:
+            from .fused import (FusedStage1, fused_available, parity_backward,
+                                parity_forward)
+            if not fused_available():
+                raise RuntimeError("triton not importable on this box")
+            n = min(2, len(self.val_loader.dataset))
+            img = self._prep_img(torch.stack(
+                [self.val_loader.dataset[i]["image"] for i in range(n)]
+            ).to(self.device)).float()
+            ok_f, delta = parity_forward(self.model, img)
+            if not ok_f:
+                raise RuntimeError(f"forward parity failed (max delta {delta:.3e})")
+            mode = os.environ.get("ANET_FUSED_BWD") or \
+                getattr(c, "fused_bwd", "triton")
+            if mode == "triton":
+                ok_b, rel = parity_backward(self.model, img)
+                if not ok_b:
+                    print(f"fused TRITON backward parity failed (worst rel "
+                          f"{rel:.3e}) — demoting to chunked-autograd backward",
+                          flush=True)
+                    mode = "chunked"
+                else:
+                    print(f"fused backward parity OK (worst rel {rel:.3e})",
+                          flush=True)
+            self.model.fused_pool = FusedStage1(self.model, bwd_mode=mode)
+            print(f"fused Stage-1 ON (bwd={mode}, fwd max delta {delta:.3e})",
+                  flush=True)
+        except Exception as e:
+            print(f"fused Stage-1 unavailable ({type(e).__name__}: {e}) — "
+                  "PyTorch dense path", flush=True)
+            fb = getattr(c, "fallback_batch", 0) or 0
+            if fb and c.batch_size > fb:
+                print(f"dense fallback: rebuilding loaders at batch {fb} "
+                      f"(was {c.batch_size}) to stay inside the VRAM budget",
+                      flush=True)
+                c.batch_size = fb
+                self._build_loaders(fb)  # both loaders, same worker/spawn setup
+
+    def _build_loaders(self, batch_size):
+        """(Re)build both loaders at batch_size. One code path, so the fused-
+        fallback rebuild keeps the SAME worker/spawn/prefetch settings — the
+        first version dropped multiprocessing_context and reintroduced the
+        ROCm fork-after-CUDA-init deadlock the constructor guards against."""
+        cfg = self.cfg
+        n_samples = getattr(cfg.train, "samples_per_epoch", None) or len(self._train_ds)
+        sampler = WeightedRandomSampler(
+            self._train_ds.sample_weights(), num_samples=n_samples, replacement=True
+        )
+        nw = cfg.train.num_workers
+        common = dict(
+            batch_size=batch_size,
+            num_workers=nw,
+            persistent_workers=nw > 0,
+            pin_memory=self.device.type == "cuda",
+        )
+        if nw > 0:
+            mp_ctx = getattr(cfg.train, "mp_context", None)
+            if mp_ctx is None and self.device.type == "cuda":
+                mp_ctx = "spawn"
+            if mp_ctx:
+                common["multiprocessing_context"] = mp_ctx
+            common["prefetch_factor"] = getattr(cfg.train, "prefetch_factor", 2)
+        self.train_loader = DataLoader(self._train_ds, sampler=sampler,
+                                       drop_last=True, **common)
+        self.val_loader = DataLoader(self._val_ds, shuffle=False, **common)
 
     def _autocast(self):
         return torch.autocast(self.device.type, self.amp_dtype,
@@ -284,7 +488,8 @@ class Trainer:
             return self._loss_fn(img, grid, teacher, band)
 
     def _loss_tensors(self, img, grid, teacher=None, band=None):
-        cells = self.model(self._prep_img(img))
+        out = self.model(self._prep_img(img))
+        cells, aux = out if isinstance(out, tuple) else (out, None)
         c = self.cfg.train
         ta = getattr(c, "tversky_alpha", 0.7)
         tb = getattr(c, "tversky_beta", 0.3)
@@ -297,7 +502,21 @@ class Trainer:
         amask = None
         if band is not None:
             amask = ~(band.any(1) & (grid == 0))
-        if getattr(c, "loss_mode", "combo") == "balanced":
+        if getattr(c, "loss_mode", "combo") == "focal_norm":
+            # v9 default (D47): ONE smooth per-cell term, per-class positive-
+            # normalized (CenterNet-style size invariance without set-ratio
+            # dynamics — no tug-of-war, no limit cycles).
+            kw = dict(gamma=c.focal_gamma,
+                      class_weights=tuple(getattr(c, "focal_norm_weights",
+                                                  (1.0, 2.0, 1.0))),
+                      mask=amask)
+            hard = focal_norm_loss(cells, grid, **kw)
+            if aux is not None:
+                # deep supervision (D46): direct encoder gradient that a
+                # collapsed head can't block; train-only, dropped at export
+                hard = hard + getattr(c, "aux_weight", 0.3) * \
+                    focal_norm_loss(aux, grid, **kw)
+        elif getattr(c, "loss_mode", "combo") == "balanced":
             # class-balanced Focal-Tversky over {bg, mannequin, tent}, one term.
             # No anchor to fight -> no mannequin 0<->over-predict oscillation.
             # balanced_alpha/beta (3-tuple bg,mann,tent | 2-tuple mann,tent | scalar)
@@ -359,6 +578,11 @@ class Trainer:
             f"workers={self.cfg.train.num_workers}",
             flush=True,
         )
+        self._seed_norm_stats(getattr(self.cfg.train, "seed_stat_batches", 8) or 0)
+        self._setup_fused()
+        use_prefetch = (self.device.type == "cuda"
+                        and self.cfg.train.num_workers == 0
+                        and (getattr(self.cfg.train, "prefetch", True)))
         for epoch in range(self.cfg.train.epochs):
             self.model.train()
             t0, running, n = time.time(), 0.0, 0
@@ -389,7 +613,9 @@ class Trainer:
                       + " (one-time, can take minutes; heartbeat every 5s)",
                       flush=True)
                 hb.__enter__()
-            for step, batch in enumerate(self.train_loader):
+            loader = (CudaPrefetcher(self.train_loader, self.device)
+                      if use_prefetch else self.train_loader)
+            for step, batch in enumerate(loader):
                 if step == 0 and hb is not None:
                     hb.writer(f"epoch {epoch}: first batch loaded — now in the "
                               "first forward (loader OK)")
@@ -449,6 +675,8 @@ class Trainer:
                     self.scaler.step(self.opt)
                     self.scaler.update()
                     self.opt.zero_grad()
+                    if self.ema is not None:
+                        self.ema.update(self.model)
                     if self.sched_per_epoch:
                         # plateau mode: no per-batch decay; run a manual linear
                         # warmup during the warmup window, then hold at peak
@@ -461,42 +689,53 @@ class Trainer:
                     else:
                         self.sched.step()
             bar.close()
-            stats = self.evaluate(self.val_loader, desc=f"epoch {epoch} eval")
-            # SYNTHETIC mannequin recall is the mission metric (ARCH §10; overall
-            # recall is ~94% VisDrone and pinned at 0), but selecting on it alone
-            # saved a mannequin-maximal/tent-dead checkpoint (ep5 over-prediction).
-            # Select on mannequin + w*tent so best.pt tracks a deployable model.
-            mann = stats["mannequin_recall_synthetic"]
-            if math.isnan(mann):
-                mann = stats["mannequin_recall"]
-            tent_w = getattr(self.cfg.train, "select_tent_weight", 0.5)
-            key = mann + tent_w * stats["tent_recall"]
-            if self.sched_per_epoch and self._warmup_left == 0:
-                self.sched.step(key)  # ReduceLROnPlateau on the selection metric
-            row = [epoch, running / max(n, 1), stats["mannequin_recall"],
-                   stats["mannequin_recall_synthetic"], stats["tent_recall"],
-                   stats["fp_per_image"], round(time.time() - t0)]
-            with open(log_path, "a", newline="") as f:
-                csv.writer(f).writerow(row)
-            mc = stats["cells"]["mannequin"]
-            print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={mann:.3f} "
-                  f"(synth {stats['mannequin_recall_synthetic']:.3f}, "
-                  f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
-                  f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
-                  f"sel={key:.3f} lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
-            # threshold-free progress: if these climb while mannequin_r stays 0,
-            # the model IS learning under the argmax/conf_thresh bar (not stuck)
-            print(f"  soft p(fg on gt): mann={stats['soft_mann']:.3f} "
-                  f"tent={stats['soft_tent']:.3f} | argmax fg cells={stats['argmax_fg']} "
-                  f"(threshold-free — cross ~0.5 to win argmax)", flush=True)
-            state = getattr(self.model, "_orig_mod", self.model).state_dict()
-            torch.save(state, self.out_dir / "last.pt")
-            # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
-            # -1.0 sentinel, which is how a NaN model got saved as best once)
-            if math.isfinite(row[1]) and key > self.best:
-                self.best, stale = key, 0
-                torch.save(state, self.out_dir / "best.pt")
-            else:
+            # evaluate + checkpoint the EMA weights when EMA is on (D48):
+            # what gets selected and saved is exactly what gets flown
+            if self.ema is not None:
+                self.ema.swap_in(self.model)
+            try:
+                stats = self.evaluate(self.val_loader, desc=f"epoch {epoch} eval")
+                # SYNTHETIC mannequin recall is the mission metric (ARCH §10; overall
+                # recall is ~94% VisDrone and pinned at 0), but selecting on it alone
+                # saved a mannequin-maximal/tent-dead checkpoint (ep5 over-prediction).
+                # Select on mannequin + w*tent so best.pt tracks a deployable model.
+                mann = stats["mannequin_recall_synthetic"]
+                if math.isnan(mann):
+                    mann = stats["mannequin_recall"]
+                tent_w = getattr(self.cfg.train, "select_tent_weight", 0.5)
+                key = mann + tent_w * stats["tent_recall"]
+                if self.sched_per_epoch and self._warmup_left == 0:
+                    self.sched.step(key)  # ReduceLROnPlateau on the selection metric
+                row = [epoch, running / max(n, 1), stats["mannequin_recall"],
+                       stats["mannequin_recall_synthetic"], stats["tent_recall"],
+                       stats["fp_per_image"], round(time.time() - t0)]
+                with open(log_path, "a", newline="") as f:
+                    csv.writer(f).writerow(row)
+                mc = stats["cells"]["mannequin"]
+                print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={mann:.3f} "
+                      f"(synth {stats['mannequin_recall_synthetic']:.3f}, "
+                      f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
+                      f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
+                      f"sel={key:.3f} lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
+                # threshold-free progress: if these climb while mannequin_r stays 0,
+                # the model IS learning under the argmax/conf_thresh bar (not stuck)
+                print(f"  soft p(fg on gt): mann={stats['soft_mann']:.3f} "
+                      f"tent={stats['soft_tent']:.3f} | argmax fg cells={stats['argmax_fg']} "
+                      f"(threshold-free — cross ~0.5 to win argmax)", flush=True)
+                state = getattr(self.model, "_orig_mod", self.model).state_dict()
+                torch.save(state, self.out_dir / "last.pt")
+                # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
+                # -1.0 sentinel, which is how a NaN model got saved as best once)
+                improved = math.isfinite(row[1]) and key > self.best
+                if improved:
+                    self.best, stale = key, 0
+                    torch.save(state, self.out_dir / "best.pt")
+            finally:
+                # exceptions between swap_in and here (eval crash, disk-full
+                # torch.save) must not leave EMA weights in the live model
+                if self.ema is not None:
+                    self.ema.swap_out(self.model)
+            if not improved:
                 stale += 1
                 min_ep = getattr(self.cfg.train, "early_stop_min_epochs", 0) or 0
                 if patience and stale >= patience and epoch + 1 >= min_ep:

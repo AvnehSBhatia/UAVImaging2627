@@ -185,6 +185,55 @@ def _cls_param2(v, c):
     return v
 
 
+def focal_norm_loss(logits, target, gamma=2.0, class_weights=(1.0, 2.0, 1.0),
+                    min_pos=1.0, min_pos_bg=8.0, mask=None):
+    """v9 default (D47): per-class positive-normalized focal loss — ONE smooth
+    per-cell term that is simultaneously size-invariant and oscillation-free.
+
+    The Focal-Tversky stack failed two ways: the set-level ratio makes the
+    gradient per cell depend nonlinearly on the batch's TP/FP totals (spiky,
+    and the documented source of the fp 0.3<->28 and mannequin 0<->overshoot
+    limit cycles), and pairing it with a focal anchor created a two-term
+    tug-of-war. This loss keeps focal's dense smooth gradient and gets size
+    invariance the CenterNet/FCOS way — normalize each class's summed focal
+    term by that class's positive-cell count in the BATCH:
+
+        L = sum_c w_c * [ sum_{cells: t=c} FL(cell) ] / max(N_c, min_pos)
+          + w_bg    * [ sum_{t=0, mask}  FL(cell) ] / max(N_fg_total, min_pos)
+
+    Every positive cell of a rare class carries O(1) gradient no matter how
+    few there are (a 60-cell mannequin and a 500-cell tent weigh the same per
+    class), and the background push scales with how much foreground actually
+    exists — at prior-bias init the foreground pull dominates, so recall
+    rises first and precision pressure grows as predictions appear.
+    Batch-level counts (not per-image) keep the normalizer steady.
+
+    Floors are asymmetric on purpose: min_pos=1 keeps a 1-4-cell mannequin
+    (exactly the worst-decile regime the decision metric targets) at full
+    per-class pull — flooring foreground at 8 measurably inverted the fg/bg
+    balance whenever a small batch's only foreground was one tiny object.
+    min_pos_bg=8 still bounds the background push in all-background batches
+    (n_fg=0). mask drops boundary-band background cells."""
+    assert len(class_weights) == logits.shape[1], \
+        f"class_weights must have {logits.shape[1]} entries (bg, mann, tent)"
+    logp = F.log_softmax(logits, 1)
+    logpt = logp.gather(1, target.unsqueeze(1)).squeeze(1)
+    fl = -((1.0 - logpt.exp()) ** gamma) * logpt  # (B, H, W)
+    total = logits.new_zeros(())
+    n_fg = (target > 0).float().sum()
+    for c, w in enumerate(class_weights):
+        m = target == c
+        if c == 0:
+            if mask is not None:
+                m = m & mask
+            total = total + w * (fl * m.float()).sum() / \
+                torch.clamp(n_fg, min=min_pos_bg)
+        else:
+            n_c = m.float().sum()
+            total = total + w * (fl * m.float()).sum() / torch.clamp(n_c, min=min_pos)
+    return total
+
+
 def distill_kl(logits, teacher_probs, temperature=2.0):
     """teacher_probs (B,3,54,96) from the cached soft grids."""
     t = temperature
