@@ -72,24 +72,16 @@ export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$ANET_DIR/.torchinduc
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$ANET_DIR/.triton}"
 
 # ---- ROCm/MIOpen hygiene
-# NORMAL (was FAST): FAST picks a conv algorithm by heuristic and NEVER retries
-# when its workspace request is denied under memory pressure -> it drops to the
-# slow no-workspace fallback for that shape for the whole run (the log's
-# "IsEnoughWorkspace ... provided ptr: 0" spam on the stem's grouped convs).
-# NORMAL does ONE timed search per unique (static) conv shape and caches it to
-# the on-disk find-db -> low-minutes one-time cost, fast steady state. This is
-# the fix the presets.py comment already prescribed ("NORMAL once builds the
-# find-db if it cliffs"). NOT the same as cudnn.benchmark (that 27-min hang is a
-# different, disabled knob).
-export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-NORMAL}"
-# find-db + compiled-kernel cache: MUST be a writable dir, else NORMAL's timed
-# search can't persist -> it re-searches every run (minutes-long warmup) and
-# spams "File is unwritable / Failed to store record to find-db". The repo path
-# was unwritable on this container; /tmp always is. Persists across runs so the
-# slow search is paid ONCE (until /tmp is cleared).
-export MIOPEN_USER_DB_PATH="${MIOPEN_USER_DB_PATH:-${TMPDIR:-/tmp}/miopen-anet}"
-export MIOPEN_CUSTOM_CACHE_DIR="${MIOPEN_CUSTOM_CACHE_DIR:-$MIOPEN_USER_DB_PATH}"
-mkdir -p "$MIOPEN_USER_DB_PATH" 2>/dev/null || true
+# FAST (the known-working default). NORMAL was tried to avoid FAST's workspace-
+# starvation fallback, but this container's MIOpen can't open/write its SQLite
+# perf DBs (repo path unwritable; /tmp path -> miopenStatusInternalError), and
+# NORMAL HARD-REQUIRES those DBs. The fused Triton Stage-1 (which handles ~96%
+# of the compute) makes MIOpen's conv-algorithm choice largely moot anyway and
+# frees the VRAM that was causing FAST's workspace denials — so FAST is fine
+# once fused is on. Do NOT override the MIOpen DB paths (defaults work under
+# FAST, which doesn't need to persist a find-db). Set MIOPEN_FIND_MODE=NORMAL
+# yourself ONLY if you've confirmed this box's MIOpen DBs are writable.
+export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
 export PYTHONUNBUFFERED=1

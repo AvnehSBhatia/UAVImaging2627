@@ -35,7 +35,7 @@ LOG_DIR="$ANET_DIR/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
 
 export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
-export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-NORMAL}"   # FAST never retries when conv workspace is denied -> permanent slow fallback; NORMAL does one cached timed search per static shape
+export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-FAST}"   # NORMAL needs writable MIOpen SQLite DBs, which this container lacks (miopenStatusInternalError); FAST is the safe default
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
 export ANET_SMOKE_SKIP_CPU="${ANET_SMOKE_SKIP_CPU:-1}"  # MI300X: skip 40s CPU path, cuda is the target
