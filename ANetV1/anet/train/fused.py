@@ -57,6 +57,13 @@ if HAS_TRITON:
         return x * tl.sigmoid(x)
 
     @triton.jit
+    def _tanh(x):
+        # tl.math.tanh is absent on some ROCm/Triton builds (gfx942 hit
+        # "module 'triton.language.math' has no attribute 'tanh'"). Exact
+        # identity via sigmoid, which every build has: tanh(x)=2*sig(2x)-1.
+        return 2.0 * tl.sigmoid(2.0 * x) - 1.0
+
+    @triton.jit
     def _blur(t, K):
         # per-tile separable gaussian == K @ T @ K (K symmetric banded, padded
         # to 32x32 with zeros == the zero padding at tile borders)
@@ -156,7 +163,7 @@ if HAS_TRITON:
             s1b = _blur(s[0], Kr)
             s2b = _blur(s[1], Kr)
             phi = tl.load(phi_ptr + r)
-            a = tl.math.tanh(s2b * s[2])
+            a = _tanh(s2b * s[2])
             gate = tl.sigmoid(s1b * tl.cos(math.pi * a + phi))
             gate = tl.where(tok, gate, 0.0)
             for j in tl.static_range(3):
@@ -189,7 +196,7 @@ if HAS_TRITON:
                 tl.atomic_add(psum_ptr + slot * H1 + j, tl.sum(h))
                 tl.atomic_add(psq_ptr + slot * H1 + j, tl.sum(h * h))
         phig = tl.load(phig_ptr)
-        ag = tl.math.tanh(sp1 * sp2)
+        ag = _tanh(sp1 * sp2)
         gate2 = tl.sigmoid(sp0 * tl.cos(math.pi * ag + phig))
         gate2 = tl.where(tok, gate2, 0.0)
 
@@ -273,7 +280,7 @@ if HAS_TRITON:
             s1b = _blur(s[0], Kr)
             s2b = _blur(s[1], Kr)
             phi = tl.load(phi_ptr + r)
-            a = tl.math.tanh(s2b * s[2])
+            a = _tanh(s2b * s[2])
             gate = tl.where(tok, tl.sigmoid(s1b * tl.cos(math.pi * a + phi)), 0.0)
             for j in tl.static_range(3):
                 pooled = tl.sum(gate * rgb[j]) / N_TOK
@@ -292,7 +299,7 @@ if HAS_TRITON:
             for k in tl.static_range(3):
                 sp[k] += tl.load(Vgs_ptr + k * H1 + j) * h
         phig = tl.load(phig_ptr)
-        ag = tl.math.tanh(sp[1] * sp[2])
+        ag = _tanh(sp[1] * sp[2])
         cosg = tl.cos(math.pi * ag + phig)
         sing = tl.sin(math.pi * ag + phig)
         score2 = sp[0] * cosg
@@ -361,7 +368,7 @@ if HAS_TRITON:
             s1b = _blur(s[0], Kr)
             s2b = _blur(s[1], Kr)
             phi = tl.load(phi_ptr + r)
-            a = tl.math.tanh(s2b * s[2])
+            a = _tanh(s2b * s[2])
             cosv = tl.cos(math.pi * a + phi)
             sinv = tl.sin(math.pi * a + phi)
             gate = tl.where(tok, tl.sigmoid(s1b * cosv), 0.0)

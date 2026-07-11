@@ -82,7 +82,14 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$ANET_DIR/.triton}"
 # find-db if it cliffs"). NOT the same as cudnn.benchmark (that 27-min hang is a
 # different, disabled knob).
 export MIOPEN_FIND_MODE="${MIOPEN_FIND_MODE:-NORMAL}"
-export MIOPEN_USER_DB_PATH="${MIOPEN_USER_DB_PATH:-$ANET_DIR/.miopen}"
+# find-db + compiled-kernel cache: MUST be a writable dir, else NORMAL's timed
+# search can't persist -> it re-searches every run (minutes-long warmup) and
+# spams "File is unwritable / Failed to store record to find-db". The repo path
+# was unwritable on this container; /tmp always is. Persists across runs so the
+# slow search is paid ONCE (until /tmp is cleared).
+export MIOPEN_USER_DB_PATH="${MIOPEN_USER_DB_PATH:-${TMPDIR:-/tmp}/miopen-anet}"
+export MIOPEN_CUSTOM_CACHE_DIR="${MIOPEN_CUSTOM_CACHE_DIR:-$MIOPEN_USER_DB_PATH}"
+mkdir -p "$MIOPEN_USER_DB_PATH" 2>/dev/null || true
 export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-0}"
 export NNPACK_DISABLE=1
 export PYTHONUNBUFFERED=1
