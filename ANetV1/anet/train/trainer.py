@@ -586,6 +586,14 @@ class Trainer:
         use_prefetch = (self.device.type == "cuda"
                         and self.cfg.train.num_workers == 0
                         and (getattr(self.cfg.train, "prefetch", True)))
+        # unmissable status line, printed LAST (below the MIOpen autotune spam)
+        # so the actual perf tier is obvious without grepping the log
+        fused = "ON" if getattr(self.model, "fused_pool", None) is not None \
+            else "OFF (dense fallback)"
+        print(f"=== ANetV1 {getattr(self.model, 'arch', '?')} ready: "
+              f"fused={fused} | compile={'ON' if self._compiled else 'OFF'} | "
+              f"batch={self.cfg.train.batch_size} | {n_batches} batches/epoch ===",
+              flush=True)
         for epoch in range(self.cfg.train.epochs):
             self.model.train()
             t0, running, n = time.time(), 0.0, 0
