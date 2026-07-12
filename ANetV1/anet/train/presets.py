@@ -161,16 +161,23 @@ def anet_cfg(**overrides):
         # (60 vs 196 in the traced frame), so per-OBJECT it generated less loss
         # even at alpha 8 (60*8 < 196*4). 12 ~ per-object-balanced (4 * 196/60).
         class_alpha=[1.0, 12.0, 4.0],  # [background, mannequin, tent]
-        # loss_mode "focal_tversky": ONE size-invariant balanced term (Focal-Tversky)
-        # + a gentle focal anchor. No focal-vs-Tversky tug-of-war -> no fp 0.3<->28
-        # limit cycle. "combo" = legacy focal + separate Tversky (kept for ablation).
-        # loss_mode: "balanced" (class-balanced Focal-Tversky over {bg,mann,tent},
-        # one term, no anchor — the anti-oscillation form), "focal_tversky"
-        # (FT + focal anchor), or "combo" (legacy). ANET_LOSS_MODE overrides.
-        # v9 default "focal_norm" (D47). "focal_tversky" / "balanced" / "combo"
-        # are kept for v8 fine-tunes from good.pt (the loss must match what
-        # trained the checkpoint) and for ablation.
-        loss_mode=os.environ.get("ANET_LOSS_MODE") or "focal_norm",
+        # v11 default "fp_tp": weighted per-class soft FP/TP ratio (ONE term,
+        # per image). Replaces focal_norm, which drove p(fg) 0.1->0.01 and
+        # collapsed the head to mann_r=0 — its background term crushed the
+        # foreground. fp_tp's +smooth numerator makes predict-nothing cost
+        # ~sum(weights) instead of 0, so collapse is no longer a fixed point.
+        # Other modes are kept for v8 fine-tunes from good.pt (loss must match
+        # what trained the checkpoint) and for ablation:
+        #   "focal_norm" (D47), "balanced" (class-balanced Focal-Tversky over
+        #   {bg,mann,tent}), "focal_tversky" (FT + focal anchor), "combo"
+        #   (legacy focal + separate Tversky). ANET_LOSS_MODE overrides.
+        loss_mode=os.environ.get("ANET_LOSS_MODE") or "fp_tp",
+        # fp_tp per-class weights in index order (bg, mann, tent). The requested
+        # prior: mannequin 0.8, tent 0.15, background 0.05.
+        fp_tp_weights=(0.05, 0.8, 0.15),
+        # fp_tp Laplace smooth: one virtual cell. Sets the collapse-point
+        # gradient scale (~1/smooth) and the FP<->recall balance; 1.0 is stable.
+        fp_tp_smooth=1.0,
         # "balanced" per-class FP (alpha) / miss (beta). bg/tent symmetric 0.5;
         # mannequin gets beta>alpha (a recall push) since it's the hard
         # under-detected class. All classes weigh equally regardless of cell

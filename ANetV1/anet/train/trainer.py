@@ -52,7 +52,8 @@ class _Heartbeat:
 
 from ..model.norm import apply_norm_updates
 from .losses import (balanced_tversky_loss, distill_kl, focal_loss,
-                     focal_norm_loss, focal_tversky_loss, tversky_loss)
+                     focal_norm_loss, focal_tversky_loss, tversky_loss,
+                     weighted_fp_tp_loss)
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
 
 
@@ -527,7 +528,19 @@ class Trainer:
         amask = None
         if band is not None:
             amask = ~(band.any(1) & (grid == 0))
-        if getattr(c, "loss_mode", "combo") == "focal_norm":
+        if getattr(c, "loss_mode", "combo") == "fp_tp":
+            # v11 default: weighted per-class soft FP/TP ratio, one term. The
+            # +smooth numerator makes predict-nothing cost ~sum(w) instead of 0,
+            # so the collapse fixed point that killed focal_norm is gone.
+            kw = dict(class_weights=tuple(getattr(c, "fp_tp_weights",
+                                                  (0.05, 0.8, 0.15))),
+                      smooth=getattr(c, "fp_tp_smooth", 1.0),
+                      band=band)
+            hard = weighted_fp_tp_loss(cells, grid, **kw)
+            if aux is not None:
+                hard = hard + getattr(c, "aux_weight", 0.3) * \
+                    weighted_fp_tp_loss(aux, grid, **kw)
+        elif getattr(c, "loss_mode", "combo") == "focal_norm":
             # v9 default (D47): ONE smooth per-cell term, per-class positive-
             # normalized (CenterNet-style size invariance without set-ratio
             # dynamics — no tug-of-war, no limit cycles).

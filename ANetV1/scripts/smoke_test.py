@@ -48,7 +48,7 @@ def v9_checks():
     import torch.nn.functional as F
 
     from anet.train.fused import _derive_params, pool_from_params
-    from anet.train.losses import focal_norm_loss
+    from anet.train.losses import focal_norm_loss, weighted_fp_tp_loss
 
     m = ANetV1(arch="v9", stem="edge_dq4", hidden=32, h1=48,
                use_checkpoint=False, aux_head=True, prior_fg=0.05)
@@ -69,6 +69,22 @@ def v9_checks():
     missing = [k for k, p in m.named_parameters() if p.grad is None]
     assert not missing, f"params without grad: {missing}"
     m.zero_grad(set_to_none=True)
+
+    # v11 default loss (weighted FP/TP): full-grad + anti-collapse property —
+    # a predict-nothing head must feel a nonzero recall pull on the true cell.
+    cells2, aux2 = m(x)
+    ftp = weighted_fp_tp_loss(cells2, grid) + 0.3 * weighted_fp_tp_loss(aux2, grid)
+    ftp.backward()
+    assert not [k for k, p in m.named_parameters() if p.grad is None], \
+        "fp_tp: params without grad"
+    m.zero_grad(set_to_none=True)
+    collapsed = torch.full((1, 3, 54, 96), 0.0)
+    collapsed[:, 0] = 12.0  # softmax ~ all background -> the collapse point
+    collapsed.requires_grad_(True)
+    weighted_fp_tp_loss(collapsed, grid).backward()
+    # gradient on the mannequin logit of the one true cell must push it UP
+    assert collapsed.grad[0, 1, 10, 10] < 0, \
+        "fp_tp lost its anti-collapse recall gradient at predict-nothing"
 
     m.eval()
     m64 = m.double()

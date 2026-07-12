@@ -239,6 +239,60 @@ def focal_norm_loss(logits, target, gamma=2.0, class_weights=(1.0, 2.0, 1.0),
     return total
 
 
+def weighted_fp_tp_loss(logits, target, class_weights=(0.05, 0.8, 0.15),
+                        smooth=1.0, band=None):
+    """v11 (supersedes focal_norm): a weighted per-class soft FP/TP ratio, one
+    smooth term, computed per image.
+
+        L      = sum_c  w_c * mean_image[ (FP_c + s) / (TP_c + s) ]
+        TP_c   = sum_cells p_c * g_c          (soft, p = softmax(logits))
+        FP_c   = sum_cells p_c * (1 - g_c)
+
+    class_weights are in index order (background, mannequin, tent); the
+    requested prior is (0.05, 0.8, 0.15) — mannequin dominates, background is a
+    near-inert 0.05 (its TP is ~5k cells/frame so the ratio is tiny regardless).
+
+    WHY THE +s IN THE NUMERATOR (this is the anti-collapse property, and the
+    whole reason the model can escape predict-nothing): the bare ratio FP/TP is
+    0/0 at the all-background point and — worse — dL/dTP = -FP/(TP+s)^2 is ZERO
+    whenever FP=0, so a collapsed head feels no pull to raise recall and the
+    collapse is a stable fixed point (exactly the mann_r=0, p(fg)->0 failure).
+    With the +s, dL/dTP = -(FP+s)/(TP+s)^2 = -1/s at collapse — a real, nonzero
+    upward push on true-class cells — while dL/dFP = 1/(TP+s) = 1/s keeps the
+    symmetric false-positive push. So predicting nothing costs ~1.0 per active
+    class instead of 0, and the only way down is to put probability mass on the
+    right cells. The loss floor is therefore ~sum_c w_c (never exactly 0); that
+    is cosmetic — optimization only sees the gradient.
+
+    Per-image mean (not batch-pooled): every frame weighs equally regardless of
+    how many object cells it holds, so a 3-cell worst-decile mannequin frame
+    pulls as hard as a 600-cell tent frame — the size bias that pins the rare
+    class is gone, and empty frames contribute a pure FP (precision) penalty
+    (TP=0 -> (FP+s)/s) cleanly separated from the recall push on object frames.
+
+    band (B, n_fg, H, W) bool: partial-coverage cells labeled background that
+    genuinely contain object — dropped from that foreground class's FP (a
+    prediction there is not a real false positive), matching the other losses.
+    """
+    assert len(class_weights) == logits.shape[1], \
+        f"class_weights must have {logits.shape[1]} entries (bg, mann, tent)"
+    p = F.softmax(logits, 1)                        # (B, C, H, W)
+    total = logits.new_zeros(())
+    for c, w in enumerate(class_weights):
+        if not w:
+            continue
+        pc = p[:, c]
+        gc = (target == c).float()
+        notg = 1.0 - gc
+        if band is not None and c != 0:            # own-class band cells aren't FP
+            notg = notg * (1.0 - band[:, c - 1].float())
+        tp = (pc * gc).sum((1, 2))                 # (B,)
+        fp = (pc * notg).sum((1, 2))               # (B,)
+        ratio = (fp + smooth) / (tp + smooth)      # (B,)
+        total = total + w * ratio.mean()
+    return total
+
+
 def distill_kl(logits, teacher_probs, temperature=2.0):
     """teacher_probs (B,3,54,96) from the cached soft grids."""
     t = temperature
