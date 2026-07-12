@@ -29,24 +29,34 @@ def _cuda_total_gib():
     return None
 
 
+def _mem_budget_gib():
+    """VRAM budget for batch sizing and the allocator cap. ANET_VRAM_GB pins an
+    explicit ceiling — e.g. a shared/partitioned MI300X that reports 192 GB but
+    only grants 48 ('use 48 GB max'); otherwise the card's real total."""
+    if "ANET_VRAM_GB" in os.environ:
+        return float(os.environ["ANET_VRAM_GB"])
+    return _cuda_total_gib()
+
+
 def _auto_batch():
     """VRAM-aware default batch. The model is ~21k params but Stage-1 runs the
     full 540x960 frame across a 4-phase batch, so activations — not weights —
     set the footprint: ~1.9 GiB/img dense-EAGER at hidden=32 (the worst case;
-    the fused Triton path is ~0.1 GiB/img). Big cards (>=120 GB: MI300A/X) keep
-    the tuned batch 96 (fused path, ~9 GB). Smaller cards are sized so the
-    dense-eager worst case fits ~62% of VRAM — so the run stays inside budget
-    whether or not the fused path engages or demotes: ~15 on a 48 GB card, ~26
-    on an 80 GB card. Effective batch is held near 96 by accum_steps.
-    ANET_BATCH pins it explicitly."""
+    the fused Triton path is ~0.1 GiB/img). A real big card with NO explicit
+    budget keeps the tuned batch 96 (fused path, ~9 GB). Otherwise batch is
+    sized so the dense-eager worst case fits ~62% of the budget — so the run
+    stays inside it whether or not the fused path engages or demotes: ~15 for a
+    48 GB budget, ~26 for 80 GB. An explicit ANET_VRAM_GB budget is honored even
+    on a 192 GB card (partition/quota case). Effective batch is held near 96 by
+    accum_steps. ANET_BATCH pins the batch directly."""
     if "ANET_BATCH" in os.environ:
         return int(os.environ["ANET_BATCH"])
-    vram = _cuda_total_gib()
-    if vram is None:
+    budget = _mem_budget_gib()
+    if budget is None:
         return 4  # Mac / CPU
-    if vram >= 120:  # MI300A/X-class: fused path has room for the tuned batch
-        return 96
-    return max(8, min(64, int(vram * 0.62 / 1.9)))
+    if "ANET_VRAM_GB" not in os.environ and budget >= 120:
+        return 96  # MI300A/X-class, no explicit cap: fused path, tuned batch
+    return max(8, min(64, int(budget * 0.62 / 1.9)))
 
 
 def anet_cfg(**overrides):
@@ -181,8 +191,14 @@ def anet_cfg(**overrides):
         # cap the torch allocator below physical VRAM so overallocation raises a
         # catchable torch.OutOfMemoryError (traceback, diagnosable) instead of the
         # driver killing the process with a bare SIGTERM; also leaves MIOpen
-        # room to get real autotune workspace instead of "provided ptr: 0"
-        cuda_memory_frac=0.90,
+        # room to get real autotune workspace instead of "provided ptr: 0".
+        # ANET_VRAM_GB pins a HARD ceiling: the fraction becomes budget/total so
+        # the PyTorch allocator physically can't exceed it (e.g. 48/192 = 0.25 to
+        # hold a partitioned MI300X at 48 GB — pair with the matching batch size
+        # from _auto_batch so the activations themselves fit).
+        cuda_memory_frac=(min(0.95, float(os.environ["ANET_VRAM_GB"]) / _cuda_total_gib())
+                          if ("ANET_VRAM_GB" in os.environ and _cuda_total_gib())
+                          else 0.90),
         focal_gamma=2.0,
         # mannequin alpha 12 (was 8): a mannequin is ~3x fewer cells than a tent
         # (60 vs 196 in the traced frame), so per-OBJECT it generated less loss

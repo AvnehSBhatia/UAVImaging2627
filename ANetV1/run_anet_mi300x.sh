@@ -53,10 +53,16 @@ export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 # at fallback_batch=32 by itself. workers=0: spawn dataloader workers deadlock
 # epoch-0 on this HIP container (fork + locked MIOpen mutexes); the in-process
 # loader + background prefetch thread keeps the GPU fed from the memmap cache.
+# HARD VRAM ceiling (GB). Default 48 — this MI300X is used as a 48 GB budget,
+# not the full 192 GB. presets sizes the batch to fit this AND caps the torch
+# allocator at budget/total so the run physically can't exceed it. Raise to 192
+# (or unset) to use the whole card; ANET_BATCH still overrides the batch.
+export ANET_VRAM_GB="${ANET_VRAM_GB:-48}"
+
 export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
-# batch/accum: LEFT UNSET so presets._auto_batch sizes the batch to the card's
-# VRAM (≈96 on a 192 GB MI300X, ≈20 on a 48 GB card) and holds the effective
-# batch near 96 via accum. Pin ANET_BATCH=<n> yourself to override.
+# batch/accum: LEFT UNSET so presets._auto_batch sizes the batch to ANET_VRAM_GB
+# (≈15 at 48 GB) and holds the effective batch near 96 via accum. Pin
+# ANET_BATCH=<n> yourself to override.
 [ -n "${ANET_BATCH:-}" ] && export ANET_BATCH
 [ -n "${ANET_ACCUM:-}" ] && export ANET_ACCUM
 # cap draws/epoch so you get an eval/checkpoint every ~2-4 min instead of ~60.
