@@ -116,6 +116,21 @@ class TileEncoder(nn.Module):
     """Shared 20x20 window encoder v9: 400 (rgb, edge..., u, v) tokens ->
     hidden-d embedding. in_dim = stem channels + 2 (uv)."""
 
+    # Dynamic-box pooling (v11, D55): the cosine-gate readout is normalized by its
+    # own gate mass, Σ(gate·h)/(Σgate + BOX_EPS), instead of the fixed 400-px
+    # window area (avg_pool). The sigmoid cosine-gate already computes a soft,
+    # data-dependent object mask per 20x20 window; dividing by its mass reads
+    # out the MEAN INSIDE THE SOFT BOX, so a mannequin covering 1-2% of the
+    # window is recovered at full strength instead of being averaged ~50-90x
+    # into the background (the measured small-object collapse). Large/uniform
+    # objects (tents) are unchanged — for a near-uniform gate the mass-mean
+    # equals the area-mean. This PRESERVES the cosine-gated-pooling mechanism
+    # (D42) and only replaces the normalizer; it stays two avg-pools + a divide
+    # (Hailo-legal) and is ~a no-op at init (gate ~0.5 -> mass-mean ~ area-mean).
+    # BOX_EPS is in the SUM domain (a fraction of one virtual gate-pixel), kept
+    # identical across the token / dense / fused paths so their parity holds.
+    BOX_EPS = 0.5
+
     def __init__(self, hidden=32, h1=48, in_dim=17):
         super().__init__()
         self.hidden = hidden
@@ -187,7 +202,14 @@ class TileEncoder(nn.Module):
                      (self.gate.V @ shift).to(h.dtype))
         gate = torch.sigmoid(
             bounded_cos_score(s[:, 0:1], s[:, 1:2], s[:, 2:3], self.gate.phi))
-        return F.avg_pool2d(gate * h, MixRoundV9.GRID)
+        # dynamic-box readout: mean of h INSIDE the soft gate box (mass-
+        # normalized), not the 400-px area mean. avg_pool of both numerator and
+        # denominator keeps it in the avg domain, so the sum-domain BOX_EPS is
+        # scaled by the window area to stay bit-consistent with the token path.
+        g = MixRoundV9.GRID
+        num = F.avg_pool2d(gate * h, g)
+        den = F.avg_pool2d(gate, g)
+        return num / (den + self.BOX_EPS / (g * g))
 
     def embed(self, pooled):  # (B, h1, nh, nw) -> (B, hidden, nh, nw)
         fc2 = self.fc2
@@ -205,8 +227,12 @@ class TileEncoder(nn.Module):
         h = F.silu(self.fc1(x))
         scale, shift = self.pool_norm.fold()
         hn = h * scale.to(h.dtype) + shift.to(h.dtype)
-        gate = self.gate(hn)
-        pooled = (gate.unsqueeze(-1) * h).mean(1)
+        gate = self.gate(hn)  # (N, 400)
+        # dynamic-box readout (see BOX_EPS): mass-normalized gated mean, the
+        # sum-domain twin of _pool_tail's avg-domain form (parity-checked).
+        num = (gate.unsqueeze(-1) * h).sum(1)
+        den = gate.sum(1, keepdim=True)
+        pooled = num / (den + self.BOX_EPS)
         return F.silu(self.fc2(pooled))
 
     def reg_l2(self):

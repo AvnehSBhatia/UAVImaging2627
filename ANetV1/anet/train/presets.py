@@ -170,7 +170,10 @@ def anet_cfg(**overrides):
         # what trained the checkpoint) and for ablation:
         #   "focal_norm" (D47), "balanced" (class-balanced Focal-Tversky over
         #   {bg,mann,tent}), "focal_tversky" (FT + focal anchor), "combo"
-        #   (legacy focal + separate Tversky). ANET_LOSS_MODE overrides.
+        #   (legacy focal + separate Tversky). "metric_only" (D56): detection
+        #   loss OFF — only proto_metric_loss trains, to PRETRAIN the embedding
+        #   space; save last.pt then ANET_INIT_FROM=... fine-tune with fp_tp.
+        #   ANET_LOSS_MODE overrides.
         loss_mode=os.environ.get("ANET_LOSS_MODE") or "fp_tp",
         # fp_tp per-class weights in index order (bg, mann, tent). The requested
         # prior: mannequin 0.8, tent 0.15, background 0.05.
@@ -178,6 +181,22 @@ def anet_cfg(**overrides):
         # fp_tp Laplace smooth: one virtual cell. Sets the collapse-point
         # gradient scale (~1/smooth) and the FP<->recall balance; 1.0 is stable.
         fp_tp_smooth=1.0,
+        # metric-prototype head (D56): weight of proto_metric_loss added to the
+        # detection loss. This is the per-cell discriminative signal (softmax
+        # over distance-to-prototype) that makes the TRUE class win the argmax —
+        # the thing fp_tp cannot do — and shapes the head's prototypes into
+        # separable mannequin/tent/bg clusters. 0 disables (falls back to the
+        # pure detection loss + a plain-linear-equivalent head). ANET_METRIC_W
+        # overrides. Set head_proto=False to remove the prototype head entirely.
+        metric_weight=float(os.environ["ANET_METRIC_W"]) if "ANET_METRIC_W" in os.environ
+        else 0.5,
+        # metric CE per-class weight (bg, mann, tent) AFTER count-normalization
+        # (so these are pure priority, not size compensation). Equal by default.
+        metric_class_weights=(1.0, 1.0, 1.0),
+        # prototype separation push (mean exp(-‖p_i-p_j‖²)); keeps clusters apart.
+        metric_sep_weight=0.1,
+        head_proto=(os.environ.get("ANET_HEAD_PROTO", "1").strip().lower()
+                    in ("1", "true", "yes")),
         # "balanced" per-class FP (alpha) / miss (beta). bg/tent symmetric 0.5;
         # mannequin gets beta>alpha (a recall push) since it's the hard
         # under-detected class. All classes weigh equally regardless of cell

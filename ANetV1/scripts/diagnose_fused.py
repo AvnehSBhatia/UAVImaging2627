@@ -81,7 +81,8 @@ def main():
     model.train()
 
     def step(m):
-        cells, aux = m(img)
+        out = m(img)  # v9 training returns {cells, aux, z}
+        cells, aux = out["cells"], out["aux"]
         (cells.square().mean() + 0.3 * aux.square().mean()).backward()
         m.zero_grad(set_to_none=True)
         if dev.type == "cuda":

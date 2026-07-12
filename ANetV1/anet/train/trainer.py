@@ -52,8 +52,8 @@ class _Heartbeat:
 
 from ..model.norm import apply_norm_updates
 from .losses import (balanced_tversky_loss, distill_kl, focal_loss,
-                     focal_norm_loss, focal_tversky_loss, tversky_loss,
-                     weighted_fp_tp_loss)
+                     focal_norm_loss, focal_tversky_loss, proto_metric_loss,
+                     tversky_loss, weighted_fp_tp_loss)
 from .metrics import CellConfusion, ObjectMetrics, confident_pred
 
 
@@ -515,7 +515,13 @@ class Trainer:
 
     def _loss_tensors(self, img, grid, teacher=None, band=None):
         out = self.model(self._prep_img(img))
-        cells, aux = out if isinstance(out, tuple) else (out, None)
+        # v9 training returns {cells, aux, z}; older paths a tensor or (cells,aux)
+        if isinstance(out, dict):
+            cells, aux, zmap = out["cells"], out["aux"], out["z"]
+        elif isinstance(out, tuple):
+            cells, aux, zmap = out[0], out[1], None
+        else:
+            cells, aux, zmap = out, None, None
         c = self.cfg.train
         ta = getattr(c, "tversky_alpha", 0.7)
         tb = getattr(c, "tversky_beta", 0.3)
@@ -528,7 +534,14 @@ class Trainer:
         amask = None
         if band is not None:
             amask = ~(band.any(1) & (grid == 0))
-        if getattr(c, "loss_mode", "combo") == "fp_tp":
+        if getattr(c, "loss_mode", "combo") == "metric_only":
+            # embedding-pretraining phase (D56): detection loss OFF, only the
+            # proto_metric_loss below trains — clusters the z-space and
+            # prototypes on mannequin/tent/bg first. Save last.pt, then
+            # ANET_INIT_FROM=... fine-tune with fp_tp (mannequin_r stays ~0
+            # during this phase, so select on last.pt, not best.pt).
+            hard = cells.new_zeros(())
+        elif getattr(c, "loss_mode", "combo") == "fp_tp":
             # v11 default: weighted per-class soft FP/TP ratio, one term. The
             # +smooth numerator makes predict-nothing cost ~sum(w) instead of 0,
             # so the collapse fixed point that killed focal_norm is gone.
@@ -586,6 +599,20 @@ class Trainer:
             if tw:
                 hard = hard + tw * tversky_loss(cells, grid, alpha=ta, beta=tb,
                                                 smooth=smooth, band=band)
+        # metric-prototype term (D56): shape z / prototypes into separable
+        # mannequin/tent/bg clusters — the per-cell "true class must win" signal
+        # weighted_fp_tp_loss lacks. Runs jointly from step 0 (the embedding
+        # separates within the first epoch, so the classifier is prototype-
+        # pretrained continuously); reuses the head's own prototypes+scale so
+        # the metric geometry IS the decision geometry.
+        mw = getattr(c, "metric_weight", 0.0) or 0.0
+        if mw and zmap is not None and getattr(self.model.head, "proto", False):
+            hard = hard + mw * proto_metric_loss(
+                zmap, grid, self.model.head.prototypes,
+                self.model.head.metric_scale(),
+                class_weights=tuple(getattr(c, "metric_class_weights",
+                                            (1.0, 1.0, 1.0))),
+                sep_weight=getattr(c, "metric_sep_weight", 0.1))
         loss = hard
         if teacher is not None:
             loss = (1.0 - self.cfg.distill.kl_weight) * hard + \

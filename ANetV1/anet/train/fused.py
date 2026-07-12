@@ -42,6 +42,8 @@ IMG_H, IMG_W, WIN = 540, 960, 20
 NH, NW = 53, 95
 PH, PW = 27, 48          # per-phase tile grid
 N_TOK = WIN * WIN        # 400
+BOX_EPS = 0.5            # dynamic-box pool eps; MUST match TileEncoder.BOX_EPS
+                         # (smoke_test d2 parity guards against drift)
 SLOTS = 512              # atomic-contention spreading for stats/param grads
 
 
@@ -199,6 +201,9 @@ if HAS_TRITON:
         ag = _tanh(sp1 * sp2)
         gate2 = tl.sigmoid(sp0 * tl.cos(math.pi * ag + phig))
         gate2 = tl.where(tok, gate2, 0.0)
+        # dynamic-box readout: divide by the gate MASS, not the fixed 400-px
+        # area (matches TileEncoder._pool_tail / pool_from_params exactly)
+        gmass = tl.sum(gate2) + BOX_EPS
 
         gy_out = oy // 10 + 2 * ty
         gx_out = ox // 10 + 2 * tx
@@ -209,7 +214,7 @@ if HAS_TRITON:
                 for ch in tl.static_range(NFRO + 5):
                     pre += tl.load(W1_ptr + j * (NFRO + 5) + ch) * xin[ch]
                 h = tl.where(tok, _silu(pre), 0.0)
-                tl.store(optr + j * soc, tl.sum(gate2 * h) / N_TOK)
+                tl.store(optr + j * soc, tl.sum(gate2 * h) / gmass)
 
     @triton.jit
     def _bwd_kernel(
@@ -304,9 +309,13 @@ if HAS_TRITON:
         sing = tl.sin(math.pi * ag + phig)
         score2 = sp[0] * cosg
         gate2 = tl.where(tok, tl.sigmoid(score2), 0.0)
+        # dynamic-box readout normalizer: out_j = sum(gate2*h_j) / D
+        D = tl.sum(gate2) + BOX_EPS
 
         # ---------------- tail backward
-        # out_j = mean(gate2 * h_j); d_gate2 = sum_j dout_j * h_j / 400
+        # out_j = sum(gate2*h_j)/D. d/dgate2_i = (A_i - B)/D with
+        #   A_i = sum_j dout_j*h_{j,i}   (the tile accumulated below)
+        #   B   = sum_j dout_j*out_j = sum_i gate2_i*A_i / D  (scalar)
         d_gate2 = tl.zeros((32, 32), tl.float32)
         optr = dout_ptr + b * sob + gy_out * soh + gx_out * sow
         for j in tl.static_range(H1):
@@ -315,8 +324,9 @@ if HAS_TRITON:
                 pre += tl.load(W1_ptr + j * (NFRO + 5) + ch) * xin[ch]
             h = tl.where(tok, _silu(pre), 0.0)
             doj = tl.load(optr + j * soc)
-            d_gate2 += doj * h / N_TOK
-        d_gate2 = tl.where(tok, d_gate2, 0.0)
+            d_gate2 += doj * h            # accumulate A_i (no /N_TOK now)
+        B = tl.sum(gate2 * d_gate2) / D
+        d_gate2 = tl.where(tok, (d_gate2 - B) / D, 0.0)
         d_score2 = d_gate2 * gate2 * (1.0 - gate2)
         d_sp0 = d_score2 * cosg
         d_com = d_score2 * sp[0] * (-sing) * math.pi * (1.0 - ag * ag)
@@ -336,7 +346,7 @@ if HAS_TRITON:
             sig = tl.sigmoid(pre)
             h = tl.where(tok, pre * sig, 0.0)
             doj = tl.load(optr + j * soc)
-            d_h = doj * gate2 / N_TOK
+            d_h = doj * gate2 / D          # dynamic-box: pool grad ∝ gate2/D
             for k in tl.static_range(3):
                 vg = tl.load(Vgs_ptr + k * H1 + j)
                 d_h += vg * d_sp[k]
@@ -459,7 +469,10 @@ def pool_from_params(x, p):
     sg = F.conv2d(h, p["Vgs"].reshape(3, -1, 1, 1), p["bg"])
     arg = torch.tanh(sg[:, 1:2] * sg[:, 2:3])
     gate2 = torch.sigmoid(sg[:, 0:1] * torch.cos(math.pi * arg + p["phig"]))
-    return F.avg_pool2d(gate2 * h, grid)
+    # dynamic-box readout: mass-normalized gated mean (matches TileEncoder)
+    num = F.avg_pool2d(gate2 * h, grid)
+    den = F.avg_pool2d(gate2, grid)
+    return num / (den + BOX_EPS / (grid * grid))
 
 
 PARAM_KEYS = ("Wr", "Wf", "bfs", "K", "phi", "W1", "b1", "Vgs", "bg", "phig")

@@ -73,10 +73,34 @@ class RegionHeadV9(nn.Module):
     the encoder built must survive, and 8 dims with a Tanh was the narrowest
     point in the entire network. The context stream is now the SlimContext
     vector (one d-dim vector per frame), so no context pooling is needed.
-    Tanh kept before the final layer (int8 calibration, D20)."""
+    Tanh kept before the final layer (int8 calibration, D20).
 
-    def __init__(self, dim, width=24, n_classes=3, prior_fg=None):
+    v11 metric-prototype classifier (D56, proto=True). The final Linear(width,
+    3) is replaced by a distance-to-prototype readout in the bounded Tanh
+    metric space z:
+
+        logit_c = scale * (2 z·p_c - ‖p_c‖²) + prior_c
+                = -scale·‖z - p_c‖² + scale·‖z‖² + prior_c
+
+    The +scale·‖z‖² term is IDENTICAL across classes at a cell, so it cancels
+    under softmax/argmax and is dropped — leaving an exactly deployable linear
+    map (weight_c = 2·scale·p_c, bias_c = prior_c − scale·‖p_c‖²), so the head
+    still folds to one conv on Hailo (no runtime L2-norm, affine-foldable). The
+    point is NOT extra capacity (a linear layer has the same freedom) but that
+    the classifier weights ARE the class prototypes: they are shaped by the
+    supervised-contrastive metric objective (train/losses.proto_metric_loss)
+    that clusters mannequin / tent / background in z BEFORE detection precision
+    tuning, then keep receiving that metric gradient jointly. That is what lets
+    the tiny under-represented mannequin separate from the easy tent instead of
+    being swallowed by it (the measured p(mann)→0 collapse). `logits_z` exposes
+    z + prototypes so the trainer can compute the metric loss on the same space
+    the decision uses."""
+
+    def __init__(self, dim, width=24, n_classes=3, prior_fg=None, proto=True):
         super().__init__()
+        self.n_classes = n_classes
+        self.width = width
+        self.proto = proto
         self.local_norm = DeployNorm(dim)
         self.local_gate = CosineGate(dim)
         # ctx is ONE d-vector per image (SlimContext already pooled space away),
@@ -89,11 +113,23 @@ class RegionHeadV9(nn.Module):
         # momentum averages the small sample harder (v10 stability fix).
         self.ctx_norm = DeployNorm(dim, momentum=0.01)
         self.fc1 = nn.Linear(2 * dim, width)
-        self.fc2 = nn.Linear(width, n_classes)
-        if prior_fg:
-            prior_bias_(self.fc2, prior_fg, n_classes)
+        if proto:
+            # class prototypes in the width-d Tanh metric space (‖·‖<√width).
+            # small init so distances start comparable and softmax isn't saturated
+            self.prototypes = nn.Parameter(torch.randn(n_classes, width)
+                                           * (width ** -0.5))
+            self.proto_log_scale = nn.Parameter(torch.zeros(()))  # softplus→~0.69
+            self.proto_bias = nn.Parameter(torch.zeros(n_classes))  # class prior
+            if prior_fg:
+                b = math.log(prior_fg / max(1.0 - (n_classes - 1) * prior_fg, 1e-6))
+                with torch.no_grad():
+                    self.proto_bias[1:] = b
+        else:
+            self.fc2 = nn.Linear(width, n_classes)
+            if prior_fg:
+                prior_bias_(self.fc2, prior_fg, n_classes)
 
-    def forward(self, ltoks, ctx):  # (B,W,4,d), (B,d) -> (B,W,3)
+    def _z(self, ltoks, ctx):  # (B,W,4,d),(B,d) -> (B,W,width) metric embedding
         b, w, t, c = ltoks.shape
         ln = self.local_norm.forward_tokens(ltoks)
         loc = (self.local_gate(ln).unsqueeze(-1) * ln).mean(2)  # (B, W, d)
@@ -101,8 +137,29 @@ class RegionHeadV9(nn.Module):
         # fc1(cat[loc, ctx]) as split matmuls + broadcast add (CoreML-safe, D31)
         h = loc @ self.fc1.weight[:, :c].t() + \
             (cn @ self.fc1.weight[:, c:].t() + self.fc1.bias).unsqueeze(1)
-        h = torch.tanh(F.silu(h))
-        return self.fc2(h)
+        return torch.tanh(F.silu(h))
+
+    def _logits(self, z):  # (B,W,width) -> (B,W,3)
+        if not self.proto:
+            return self.fc2(z)
+        scale = F.softplus(self.proto_log_scale)
+        # deployable linear form of -scale·‖z-p‖² (the ‖z‖² term cancels in
+        # softmax/argmax and is dropped so this is exactly a conv at export)
+        weight = 2.0 * scale * self.prototypes                       # (3, width)
+        bias = self.proto_bias - scale * (self.prototypes ** 2).sum(-1)  # (3,)
+        return z @ weight.t() + bias
+
+    def forward(self, ltoks, ctx):  # (B,W,4,d),(B,d) -> (B,W,3)
+        return self._logits(self._z(ltoks, ctx))
+
+    def logits_z(self, ltoks, ctx):  # -> (logits (B,W,3), z (B,W,width))
+        """Training entry: returns decisions AND the metric embedding so the
+        proto_metric_loss can shape z / prototypes on the decision space."""
+        z = self._z(ltoks, ctx)
+        return self._logits(z), z
+
+    def metric_scale(self):
+        return F.softplus(self.proto_log_scale)
 
     def reg_l2(self):
         return self.local_gate.reg_l2()

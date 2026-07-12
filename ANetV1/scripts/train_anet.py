@@ -108,6 +108,7 @@ def main():
             aux_head=cfg.train.aux_head,
             path_a_per_channel=cfg.train.path_a_per_channel,
             prior_fg=getattr(cfg.train, "prior_fg", None),
+            head_proto=getattr(cfg.train, "head_proto", True),
         )
     n_params = sum(p.numel() for p in model.parameters())
     n_aux = model.aux.weight.numel() + model.aux.bias.numel() \

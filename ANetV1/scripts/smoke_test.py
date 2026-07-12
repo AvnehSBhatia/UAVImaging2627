@@ -59,8 +59,10 @@ def v9_checks():
 
     x = torch.rand(1, 3, 540, 960)
     m.train()
-    cells, aux = m(x)
+    out = m(x)  # v9 training: dict {cells, aux, z}
+    cells, aux, zmap = out["cells"], out["aux"], out["z"]
     assert cells.shape == aux.shape == (1, 3, 54, 96)
+    assert zmap.shape == (1, m.head.width, 53, 95), "metric z-map shape"
     grid = torch.zeros(1, 54, 96, dtype=torch.long)
     grid[0, 10, 10] = 1
     loss = focal_norm_loss(cells, grid) + 0.3 * focal_norm_loss(aux, grid)
@@ -70,9 +72,21 @@ def v9_checks():
     assert not missing, f"params without grad: {missing}"
     m.zero_grad(set_to_none=True)
 
+    # metric-prototype path (D56): proto_metric_loss on z + window labels must
+    # reach the prototypes and the encoder.
+    from anet.train.losses import proto_metric_loss
+    out_m = m(x)
+    wl = proto_metric_loss(out_m["z"], grid, m.head.prototypes, m.head.metric_scale())
+    wl.backward()
+    for name in ("head.prototypes", "head.proto_log_scale"):
+        p = dict(m.named_parameters())[name]
+        assert p.grad is not None and p.grad.abs().sum() > 0, f"no metric grad to {name}"
+    m.zero_grad(set_to_none=True)
+
     # v11 default loss (weighted FP/TP): full-grad + anti-collapse property —
     # a predict-nothing head must feel a nonzero recall pull on the true cell.
-    cells2, aux2 = m(x)
+    out2 = m(x)
+    cells2, aux2 = out2["cells"], out2["aux"]
     ftp = weighted_fp_tp_loss(cells2, grid) + 0.3 * weighted_fp_tp_loss(aux2, grid)
     ftp.backward()
     assert not [k for k, p in m.named_parameters() if p.grad is None], \
@@ -101,7 +115,9 @@ def v9_checks():
             t = r.forward_tokens(t)
         h = F.silu(m64.encoder.fc1(t))
         sc, sh = m64.encoder.pool_norm.fold()
-        pooled = (m64.encoder.gate(h * sc + sh).unsqueeze(-1) * h).mean(1)
+        g64 = m64.encoder.gate(h * sc + sh)  # (N, 400) dynamic-box gate
+        pooled = ((g64.unsqueeze(-1) * h).sum(1)
+                  / (g64.sum(1, keepdim=True) + m64.encoder.BOX_EPS))
         p_win = pooled.reshape(1, m64.n_win, -1).permute(0, 2, 1).reshape(
             1, -1, m64.nh, m64.nw)
         d1 = (p_dense - p_win).abs().max().item()

@@ -241,7 +241,7 @@ def focal_norm_loss(logits, target, gamma=2.0, class_weights=(1.0, 2.0, 1.0),
 
 def weighted_fp_tp_loss(logits, target, class_weights=(0.05, 0.8, 0.15),
                         smooth=1.0, band=None):
-    """v11 (supersedes focal_norm): a weighted per-class soft FP/TP ratio, one
+    """v11/D54 (supersedes focal_norm): a weighted per-class soft FP/TP ratio, one
     smooth term, computed per image.
 
         L      = sum_c  w_c * mean_image[ (FP_c + s) / (TP_c + s) ]
@@ -291,6 +291,57 @@ def weighted_fp_tp_loss(logits, target, class_weights=(0.05, 0.8, 0.15),
         ratio = (fp + smooth) / (tp + smooth)      # (B,)
         total = total + w * ratio.mean()
     return total
+
+
+def proto_metric_loss(z, grid, prototypes, scale, class_weights=(1.0, 1.0, 1.0),
+                      sep_weight=0.1, min_count=1.0):
+    """Supervised prototype metric loss (D56). Shapes the head's bounded Tanh
+    metric space z so mannequin / tent / background occupy separable clusters
+    around the head's learnable prototypes — the discriminative signal the
+    FP/TP detection loss structurally lacks. weighted_fp_tp_loss never forces
+    the TRUE class to WIN the per-cell softmax; a soft-mass ratio is happy with
+    p(mann)=0.2 as long as tent's own ratio is fine, which is exactly how the
+    tiny mannequin lost every argmax to the easy tent. This term supplies the
+    missing "right class must win here" push, in the SAME geometry the head
+    decides in (it reuses the head's prototypes + scale), so the pretrained
+    clustering IS the classifier.
+
+    z: (B, width, 53, 95) per-window metric embedding (RegionHeadV9.logits_z).
+    grid: (B, 54, 96) cell labels {0,1,2}; reduced to 53x95 WINDOW labels by a
+      2x2 priority pool (mannequin > tent > background). A stride-1 2x2 pool at
+      window (i,j) covers exactly cells (i:i+2, j:j+2) — the same four cells the
+      window feeds through the overlap-average — so labels are correctly aligned.
+    prototypes: (C, width); scale: softplus temperature. Both are the head's own
+      parameters.
+
+    Terms:
+      - class-balanced prototype cross-entropy over softmax(-scale·‖z-p_c‖²):
+        summed per class then divided by that class's window count, so a 3-window
+        mannequin frame pulls as hard as a 600-window tent (the size bias that
+        buries the rare class is gone by construction). The head's per-class
+        prior bias is intentionally omitted — this term shapes geometry, not
+        priors.
+      - prototype separation: mean exp(-‖p_i-p_j‖²) over class pairs, a smooth
+        push keeping the prototypes (hence the clusters) from collapsing together.
+    """
+    C = prototypes.shape[0]
+    # window labels: 2x2 stride-1 priority pool of the cell grid (mann > tent > bg)
+    mann = F.max_pool2d((grid == 1).float().unsqueeze(1), 2, 1).squeeze(1)
+    tent = F.max_pool2d((grid == 2).float().unsqueeze(1), 2, 1).squeeze(1)
+    one, two = torch.ones_like(mann), 2 * torch.ones_like(mann)
+    wlabel = torch.where(mann > 0, one,
+                         torch.where(tent > 0, two, torch.zeros_like(mann))).long()
+    zt = z.permute(0, 2, 3, 1)                                  # (B, 53, 95, width)
+    d2 = ((zt.unsqueeze(-2) - prototypes) ** 2).sum(-1)         # (B, 53, 95, C)
+    logp = F.log_softmax(-scale * d2, -1)
+    nll = -logp.gather(-1, wlabel.unsqueeze(-1)).squeeze(-1)    # (B, 53, 95)
+    total = z.new_zeros(())
+    for c, wgt in enumerate(class_weights):
+        m = (wlabel == c).float()
+        total = total + wgt * (nll * m).sum() / m.sum().clamp_min(min_count)
+    pd = ((prototypes.unsqueeze(0) - prototypes.unsqueeze(1)) ** 2).sum(-1)  # (C,C)
+    off = ~torch.eye(C, dtype=torch.bool, device=pd.device)
+    return total + sep_weight * torch.exp(-pd[off]).mean()
 
 
 def distill_kl(logits, teacher_probs, temperature=2.0):

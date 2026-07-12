@@ -31,7 +31,7 @@ class ANetV1(nn.Module):
 
     def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
                  path_a_per_channel=True, prior_fg=None, arch="v8", h1=48,
-                 neck_rounds=2, head_width=24, aux_head=False):
+                 neck_rounds=2, head_width=24, aux_head=False, head_proto=True):
         super().__init__()
         self.prior_fg = prior_fg
         self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
@@ -89,7 +89,8 @@ class ANetV1(nn.Module):
                     conv.weight.copy_(torch.eye(d).reshape(d, d, 1, 1))
                     conv.bias.zero_()
             self.context = SlimContext(d)
-            self.head = RegionHeadV9(dim=d, width=head_width, prior_fg=prior_fg)
+            self.head = RegionHeadV9(dim=d, width=head_width, prior_fg=prior_fg,
+                                     proto=head_proto)
             # train-only deep supervision (D46): a linear probe on the raw
             # embedding map gives the encoder a direct gradient path that
             # cannot be blocked by a collapsed head. Dropped at export/eval.
@@ -162,6 +163,7 @@ class ANetV1(nn.Module):
                 head_width=sd["head.fc1.weight"].shape[0],
                 path_a_per_channel=sd["pools.0.weight"].shape[0] > 1,
                 aux_head="aux.weight" in sd,
+                head_proto="head.prototypes" in sd,
                 **kwargs)
             # migrate pre-v10 stems: 4 separate edge convs -> one fused groups=12
             # (stem_mod.edges.{0..3}.weight -> stem_mod.edge.weight). Same params,
@@ -311,12 +313,17 @@ class ANetV1(nn.Module):
         own = emb.unsqueeze(2)
         local = torch.stack([mp.flatten(2).permute(0, 2, 1) for mp in maps], 2)
         ltoks = torch.cat([own, local], 2)  # (B, W, 4, d)
+        if self.training:
+            # dict return in training: cells + optional aux probe + the per-window
+            # metric embedding z (B, width, 53, 95) for proto_metric_loss. Eval /
+            # export stays a bare tensor (ONNX-safe, unchanged graph).
+            wl, z = self.head.logits_z(ltoks, ctx)
+            cells = self._cells(wl.permute(0, 2, 1).reshape(b, 3, self.nh, self.nw))
+            aux_cells = self._cells(self.aux(m0)) if self.aux is not None else None
+            zmap = z.permute(0, 2, 1).reshape(b, -1, self.nh, self.nw)
+            return {"cells": cells, "aux": aux_cells, "z": zmap}
         wlogits = self.head(ltoks, ctx).permute(0, 2, 1).reshape(b, 3, self.nh, self.nw)
-        cells = self._cells(wlogits)
-        if self.training and self.aux is not None:
-            aux_cells = self._cells(self.aux(m0))
-            return cells, aux_cells
-        return cells
+        return self._cells(wlogits)
 
     def _cells(self, wlogits):  # (B,3,53,95) window logits -> (B,3,54,96) cells
         cells = F.conv_transpose2d(wlogits, self.cell_kernel.to(wlogits.dtype), groups=3)
