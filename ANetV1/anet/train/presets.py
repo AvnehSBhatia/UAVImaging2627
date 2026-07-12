@@ -39,24 +39,30 @@ def _mem_budget_gib():
 
 
 def _auto_batch():
-    """VRAM-aware default batch. The model is ~21k params but Stage-1 runs the
-    full 540x960 frame across a 4-phase batch, so activations — not weights —
-    set the footprint: ~1.9 GiB/img dense-EAGER at hidden=32 (the worst case;
-    the fused Triton path is ~0.1 GiB/img). A real big card with NO explicit
-    budget keeps the tuned batch 96 (fused path, ~9 GB). Otherwise batch is
-    sized so the dense-eager worst case fits ~62% of the budget — so the run
-    stays inside it whether or not the fused path engages or demotes: ~15 for a
-    48 GB budget, ~26 for 80 GB. An explicit ANET_VRAM_GB budget is honored even
-    on a 192 GB card (partition/quota case). Effective batch is held near 96 by
-    accum_steps. ANET_BATCH pins the batch directly."""
+    """Memory-safe default batch. The model is ~21k params but Stage-1 convolves
+    the full 540x960 frame across a 4-phase batch, so ACTIVATIONS — not weights —
+    dominate: ~1.9 GiB/img dense-EAGER at hidden=32, and with gradient
+    checkpointing (default on, below) ~0.5 GiB/img. Free VRAM is NOT knowable
+    from the device total — a 192 GB MI300X is routinely shared/partitioned — so
+    the default is deliberately CONSERVATIVE and does not scale to the card:
+
+      - ANET_BATCH=<n>     : pin the batch directly.
+      - ANET_VRAM_GB=<gb>  : size the batch so the dense-eager worst case fits
+                             ~55% of that budget (48 -> 13, 192 -> 55), and cap
+                             the allocator to it (below).
+      - neither            : batch 16 — trains in ~8-12 GiB with checkpointing,
+                             fits alongside other jobs on a shared card.
+
+    accum_steps holds the effective batch near 96 so the LR schedule/step count
+    are stable regardless of the physical batch."""
     if "ANET_BATCH" in os.environ:
         return int(os.environ["ANET_BATCH"])
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
-    if "ANET_VRAM_GB" not in os.environ and budget >= 120:
-        return 96  # MI300A/X-class, no explicit cap: fused path, tuned batch
-    return max(8, min(64, int(budget * 0.62 / 1.9)))
+    if "ANET_VRAM_GB" in os.environ:  # explicit budget -> size the batch to it
+        return max(4, min(96, int(budget * 0.55 / 1.9)))
+    return 16  # conservative default; free VRAM on a shared card is unknowable
 
 
 def anet_cfg(**overrides):
@@ -165,14 +171,16 @@ def anet_cfg(**overrides):
         # Box-filter init -> starts identical to the shared-scalar spec form.
         # False restores the exact 179-param D13 Path A.
         path_a_per_channel=True,
-        # per-round checkpointing (encoder.forward_dense(ckpt=True)): backward
-        # peak = forward-held boundaries (~0.45 GiB/img) + the largest
-        # rematerialized segment, for one extra Stage-1 forward. Mac:
-        # mandatory memory valve. CUDA/ROCm: off — compile's min-cut
-        # partitioner already rematerializes, and checkpoint HOPs would break
-        # up the fused graph. ANET_CKPT=1 for eager runs that must stay small.
+        # per-round checkpointing (encoder.forward_dense(ckpt=True)): recompute
+        # Stage-1 activations in the backward instead of storing them — backward
+        # peak drops from ~1.9 to ~0.5 GiB/img (one extra Stage-1 forward). Now
+        # ON by default EVERYWHERE (the model must fit a shared/partitioned card,
+        # and activations — not the 21k weights — are the whole footprint). It
+        # only touches the DENSE encoder path; the fused Triton kernel manages
+        # its own memory and ignores it, so there is no fused-graph interaction.
+        # ANET_CKPT=0 disables (a dedicated card with VRAM to spare + compile).
         use_checkpoint=(os.environ["ANET_CKPT"].strip().lower() in ("1", "true", "yes"))
-        if "ANET_CKPT" in os.environ else not IS_CUDA,
+        if "ANET_CKPT" in os.environ else True,
         amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
         # ANET_SAMPLES caps draws/epoch (was uncapped on CUDA -> full ~13.5k ->
         # ~60 min/epoch dense). The WeightedRandomSampler redraws i.i.d. from a
