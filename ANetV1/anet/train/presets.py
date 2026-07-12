@@ -20,24 +20,49 @@ IS_CUDA = torch.cuda.is_available()
 IS_ROCM = torch.version.hip is not None  # MI300X presents as cuda but is MIOpen
 
 
+def _cuda_total_gib():
+    if IS_CUDA:
+        try:
+            return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        except Exception:
+            return None
+    return None
+
+
+def _auto_batch():
+    """VRAM-aware default batch. The model is ~21k params but Stage-1 runs the
+    full 540x960 frame across a 4-phase batch, so activations — not weights —
+    set the footprint: ~1.9 GiB/img dense-EAGER at hidden=32 (the worst case;
+    the fused Triton path is ~0.1 GiB/img). Big cards (>=120 GB: MI300A/X) keep
+    the tuned batch 96 (fused path, ~9 GB). Smaller cards are sized so the
+    dense-eager worst case fits ~62% of VRAM — so the run stays inside budget
+    whether or not the fused path engages or demotes: ~15 on a 48 GB card, ~26
+    on an 80 GB card. Effective batch is held near 96 by accum_steps.
+    ANET_BATCH pins it explicitly."""
+    if "ANET_BATCH" in os.environ:
+        return int(os.environ["ANET_BATCH"])
+    vram = _cuda_total_gib()
+    if vram is None:
+        return 4  # Mac / CPU
+    if vram >= 120:  # MI300A/X-class: fused path has room for the tuned batch
+        return 96
+    return max(8, min(64, int(vram * 0.62 / 1.9)))
+
+
 def anet_cfg(**overrides):
+    bs = _auto_batch()
     train = dict(
         epochs=30,
-        # effective batch 64 on CUDA (32x2), 16 on Mac (4x4).
-        # MEMORY (measured, 2026-07-08, hidden=24/edge_dq, batch 1 fwd+bwd):
-        # saved-for-backward was 2.87 GiB/img eager — 1.35 GiB of it fp32
-        # ManualBatchNorm intermediates (now fused F.batch_norm off-MPS) and
-        # ~0.5 GiB an fp32 type-promotion from the fp32 uv_tile cat (fixed).
-        # With those fixes it is 1.54 GiB/img eager, ~0.65 compiled (inductor
-        # rematerializes the pointwise chains), ~0.45+segment with per-round
-        # checkpointing. ROCm default batch 16 x accum 4 (effective 64
-        # unchanged) => ~10 GB compiled / ~25 GB eager fallback on the 192 GB
-        # card. MIOpen autotune can still spike multi-GB workspaces on first
-        # steps (MIOPEN_FIND_MODE=NORMAL once builds the find-db if it cliffs).
-        batch_size=int(os.environ["ANET_BATCH"]) if "ANET_BATCH" in os.environ
-        else (16 if IS_ROCM else (32 if IS_CUDA else 4)),
+        # VRAM-aware batch (see _auto_batch): sized so the dense-EAGER path
+        # (~1.8 GiB/img at hidden=32, the worst case) fits the actual card, so a
+        # 48 GB box no longer OOMs on the batch-96 MI300X default. accum holds
+        # the effective batch near 96 (so step count / LR schedule are stable
+        # across cards); on Mac it stays the old 4x4=16. MIOpen autotune can
+        # still spike multi-GB workspaces on the first steps — the cuda_memory_frac
+        # cap turns any such overrun into a catchable OOM, not a driver SIGTERM.
+        batch_size=bs,
         accum_steps=int(os.environ["ANET_ACCUM"]) if "ANET_ACCUM" in os.environ
-        else (4 if IS_ROCM else (2 if IS_CUDA else 4)),
+        else (max(1, round(96 / bs)) if IS_CUDA else 4),
         lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ
         else (4.0e-3 if IS_CUDA else 3.0e-3),
         # higher peak LR needs a longer ramp or it diverges on step 1 — scale
@@ -116,7 +141,9 @@ def anet_cfg(**overrides):
         # ANET_FUSED_BWD=triton|chunked override.
         fused=IS_CUDA,
         fused_bwd="triton",
-        fallback_batch=32,
+        # dense-fallback batch (used if the fused path demotes): never larger
+        # than the VRAM-sized batch, so the heavier dense-eager path still fits.
+        fallback_batch=min(32, bs),
         # DeployNorm seeding (D39): 24 covers the full cumulative-average ramp
         # (momentum locks to its 0.05 floor at step 20) before any real gradient,
         # so training never normalizes against a half-formed running stat.

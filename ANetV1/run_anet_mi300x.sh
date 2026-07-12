@@ -54,8 +54,11 @@ export DATA_ROOT ANET_DATA_ROOT="$DATA_ROOT"
 # epoch-0 on this HIP container (fork + locked MIOpen mutexes); the in-process
 # loader + background prefetch thread keeps the GPU fed from the memmap cache.
 export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
-export ANET_BATCH="${ANET_BATCH:-96}"
-export ANET_ACCUM="${ANET_ACCUM:-1}"
+# batch/accum: LEFT UNSET so presets._auto_batch sizes the batch to the card's
+# VRAM (≈96 on a 192 GB MI300X, ≈20 on a 48 GB card) and holds the effective
+# batch near 96 via accum. Pin ANET_BATCH=<n> yourself to override.
+[ -n "${ANET_BATCH:-}" ] && export ANET_BATCH
+[ -n "${ANET_ACCUM:-}" ] && export ANET_ACCUM
 # cap draws/epoch so you get an eval/checkpoint every ~2-4 min instead of ~60.
 # The sampler redraws i.i.d. from a fixed distribution, so this is a pure speed
 # lever (does not change what any step sees). Raise ANET_EPOCHS to keep the
@@ -112,7 +115,7 @@ fi
 
 printf '\n== ANetV1 v9 MI300X | data=%s | python=%s ==\n' "$DATA_ROOT" "$PY"
 printf '== batch=%s fused=%s compile=%s ==\n' \
-    "$ANET_BATCH" "${ANET_FUSED:-1}" "$ANET_COMPILE"
+    "${ANET_BATCH:-auto(VRAM)}" "${ANET_FUSED:-1}" "$ANET_COMPILE"
 
 "$PY" scripts/train_anet.py 2>&1 | tee "$LOG_DIR/anet.log"
 touch "$STAGE_DIR/anet.done"   # keeps the run_mi300x.sh pipeline from retraining
