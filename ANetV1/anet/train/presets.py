@@ -141,6 +141,11 @@ def anet_cfg(**overrides):
         # + loss_mode="center" together — see trainer.py's center branch)
         center_alpha=2.0,             # center_focal_loss positive-term focusing power
         center_beta=4.0,              # center_focal_loss negative-penalty falloff around a peak
+        # up-weight the (rare, ~1-cell) positive center term vs the ~2500 bg cells
+        # so the center prob climbs faster than the measured ~0.002/epoch from-
+        # scratch crawl. ANET_POS_W overrides. 1.0 = plain CenterNet.
+        center_pos_weight=float(os.environ["ANET_POS_W"]) if "ANET_POS_W" in os.environ
+        else 3.0,
         offset_weight=1.0,            # weight of offset_l1 relative to center_focal_loss
         # v12 DEEP SUPERVISION: weight of a center_focal probe straight off the
         # encoder embedding map (ANetV1.aux_center, train-only). The pinpoint
@@ -151,7 +156,12 @@ def anet_cfg(**overrides):
         center_aux_weight=float(os.environ["ANET_AUX_W"]) if "ANET_AUX_W" in os.environ
         else 1.0,
         peak_thresh=0.3,              # eval-time 3x3-local-max heatmap threshold (CenterObjectMetrics)
-        center_sigma=0.7,             # Gaussian splat sigma (cells) for the heat target (rasterize.py)
+        # Gaussian splat sigma (cells) for the heat target (rasterize.py). 1.5
+        # (was 0.7 ~ a single cell) gives a ~3x3 soft core so cells adjacent to a
+        # true center carry a near-1 target and are barely penalized as negatives
+        # — a smoother objective the from-scratch head climbs faster. Wired
+        # through SUASCells(center_sigma=...) now (the dataset used to hardcode 0.7).
+        center_sigma=1.5,
         # aux deep-supervision probe (D46): DROPPED in v10. Measured (single
         # forward+backward decomposition) it contributes 0.02% of the encoder
         # gradient — the hard-loss path dominates ~4000x even when the head is

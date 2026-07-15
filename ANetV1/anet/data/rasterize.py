@@ -125,7 +125,7 @@ def boxes_to_soft_grid(boxes_conf, coverage_thresh=0.0):
     return p
 
 
-def boxes_to_heatmap(boxes, sigma=0.7):
+def boxes_to_heatmap(boxes, sigma=1.5):
     """v12 object-center targets on the 27x48 stride-20 grid (CenterNet-style).
 
     Same class convention as boxes_to_grid: box[0]==0 -> mannequin (heat
@@ -150,9 +150,10 @@ def boxes_to_heatmap(boxes, sigma=0.7):
     heat = np.zeros((N_CLASSES, V12_H, V12_W), np.float32)
     offset = np.zeros((2, V12_H, V12_W), np.float32)
     reg_mask = np.zeros((1, V12_H, V12_W), np.float32)
-    # 5x5 splat window: exp(-4/(2*0.7^2)) ~= 0.02 at the corner, negligible
-    # beyond radius 2 for the sigma~0.7 cell the spec calls for.
-    radius = 2
+    # splat window scaled to sigma (radius ~3*sigma captures the Gaussian down to
+    # ~1% before it's clipped); radius 2 clipped the sigma>=1 splat into a hard
+    # square, defeating the point of widening it.
+    radius = max(2, int(np.ceil(3.0 * sigma)))
     for box in boxes:
         k = int(box[0])
         _, cx, cy, w, h = box

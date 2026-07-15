@@ -49,7 +49,7 @@ def _read_label(path):
 class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
                  vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
-                 band_lo=None, cache=False, center=False):
+                 band_lo=None, cache=False, center=False, center_sigma=1.5):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
@@ -61,6 +61,7 @@ class SUASCells(Dataset):
         # "offset", "reg_mask") on the 27x48 stride-20 grid, rasterized from
         # the same transformed+padded boxes already produced for the v9 grid.
         self.center = center
+        self.center_sigma = center_sigma
         # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
         # conversion to the consumer (the Trainer does it on-GPU): 4x less
         # pinned-memory + H2D traffic per image and no fp32 convert in the
@@ -222,7 +223,7 @@ class SUASCells(Dataset):
             # padded is the same canvas-normalized, -1-padded box set already
             # rasterized into `grid` above; boxes_to_heatmap ignores the -1
             # padding rows (their class index isn't 0 or 1).
-            heat, offset, reg_mask = boxes_to_heatmap(padded.numpy())
+            heat, offset, reg_mask = boxes_to_heatmap(padded.numpy(), sigma=self.center_sigma)
             out["heat"] = torch.from_numpy(heat)
             out["offset"] = torch.from_numpy(offset)
             out["reg_mask"] = torch.from_numpy(reg_mask)

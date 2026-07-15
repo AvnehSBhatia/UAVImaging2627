@@ -87,8 +87,13 @@ cfg = anet_cfg(
     arch="v12",
     stem="edge_dq4",         # 4-orientation Sobel-init edge stem (D41)
     hidden=32,               # embedding width (same budget as v9)
-    epochs=int(os.environ.get("ANET_EPOCHS", 40)),
-    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 1.5e-3,
+    # from-scratch center-heatmap training is SLOW on the rare tiny mannequin:
+    # the first real run climbed soft p(center) only ~0.002/epoch and the 40-epoch
+    # cosine decayed LR away mid-climb. More budget + a hotter peak (3e-3, was the
+    # v9-fine-tune-safe 1.5e-3) give it room; pair with center_pos_weight + the
+    # soft-signal selection so it isn't early-stopped before peaks cross 0.5.
+    epochs=int(os.environ.get("ANET_EPOCHS", 80)),
+    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 3.0e-3,
     # prior_fg 0.01 (RetinaNet §4.1 prior), NOT 0.1/0.05. On the 27x48=1296-cell
     # heatmap only ~1-2 cells per class are objects, so a HIGH init prior makes
     # the ~2590 background cells' penalty-reduced-focal gradient sink the head's
@@ -118,6 +123,7 @@ def build_datasets(cfg, teacher_dir=None):
         band_lo=getattr(cfg.data, "band_lo", None),  # boundary ignore band
         cache=getattr(cfg.data, "cache", False),  # memmap preprocessing cache
         center=True,  # v12: also build heat/offset/reg_mask targets (rasterize.py)
+        center_sigma=getattr(cfg.train, "center_sigma", 1.5),  # Gaussian splat width
     )
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)

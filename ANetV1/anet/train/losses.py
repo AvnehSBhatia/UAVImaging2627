@@ -378,7 +378,7 @@ def distill_kl(logits, teacher_probs, temperature=2.0):
     return F.kl_div(logp, soft, reduction="batchmean") * t * t
 
 
-def center_focal_loss(heat_logits, heat_target, alpha=2.0, beta=4.0):
+def center_focal_loss(heat_logits, heat_target, alpha=2.0, beta=4.0, pos_weight=1.0):
     """v12 (CenterNet, Law & Deng 2018): penalty-reduced pixel focal loss over
     the two INDEPENDENT per-class heatmaps (mannequin ch0, tent ch1) — each
     class gets its own sigmoid, so there is no softmax competition and a tent
@@ -416,7 +416,12 @@ def center_focal_loss(heat_logits, heat_target, alpha=2.0, beta=4.0):
     p = torch.sigmoid(heat_logits.float())
     eps = 1e-6
     pos = (heat_target == 1.0).float()
-    pos_loss = -((1 - p).clamp_min(eps) ** alpha) * torch.log(p.clamp_min(eps)) * pos
+    # pos_weight (>1) amplifies the "raise p at the true center" gradient relative
+    # to the ~2500 background cells' collective push-down. On this 1296-cell/class
+    # heatmap the rare object claims ~1 cell, so from scratch the center prob rose
+    # only ~0.002/epoch under equal weighting (measured, soft_mann 0.01->0.06 in 24
+    # epochs); up-weighting positives is the direct lever to speed that climb.
+    pos_loss = -pos_weight * ((1 - p).clamp_min(eps) ** alpha) * torch.log(p.clamp_min(eps)) * pos
     neg_loss = -((1 - heat_target) ** beta) * (p ** alpha) * torch.log((1 - p).clamp_min(eps)) * (1 - pos)
     n_pos = pos.sum().clamp_min(1.0)
     return (pos_loss.sum() + neg_loss.sum()) / n_pos

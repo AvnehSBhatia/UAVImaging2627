@@ -532,8 +532,9 @@ class Trainer:
             # a frame with both classes present doesn't force them to fight
             # for probability mass the way the v8/v9 cell softmax does.
             out = self.model(self._prep_img(img))  # {"heat":(B,2,27,48),"offset":(B,2,27,48)} raw logits
-            loss = center_focal_loss(out["heat"], heat,
-                                     alpha=c.center_alpha, beta=c.center_beta) + \
+            pw = getattr(c, "center_pos_weight", 1.0)
+            loss = center_focal_loss(out["heat"], heat, alpha=c.center_alpha,
+                                     beta=c.center_beta, pos_weight=pw) + \
                 c.offset_weight * offset_l1(out["offset"], offset, reg_mask)
             # deep supervision (v12): a direct center_focal gradient on the
             # encoder-embedding probe (out["aux_heat"], train-only) forces the
@@ -543,7 +544,8 @@ class Trainer:
             aw = getattr(c, "center_aux_weight", 0.0) or 0.0
             if aw and "aux_heat" in out:
                 loss = loss + aw * center_focal_loss(
-                    out["aux_heat"], heat, alpha=c.center_alpha, beta=c.center_beta)
+                    out["aux_heat"], heat, alpha=c.center_alpha,
+                    beta=c.center_beta, pos_weight=pw)
             l2, l1 = self.model.reg_losses()
             return loss + c.l2_score_reg * l2 + c.l1_kernel_reg * l1
         out = self.model(self._prep_img(img))
@@ -813,6 +815,16 @@ class Trainer:
                     mann = stats["mannequin_recall"]
                 tent_w = getattr(self.cfg.train, "select_tent_weight", 0.5)
                 key = mann + tent_w * stats["tent_recall"]
+                # v12 center head: the peak/threshold recall stays 0 for many
+                # epochs while soft p(center) climbs 0.01 -> 0.5 monotonically, so
+                # a recall-only key can't see progress, freezes best.pt at the cold
+                # start, and early-stops mid-climb (observed: killed at epoch 24
+                # with soft_mann still rising 0.047->0.063). Add the soft signal so
+                # selection + early-stop track sub-threshold learning; the real
+                # recall term still dominates the moment peaks cross ~0.5.
+                if getattr(self.cfg.train, "loss_mode", "") == "center":
+                    key = key + 0.5 * (stats.get("soft_mann", 0.0)
+                                       + tent_w * stats.get("soft_tent", 0.0))
                 if self.sched_per_epoch and self._warmup_left == 0:
                     self.sched.step(key)  # ReduceLROnPlateau on the selection metric
                 row = [epoch, running / max(n, 1), stats["mannequin_recall"],
