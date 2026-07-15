@@ -27,6 +27,7 @@ from .rasterize import (
     CANVAS_W,
     boxes_to_grid,
     boxes_to_grid_band,
+    boxes_to_heatmap,
     letterbox_params,
     transform_boxes,
 )
@@ -48,7 +49,7 @@ def _read_label(path):
 class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
                  vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
-                 band_lo=None, cache=False):
+                 band_lo=None, cache=False, center=False):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
@@ -56,6 +57,10 @@ class SUASCells(Dataset):
         # coverage cells in [band_lo, coverage_thresh), used by the loss as an
         # ignore band (boundary label noise). None = off (eval scripts).
         self.band_lo = band_lo
+        # center=True: also emit v12's object-center targets ("heat",
+        # "offset", "reg_mask") on the 27x48 stride-20 grid, rasterized from
+        # the same transformed+padded boxes already produced for the v9 grid.
+        self.center = center
         # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
         # conversion to the consumer (the Trainer does it on-GPU): 4x less
         # pinned-memory + H2D traffic per image and no fp32 convert in the
@@ -213,6 +218,14 @@ class SUASCells(Dataset):
                "vd": self.is_visdrone(i), "stem": self.items[i].stem}
         if band is not None:
             out["band"] = band
+        if self.center:
+            # padded is the same canvas-normalized, -1-padded box set already
+            # rasterized into `grid` above; boxes_to_heatmap ignores the -1
+            # padding rows (their class index isn't 0 or 1).
+            heat, offset, reg_mask = boxes_to_heatmap(padded.numpy())
+            out["heat"] = torch.from_numpy(heat)
+            out["offset"] = torch.from_numpy(offset)
+            out["reg_mask"] = torch.from_numpy(reg_mask)
         if self.teacher_dir is not None:
             soft = np.load(self.teacher_dir / f"{self.items[i].stem}.npz")["grid"]
             out["teacher"] = torch.from_numpy(soft)

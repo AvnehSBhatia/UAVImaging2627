@@ -132,6 +132,49 @@ def v9_checks():
     print("  v9 checks passed")
 
 
+def v12_checks():
+    """v12: param budget + forward shapes on the single-phase 27x48 grid."""
+    m = ANetV1(arch="v12", dense=True, hidden=32, stem="edge_dq4",
+               head_width=24, prior_fg=0.1, use_checkpoint=False)
+    n = sum(p.numel() for p in m.parameters())
+    print(f"ANetV1 v12 params: {n:,}")
+    assert n < 40_000, "v12 param budget exceeded"
+    assert m.nh == 27 and m.nw == 48 and m.n_win == 27 * 48
+
+    x = torch.rand(2, 3, 540, 960)
+    m.train()
+    out = m(x)
+    assert out["heat"].shape == (2, 2, 27, 48), out["heat"].shape
+    assert out["offset"].shape == (2, 2, 27, 48), out["offset"].shape
+
+    m.eval()
+    with torch.no_grad():
+        out_eval = m(x)
+    assert out_eval["heat"].shape == (2, 2, 27, 48)
+    assert out_eval["offset"].shape == (2, 2, 27, 48)
+
+    from anet.train.losses import center_focal_loss, offset_l1
+
+    m.train()
+    out = m(x)
+    heat_t = torch.zeros(2, 2, 27, 48)
+    heat_t[:, 0, 5, 5] = 1.0
+    offset_t = torch.zeros(2, 2, 27, 48)
+    reg_mask = torch.zeros(2, 1, 27, 48)
+    reg_mask[:, 0, 5, 5] = 1.0
+    loss = center_focal_loss(out["heat"], heat_t) + offset_l1(out["offset"], offset_t, reg_mask)
+    l2, l1 = m.reg_losses()
+    (loss + 1e-4 * (l2 + l1)).backward()
+    missing = [k for k, p in m.named_parameters() if p.grad is None]
+    assert not missing, f"v12 params without grad: {missing}"
+    m.zero_grad(set_to_none=True)
+
+    sd = m.state_dict()
+    m2 = ANetV1.from_state_dict(sd)
+    assert m2.arch == "v12" and m2.encoder.hidden == 32
+    print("  v12 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -142,6 +185,7 @@ def main():
             # ~17-18k shared Path A (D13); ~21-22k per-channel Path A (D37) at hidden=16
             assert 15_000 < n < 24_000, "param count off spec (ARCHITECTURE.md §5)"
     v9_checks()
+    v12_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

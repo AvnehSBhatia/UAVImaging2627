@@ -163,3 +163,63 @@ class RegionHeadV9(nn.Module):
 
     def reg_l2(self):
         return self.local_gate.reg_l2()
+
+
+class CenterHead(nn.Module):
+    """v12 head: object center-heatmap detector (see workflow spec / planned
+    ARCHITECTURE.md delta). Reuses RegionHeadV9's split-stream `_z` verbatim —
+    local DeployNorm + CosineGate gated-mean pool over the 4 local tokens
+    concatenated (via split matmuls, D31) with the ctx DeployNorm(momentum=
+    0.01) stream, SiLU->Tanh — because that metric embedding is exactly the
+    per-window evidence a center/offset readout needs too; only the final
+    projection changes; there is no prototype path here; scale/proto losses
+    are not this head's job.
+
+    fc2 projects the width-d embedding to 4 raw logits per window:
+      [center_mannequin, center_tent, dx, dy]
+    center_* are independent-sigmoid heatmap logits (no softmax competition,
+    per v12 spec); dx/dy are class-agnostic sub-cell offset logits (squashed
+    through sigmoid downstream by offset_l1, not here) — kept as raw logits
+    out of this module so the head still folds to one plain Linear/1x1-conv
+    at export (D20/D31)."""
+
+    def __init__(self, dim, width=24, prior_fg=None):
+        super().__init__()
+        self.width = width
+        self.local_norm = DeployNorm(dim)
+        self.local_gate = CosineGate(dim)
+        # see RegionHeadV9.ctx_norm docstring for why this momentum is slow:
+        # ctx is one d-vector/image, so a faster EMA random-walks noise into
+        # every window's logit identically (measured argmax instability).
+        self.ctx_norm = DeployNorm(dim, momentum=0.01)
+        self.fc1 = nn.Linear(2 * dim, width)
+        self.fc2 = nn.Linear(width, 4)
+        if prior_fg:
+            # RetinaNet-style prior (see prior_bias_ above), but here BOTH
+            # output channels 0/1 are independent foreground sigmoids (no
+            # background class to leave at 0), so bias = logit(prior_fg)
+            # directly rather than the softmax-normalized form in
+            # prior_bias_/RegionHead. dx/dy offset channels start at 0.
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.fc2.bias.zero_()
+                self.fc2.bias[0:2] = b
+                self.fc2.bias[2:4] = 0.0
+
+    def _z(self, ltoks, ctx):  # (B,W,4,d),(B,d) -> (B,W,width) — identical to
+        # RegionHeadV9._z (kept as a literal copy, not a shared call, so this
+        # head has no import/coupling dependency on RegionHeadV9's proto path)
+        b, w, t, c = ltoks.shape
+        ln = self.local_norm.forward_tokens(ltoks)
+        loc = (self.local_gate(ln).unsqueeze(-1) * ln).mean(2)  # (B, W, d)
+        cn = self.ctx_norm.forward_tokens(ctx)  # (B, d)
+        # fc1(cat[loc, ctx]) as split matmuls + broadcast add (CoreML-safe, D31)
+        h = loc @ self.fc1.weight[:, :c].t() + \
+            (cn @ self.fc1.weight[:, c:].t() + self.fc1.bias).unsqueeze(1)
+        return torch.tanh(F.silu(h))
+
+    def forward(self, ltoks, ctx):  # (B,W,4,d),(B,d) -> (B,W,4) raw logits
+        return self.fc2(self._z(ltoks, ctx))
+
+    def reg_l2(self):
+        return self.local_gate.reg_l2()

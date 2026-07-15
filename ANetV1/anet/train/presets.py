@@ -136,6 +136,14 @@ def anet_cfg(**overrides):
         h1=48,                        # pre-pool token width (D42)
         neck_rounds=2,                # ConvNeck depth (D43)
         head_width=24,                # classifier width (D45)
+        # --------------------------------------------------------- v12 keys
+        # (harmless for v8/v9 runs; scripts/train_anet.py selects arch="v12"
+        # + loss_mode="center" together — see trainer.py's center branch)
+        center_alpha=2.0,             # center_focal_loss positive-term focusing power
+        center_beta=4.0,              # center_focal_loss negative-penalty falloff around a peak
+        offset_weight=1.0,            # weight of offset_l1 relative to center_focal_loss
+        peak_thresh=0.3,              # eval-time 3x3-local-max heatmap threshold (CenterObjectMetrics)
+        center_sigma=0.7,             # Gaussian splat sigma (cells) for the heat target (rasterize.py)
         # aux deep-supervision probe (D46): DROPPED in v10. Measured (single
         # forward+backward decomposition) it contributes 0.02% of the encoder
         # gradient — the hard-loss path dominates ~4000x even when the head is
@@ -212,11 +220,15 @@ def anet_cfg(**overrides):
         # (60 vs 196 in the traced frame), so per-OBJECT it generated less loss
         # even at alpha 8 (60*8 < 196*4). 12 ~ per-object-balanced (4 * 196/60).
         class_alpha=[1.0, 12.0, 4.0],  # [background, mannequin, tent]
-        # v11 default "fp_tp": weighted per-class soft FP/TP ratio (ONE term,
-        # per image). Replaces focal_norm, which drove p(fg) 0.1->0.01 and
-        # collapsed the head to mann_r=0 — its background term crushed the
-        # foreground. fp_tp's +smooth numerator makes predict-nothing cost
-        # ~sum(weights) instead of 0, so collapse is no longer a fixed point.
+        # default "fp_tp": weighted per-class ratio of soft FP-RATE to soft
+        # RECALL (v12/D57 — both terms cell-count-normalized, batch-pooled, ONE
+        # bounded term). The v11 RAW-SUM form of this loss collapsed the head to
+        # mann_r=0: its FP was a sum over ~5000 bg cells vs TP over ~60 object
+        # cells, which (a) punished over-prediction ~100x harder than predicting
+        # nothing so the correction overshot into the all-background basin, and
+        # (b) let that basin's per-cell bg push out-vote recovery ~80:1. Rate-
+        # normalizing both terms makes over-predict and collapse cost the SAME
+        # (bounded ratio=1) and balances the recovery gradient. See losses.py.
         # Other modes are kept for v8 fine-tunes from good.pt (loss must match
         # what trained the checkpoint) and for ablation:
         #   "focal_norm" (D47), "balanced" (class-balanced Focal-Tversky over
@@ -224,14 +236,23 @@ def anet_cfg(**overrides):
         #   (legacy focal + separate Tversky). "metric_only" (D56): detection
         #   loss OFF — only proto_metric_loss trains, to PRETRAIN the embedding
         #   space; save last.pt then ANET_INIT_FROM=... fine-tune with fp_tp.
+        #   "center" (v12): object center-heatmap detector — center_focal_loss
+        #   (CenterNet penalty-reduced focal) over two INDEPENDENT per-class
+        #   sigmoids (mannequin, tent; no softmax competition) + offset_weight
+        #   * offset_l1 for the sub-cell (dx,dy) regression. Requires the
+        #   dataset built with center=True (adds heat/offset/reg_mask targets)
+        #   and arch="v12" (model returns a {"heat","offset"} dict, not a cell
+        #   tensor) — see trainer.py's loss_mode=="center" branch.
         #   ANET_LOSS_MODE overrides.
         loss_mode=os.environ.get("ANET_LOSS_MODE") or "fp_tp",
         # fp_tp per-class weights in index order (bg, mann, tent). The requested
         # prior: mannequin 0.8, tent 0.15, background 0.05.
         fp_tp_weights=(0.05, 0.8, 0.15),
-        # fp_tp Laplace smooth: one virtual cell. Sets the collapse-point
-        # gradient scale (~1/smooth) and the FP<->recall balance; 1.0 is stable.
-        fp_tp_smooth=1.0,
+        # fp_tp smooth (on the [0,1] rate/recall terms, v12): sets the collapse-
+        # point escape-gradient scale (~1/smooth) and the dynamic range
+        # (perfect = s/(1+s)). 0.1 -> perfect≈0.09 vs collapse=1.0, a strong
+        # escape gradient with wide range. (The v11 raw-sum form used 1.0.)
+        fp_tp_smooth=0.1,
         # metric-prototype head (D56): weight of proto_metric_loss added to the
         # detection loss. This is the per-cell discriminative signal (softmax
         # over distance-to-prototype) that makes the TRUE class win the argmax —

@@ -240,39 +240,63 @@ def focal_norm_loss(logits, target, gamma=2.0, class_weights=(1.0, 2.0, 1.0),
 
 
 def weighted_fp_tp_loss(logits, target, class_weights=(0.05, 0.8, 0.15),
-                        smooth=1.0, band=None):
-    """v11/D54 (supersedes focal_norm): a weighted per-class soft FP/TP ratio, one
-    smooth term, computed per image.
+                        smooth=0.1, band=None):
+    """v12/D57 (supersedes the v11 raw-sum form): a weighted per-class ratio of
+    the soft FALSE-POSITIVE RATE to the soft RECALL — one bounded term.
 
-        L      = sum_c  w_c * mean_image[ (FP_c + s) / (TP_c + s) ]
-        TP_c   = sum_cells p_c * g_c          (soft, p = softmax(logits))
-        FP_c   = sum_cells p_c * (1 - g_c)
+        L         = sum_c  w_c * (fp_rate_c + s) / (recall_c + s)
+        recall_c  = (sum p_c * g_c)     / (sum g_c)        # soft recall  in [0,1]
+        fp_rate_c = (sum p_c * (1-g_c)) / (sum (1-g_c))    # soft FP rate in [0,1]
+        p         = softmax(logits); the sums are POOLED over the whole batch.
 
-    class_weights are in index order (background, mannequin, tent); the
-    requested prior is (0.05, 0.8, 0.15) — mannequin dominates, background is a
-    near-inert 0.05 (its TP is ~5k cells/frame so the ratio is tiny regardless).
+    WHY THE v11 FORM COLLAPSED AND WHY THIS DOESN'T. v11 used RAW SUMS:
+    ratio = (FP+s)/(TP+s) with FP = sum p_c over the ~5000 background cells and
+    TP = sum p_c over the ~60 object cells of a frame. Two fatal asymmetries:
+      1. UNBOUNDED over-prediction. Lighting foreground everywhere makes FP a sum
+         over the whole grid while TP saturates at the ~60 object cells, so the
+         ratio blows up to ~80 — ~100x the ~1.0 cost of predicting NOTHING. So
+         descent treats any over-prediction excursion as a catastrophe and SLAMS
+         p(fg) down, overshooting the narrow correct band straight into the all-
+         background basin (observed: mann_r 1.0 at epoch 1 -> 0.0 at epoch 2,
+         train loss spiking 26 -> 65 as the LR warmup peaked).
+      2. IMBALANCED recovery. At the collapsed point the +s numerator gives a
+         nonzero up-gradient on the ~60 true cells (v11's anti-collapse claim),
+         but the SAME +s gives an equal PER-CELL down-gradient on the ~5000
+         background cells; summed, "keep p(fg)=0 everywhere" out-votes the
+         recovery ~80:1 through the shared encoder, so collapse is a stable
+         attractor (observed: mann_r pinned at 0.0 for 20+ epochs while the loss
+         kept falling — predict-nothing IS the raw-sum minimum).
+    The v11 docstring accounted for the SIGN of the collapse gradient but not its
+    class-count-imbalanced MAGNITUDE; +smooth never fixed the fg:bg imbalance.
 
-    WHY THE +s IN THE NUMERATOR (this is the anti-collapse property, and the
-    whole reason the model can escape predict-nothing): the bare ratio FP/TP is
-    0/0 at the all-background point and — worse — dL/dTP = -FP/(TP+s)^2 is ZERO
-    whenever FP=0, so a collapsed head feels no pull to raise recall and the
-    collapse is a stable fixed point (exactly the mann_r=0, p(fg)->0 failure).
-    With the +s, dL/dTP = -(FP+s)/(TP+s)^2 = -1/s at collapse — a real, nonzero
-    upward push on true-class cells — while dL/dFP = 1/(TP+s) = 1/s keeps the
-    symmetric false-positive push. So predicting nothing costs ~1.0 per active
-    class instead of 0, and the only way down is to put probability mass on the
-    right cells. The loss floor is therefore ~sum_c w_c (never exactly 0); that
-    is cosmetic — optimization only sees the gradient.
+    Normalizing EACH term by its own cell count fixes both by construction:
+      - BOUNDED: fp_rate, recall are both in [0,1], so predicting-everything
+        (fp_rate=recall=1 -> ratio=1) costs the SAME as predicting-nothing
+        (recall=0, fp_rate=0 -> ratio=1); a perfect frame costs s/(1+s). No
+        ~100x cliff remains for the correction to overshoot off of.
+      - BALANCED: at collapse dL/d(p on a true cell) = -w/(s*n_pos) and
+        dL/d(p on a bg cell) = +w/(s*n_neg). Because these are per-cell RATES the
+        aggregate up-push (over n_pos cells) equals the aggregate down-push (over
+        n_neg cells), while PER CELL the true-cell push is n_neg/n_pos (~80x)
+        stronger — so raising p(fg) exactly where an object sits wins locally.
+        The recovery gradient points OUT of collapse instead of into it.
 
-    Per-image mean (not batch-pooled): every frame weighs equally regardless of
-    how many object cells it holds, so a 3-cell worst-decile mannequin frame
-    pulls as hard as a 600-cell tent frame — the size bias that pins the rare
-    class is gone, and empty frames contribute a pure FP (precision) penalty
-    (TP=0 -> (FP+s)/s) cleanly separated from the recall push on object frames.
+    Batch-POOLED, not per-image: a frame that lacks class c must not contribute a
+    spurious recall=0 -> ratio≈1 that dilutes the frames that DO contain c (the
+    v11 per-image mean was ~90% empty-frame 1.0s for the rare mannequin, drowning
+    the real detection gradient). Pooling makes recall the soft fraction of ALL
+    class-c object mass in the batch that is lit, and fp_rate the soft fraction of
+    all non-c cells wrongly lit — rate-normalized, so neither a single frame nor
+    the sheer background count can dominate.
+
+    class_weights (background, mannequin, tent); the prior (0.05, 0.8, 0.15)
+    keeps mannequin dominant. smooth s sets the collapse-point gradient scale
+    (~1/s) and the dynamic range (perfect = s/(1+s)); 0.1 balances a strong
+    escape gradient against a wide range (perfect≈0.09 vs collapse=1.0).
 
     band (B, n_fg, H, W) bool: partial-coverage cells labeled background that
-    genuinely contain object — dropped from that foreground class's FP (a
-    prediction there is not a real false positive), matching the other losses.
+    genuinely contain object — dropped from that foreground class's FP (and from
+    its non-class count), matching the other losses.
     """
     assert len(class_weights) == logits.shape[1], \
         f"class_weights must have {logits.shape[1]} entries (bg, mann, tent)"
@@ -286,10 +310,11 @@ def weighted_fp_tp_loss(logits, target, class_weights=(0.05, 0.8, 0.15),
         notg = 1.0 - gc
         if band is not None and c != 0:            # own-class band cells aren't FP
             notg = notg * (1.0 - band[:, c - 1].float())
-        tp = (pc * gc).sum((1, 2))                 # (B,)
-        fp = (pc * notg).sum((1, 2))               # (B,)
-        ratio = (fp + smooth) / (tp + smooth)      # (B,)
-        total = total + w * ratio.mean()
+        n_pos = gc.sum().clamp_min(1.0)            # batch-pooled cell counts
+        n_neg = notg.sum().clamp_min(1.0)
+        recall = (pc * gc).sum() / n_pos           # soft recall  in [0,1]
+        fp_rate = (pc * notg).sum() / n_neg        # soft FP rate in [0,1]
+        total = total + w * (fp_rate + smooth) / (recall + smooth)
     return total
 
 
@@ -351,3 +376,65 @@ def distill_kl(logits, teacher_probs, temperature=2.0):
     soft = (teacher_probs.clamp_min(1e-9) ** (1.0 / t))
     soft = soft / soft.sum(1, keepdim=True)
     return F.kl_div(logp, soft, reduction="batchmean") * t * t
+
+
+def center_focal_loss(heat_logits, heat_target, alpha=2.0, beta=4.0):
+    """v12 (CenterNet, Law & Deng 2018): penalty-reduced pixel focal loss over
+    the two INDEPENDENT per-class heatmaps (mannequin ch0, tent ch1) — each
+    class gets its own sigmoid, so there is no softmax competition and a tent
+    peak can never eat a mannequin's gradient the way the v9 shared-softmax
+    grid did.
+
+    heat_logits, heat_target: (B, 2, 27, 48). heat_target is a Gaussian center
+    splat (peak 1.0 at each object's cell, max-merged across objects) rather
+    than a hard 0/1 mask — the Gaussian ring around a positive gets a REDUCED
+    (not zero) negative penalty via the (1-target)**beta term below, so a
+    near-miss prediction one cell off the true center is punished far more
+    gently than a prediction on the empty far side of the grid. That gradient
+    shaping is exactly what keeps a head from collapsing to predict-nothing on
+    a 27x48=1296-cell grid where a real object claims ~1 cell: a naive 0/1
+    focal loss would treat "off by one cell" and "off by the whole frame" as
+    equally wrong, so the safest local minimum is silence everywhere.
+
+        p        = sigmoid(heat_logits)                      # (B,2,27,48) in (0,1)
+        pos      = heat_target == 1.0                        # exact peak cells only
+        pos_loss = -(1-p)**alpha * log(p)              * pos       # hard on misses at the peak
+        neg_loss = -(1-heat_target)**beta * p**alpha * log(1-p) * (1-pos)  # soft elsewhere
+        loss     = (pos_loss.sum() + neg_loss.sum()) / n_pos
+
+    alpha modulates BOTH terms like standard focal (down-weight already-easy
+    pixels, hard or soft); beta shapes how fast the negative penalty ramps up
+    with distance from a true center via the Gaussian target value — near-peak
+    cells (target near 1) are barely penalized for being non-zero, far cells
+    (target near 0) get the full negative push. Normalizing by n_pos (count of
+    EXACT peak cells, not all Gaussian-lit cells) keeps the loss on the scale
+    of "average cost per real object" regardless of how many objects a frame
+    has, so a 1-object and a 20-object frame contribute comparable gradient
+    magnitude per object -- the same size-invariance rationale as
+    focal_norm_loss's per-class normalization, applied per-object instead of
+    per-class."""
+    p = torch.sigmoid(heat_logits.float())
+    eps = 1e-6
+    pos = (heat_target == 1.0).float()
+    pos_loss = -((1 - p).clamp_min(eps) ** alpha) * torch.log(p.clamp_min(eps)) * pos
+    neg_loss = -((1 - heat_target) ** beta) * (p ** alpha) * torch.log((1 - p).clamp_min(eps)) * (1 - pos)
+    n_pos = pos.sum().clamp_min(1.0)
+    return (pos_loss.sum() + neg_loss.sum()) / n_pos
+
+
+def offset_l1(off_logits, off_target, mask):
+    """v12 sub-pixel regression: L1 between the sigmoid-squashed (dx,dy) offset
+    prediction and the true fractional offset within the object's center cell,
+    masked to ONLY the exact center cells (reg_mask) so the network never
+    receives an offset gradient from a cell that has no object to regress —
+    the Gaussian heatmap target intentionally lights up neighbor cells for
+    classification purposes, but they have no defined dx/dy, so leaking them
+    into this loss would train the head toward a meaningless averaged offset.
+
+    off_logits, off_target: (B, 2, 27, 48); mask: (B, 1, 27, 48) broadcasts
+    over both offset channels. Sigmoid (not raw logits) keeps the prediction
+    bounded to [0,1) — exactly the domain of a fractional in-cell offset,
+    matching the deploy-legal bounded-activation convention used throughout
+    the head (see CenterHead / RegionHeadV9's Tanh output)."""
+    p = torch.sigmoid(off_logits.float())
+    return (F.l1_loss(p, off_target, reduction="none") * mask).sum() / mask.sum().clamp_min(1.0)

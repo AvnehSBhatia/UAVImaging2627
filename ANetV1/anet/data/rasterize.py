@@ -11,6 +11,9 @@ CANVAS_W, CANVAS_H = 960, 540
 GRID_W, GRID_H = 96, 54
 N_CLASSES = 2  # mannequin, tent (background handled as class 0 in grids)
 
+# v12 center-heatmap grid: single-phase stride-20 windows (540//20, 960//20).
+V12_H, V12_W = 27, 48
+
 
 def letterbox_params(w0, h0, tw=CANVAS_W, th=CANVAS_H):
     """Scale-to-fit + center pad. Synthetic 1920x1080 -> scale 0.5, no pad."""
@@ -120,6 +123,57 @@ def boxes_to_soft_grid(boxes_conf, coverage_thresh=0.0):
     p[1:] *= scale
     p[0] = 1.0 - p[1:].sum(0)
     return p
+
+
+def boxes_to_heatmap(boxes, sigma=0.7):
+    """v12 object-center targets on the 27x48 stride-20 grid (CenterNet-style).
+
+    Same class convention as boxes_to_grid: box[0]==0 -> mannequin (heat
+    channel 0), box[0]==1 -> tent (heat channel 1) — i.e. channel == class,
+    where boxes_to_grid's hard label would be class+1.
+
+    Returns
+    -------
+    heat     : (2, V12_H, V12_W) float32 — per-class Gaussian center splat,
+               MAX-merged across every object of that class. Peak 1.0 at each
+               object's own center cell; neighbors filled by
+               exp(-((dr**2+dc**2)/(2*sigma**2))).
+    offset   : (2, V12_H, V12_W) float32 — [dx,dy] sub-cell offset written at
+               each object's center cell only, class-agnostic (channel
+               0=dx, 1=dy). Zero everywhere else.
+    reg_mask : (1, V12_H, V12_W) float32 — 1.0 at object-center cells, else 0.
+
+    Coordinate convention: fx=cx*V12_W, fy=cy*V12_H; col=floor(fx),
+    row=floor(fy) (clamped into the grid); dx=fx-col, dy=fy-row in [0,1).
+    Recover: cx=(col+dx)/V12_W, cy=(row+dy)/V12_H.
+    """
+    heat = np.zeros((N_CLASSES, V12_H, V12_W), np.float32)
+    offset = np.zeros((2, V12_H, V12_W), np.float32)
+    reg_mask = np.zeros((1, V12_H, V12_W), np.float32)
+    # 5x5 splat window: exp(-4/(2*0.7^2)) ~= 0.02 at the corner, negligible
+    # beyond radius 2 for the sigma~0.7 cell the spec calls for.
+    radius = 2
+    for box in boxes:
+        k = int(box[0])
+        _, cx, cy, w, h = box
+        if k not in (0, 1) or w <= 0 or h <= 0:
+            continue  # skip -1-padded rows and degenerate boxes
+        fx, fy = cx * V12_W, cy * V12_H
+        col = min(max(int(np.floor(fx)), 0), V12_W - 1)
+        row = min(max(int(np.floor(fy)), 0), V12_H - 1)
+        dx = min(max(fx - col, 0.0), 1.0 - 1e-6)
+        dy = min(max(fy - row, 0.0), 1.0 - 1e-6)
+
+        r0, r1 = max(row - radius, 0), min(row + radius + 1, V12_H)
+        c0, c1 = max(col - radius, 0), min(col + radius + 1, V12_W)
+        rr, cc = np.mgrid[r0:r1, c0:c1]
+        g = np.exp(-((rr - row) ** 2 + (cc - col) ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
+        heat[k, r0:r1, c0:c1] = np.maximum(heat[k, r0:r1, c0:c1], g)
+
+        offset[0, row, col] = dx
+        offset[1, row, col] = dy
+        reg_mask[0, row, col] = 1.0
+    return heat, offset, reg_mask
 
 
 def box_footprint_cells(box, coverage_thresh=0.05):

@@ -119,3 +119,90 @@ class ObjectMetrics:
             sum(r[2] for r in decile) / len(decile) if decile else float("nan")
         )
         return out
+
+
+# v12 center-heatmap grid — stride-20 single-phase, distinct from the v8/v9
+# 54x96 overlap grid above (GRID_H/GRID_W). Kept local to avoid conflating
+# the two conventions.
+V12_H, V12_W = 27, 48
+
+
+class CenterObjectMetrics:
+    """Object-level recall/FP for the v12 center-heatmap head. Peaks are
+    3x3 local maxima of the per-class sigmoid heatmap above `peak_thresh`;
+    each surviving peak's (row,col) is de-quantized by the class-agnostic
+    offset head to a canvas-normalized (cx,cy) and matched against GT boxes
+    of the same class by point-in-box containment. summary() mirrors
+    ObjectMetrics.summary()'s key names so trainer best.pt selection
+    (`mannequin_synth + 0.5*tent`) is unchanged whichever head is active."""
+
+    def __init__(self, peak_thresh=0.3):
+        self.peak_thresh = peak_thresh
+        self.records = []  # (cls, area, found, is_vd) — cls: 1=mannequin, 2=tent
+        self.fp_components = 0
+        self.images = 0
+
+    @staticmethod
+    def _to_numpy(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    @staticmethod
+    def _find_peaks(prob, thresh):
+        """(H,W) prob -> (rows, cols) of cells that are >thresh and >= every
+        neighbor in their 3x3 window (self included, so plateaus/ties all
+        fire — matches CenterNet-style NMS-free peak picking)."""
+        h, w = prob.shape
+        padded = np.full((h + 2, w + 2), -np.inf, dtype=prob.dtype)
+        padded[1:-1, 1:-1] = prob
+        local_max = np.full_like(prob, -np.inf)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                local_max = np.maximum(local_max, padded[1 + dr:1 + dr + h, 1 + dc:1 + dc + w])
+        mask = (prob > thresh) & (prob >= local_max)
+        return np.where(mask)
+
+    def update(self, heat_prob, offset_prob, boxes, is_vd):
+        """heat_prob/offset_prob (2,27,48) sigmoid probs; boxes (N,5)
+        canvas-normalized [cls,cx,cy,w,h], -1 padded."""
+        heat_prob = self._to_numpy(heat_prob)
+        offset_prob = self._to_numpy(offset_prob)
+        self.images += 1
+        for c in range(2):  # 0=mannequin, 1=tent
+            rows, cols = self._find_peaks(heat_prob[c], self.peak_thresh)
+            dx = offset_prob[0, rows, cols]
+            dy = offset_prob[1, rows, cols]
+            cx = (cols + dx) / V12_W
+            cy = (rows + dy) / V12_H
+            matched = np.zeros(len(rows), dtype=bool)
+            for box in boxes:
+                if box[0] < 0 or int(box[0]) != c:
+                    continue
+                bx, by, bw, bh = float(box[1]), float(box[2]), float(box[3]), float(box[4])
+                inside = ((cx >= bx - bw / 2) & (cx <= bx + bw / 2)
+                          & (cy >= by - bh / 2) & (cy <= by + bh / 2))
+                found = bool(inside.any())
+                matched |= inside
+                self.records.append((c + 1, bw * bh, found, bool(is_vd)))
+            self.fp_components += int((~matched).sum())
+
+    def summary(self):
+        out = {"fp_per_image": self.fp_components / max(self.images, 1)}
+        recs = self.records
+        for k, name in ((1, "mannequin"), (2, "tent")):
+            sub = [r for r in recs if r[0] == k]
+            out[f"{name}_recall"] = (
+                sum(r[2] for r in sub) / len(sub) if sub else float("nan")
+            )
+        for name, cond in (("synthetic", lambda r: not r[3]), ("visdrone", lambda r: r[3])):
+            sub = [r for r in recs if r[0] == 1 and cond(r)]
+            out[f"mannequin_recall_{name}"] = (
+                sum(r[2] for r in sub) / len(sub) if sub else float("nan")
+            )
+        m = sorted((r for r in recs if r[0] == 1), key=lambda r: r[1])
+        decile = m[: max(len(m) // 10, 1)]
+        out["mannequin_recall_smallest_decile"] = (
+            sum(r[2] for r in decile) / len(decile) if decile else float("nan")
+        )
+        return out

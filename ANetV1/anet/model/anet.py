@@ -7,7 +7,7 @@ from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
 from .globalmix import GlobalCosineMix
-from .head import RegionHead, RegionHeadV9, prior_bias_
+from .head import CenterHead, RegionHead, RegionHeadV9, prior_bias_
 from .neck import ConvNeck
 from .pyramid import GatedGlobalPool, ScalarKernelPool
 from .tile_encoder import TileEncoder
@@ -34,9 +34,16 @@ class ANetV1(nn.Module):
                  neck_rounds=2, head_width=24, aux_head=False, head_proto=True):
         super().__init__()
         self.prior_fg = prior_fg
-        self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
-        self.nw = (self.IMG_W - self.WIN) // self.STRIDE + 1  # 95
-        self.n_win = self.nh * self.nw  # 5035
+        if arch == "v12":
+            # v12 stage 1 is single-phase, non-overlapping stride-20 windows
+            # (no 4x phase overlap): one cell per 20x20 tile, exactly matching
+            # the center-heatmap grid rasterize.py builds (V12_H=27, V12_W=48).
+            self.nh = self.IMG_H // self.WIN  # 27
+            self.nw = self.IMG_W // self.WIN  # 48
+        else:
+            self.nh = (self.IMG_H - self.WIN) // self.STRIDE + 1  # 53
+            self.nw = (self.IMG_W - self.WIN) // self.STRIDE + 1  # 95
+        self.n_win = self.nh * self.nw  # 5035 (v8/v9) / 1296 (v12)
         self.use_checkpoint = use_checkpoint
         self.dense = dense
         self.arch = arch
@@ -115,8 +122,27 @@ class ANetV1(nn.Module):
             self.globals_ = nn.ModuleList([GatedGlobalPool(dim=d) for _ in range(3)])  # unshared (D28)
             self.mix = GlobalCosineMix(pad_to=d)
             self.head = RegionHead(dim=d, prior_fg=prior_fg)
+        elif arch == "v12":
+            # object center-heatmap detector (see workflow spec / planned
+            # ARCHITECTURE.md delta): same Stage-1 encoder/neck/Path-A/context
+            # as v9, but single-phase stride-20 (no 4x overlap, D-something
+            # TBD) and a CenterHead readout instead of RegionHeadV9's per-cell
+            # classifier — no aux probe, no metric-prototype path.
+            self.encoder = TileEncoder(hidden=hidden, h1=h1, in_dim=self.in_dim)
+            self.neck = ConvNeck(d, rounds=neck_rounds)
+            self.pools = nn.ModuleList(
+                [ScalarKernelPool(d, k, per_channel=path_a_per_channel)
+                 for k in (3, 7, 11)]
+            )
+            self.path_dq = nn.ModuleList([nn.Conv2d(d, d, 1) for _ in range(3)])
+            with torch.no_grad():
+                for conv in self.path_dq:
+                    conv.weight.copy_(torch.eye(d).reshape(d, d, 1, 1))
+                    conv.bias.zero_()
+            self.context = SlimContext(d)
+            self.head = CenterHead(dim=d, width=head_width, prior_fg=prior_fg)
         else:
-            raise ValueError(f"unknown arch {arch!r} (v8|v9)")
+            raise ValueError(f"unknown arch {arch!r} (v8|v9|v12)")
 
         # window-relative pixel coords, row-major to match F.unfold token order
         r = torch.arange(self.WIN, dtype=torch.float32)
@@ -129,18 +155,25 @@ class ANetV1(nn.Module):
         reps_h = self.IMG_H // self.WIN
         reps_w = self.IMG_W // self.WIN
         self.register_buffer("uv_tile", tile.repeat(1, reps_h, reps_w).unsqueeze(0))
-        # global window centers (== mean of the center-4 pixels, D4)
+        # global window centers (== mean of the center-4 pixels, D4). v12 uses
+        # non-overlapping stride-20 windows (self.nh/nw already 27/48 above),
+        # so its centers are (c*20+10)/960, (r*20+10)/540 — same formula with
+        # STRIDE replaced by WIN (the effective stride). v8/v9 keep the
+        # overlapping stride-10 53x95 grid; the two never coexist on one
+        # instance (arch is fixed at construction), so "xy_map" is safe to
+        # reuse for either shape.
         jj = torch.arange(self.nh, dtype=torch.float32)
         ii = torch.arange(self.nw, dtype=torch.float32)
         y, x = torch.meshgrid(jj, ii, indexing="ij")
+        eff_stride = self.WIN if arch == "v12" else self.STRIDE
         xy = torch.stack(
             [
-                (x * self.STRIDE + self.WIN / 2) / self.IMG_W,
-                (y * self.STRIDE + self.WIN / 2) / self.IMG_H,
+                (x * eff_stride + self.WIN / 2) / self.IMG_W,
+                (y * eff_stride + self.WIN / 2) / self.IMG_H,
             ],
             -1,
         )
-        self.register_buffer("xy_map", xy.permute(2, 0, 1).unsqueeze(0))  # (1,2,53,95)
+        self.register_buffer("xy_map", xy.permute(2, 0, 1).unsqueeze(0))  # (1,2,53,95) v8/v9, (1,2,27,48) v12
         # overlap counts for exact cell averaging (1/2/4 corners/edges/interior)
         ones = torch.ones(1, 1, self.nh, self.nw)
         self.register_buffer("cell_counts", F.conv_transpose2d(ones, torch.ones(1, 1, 2, 2)))
@@ -150,12 +183,19 @@ class ANetV1(nn.Module):
     def from_state_dict(cls, sd, **kwargs):
         """Rebuild a model with arch/hidden/stem/Path-A inferred from checkpoint
         shapes (v8 pre/post-D37 checkpoints and v9 checkpoints all load)."""
-        if any(k.startswith("neck.") for k in sd):  # v9 signature
+        if any(k.startswith("neck.") for k in sd):  # v9 or v12 signature
             stem = "edge_dq4" if any(k.startswith("stem_mod.dq_in.") for k in sd) \
                 else ("edge_dq" if any(k.startswith("stem_mod.") for k in sd)
                       else "highpass")
+            # v12's CenterHead has fc1/fc2 like RegionHeadV9(proto=False) but
+            # NO prototypes and fc2 projects to exactly 4 outputs (center_mann,
+            # center_tent, dx, dy) instead of 3 class logits — that's the only
+            # shape signature distinguishing the two once "neck." is present.
+            is_v12 = "head.fc2.weight" in sd \
+                and sd["head.fc2.weight"].shape[0] == 4 \
+                and "head.prototypes" not in sd
             model = cls(
-                arch="v9", stem=stem,
+                arch="v12" if is_v12 else "v9", stem=stem,
                 hidden=sd["encoder.fc2.weight"].shape[0],
                 h1=sd["encoder.fc1.weight"].shape[0],
                 neck_rounds=sum(1 for k in sd if k.startswith("neck.dw.")
@@ -329,8 +369,41 @@ class ANetV1(nn.Module):
         cells = F.conv_transpose2d(wlogits, self.cell_kernel.to(wlogits.dtype), groups=3)
         return cells / self.cell_counts.to(wlogits.dtype)
 
+    # ------------------------------------------------------------------ v12
+    def _embed_map_v12(self, feat):  # (B,feat,540,960) -> (B,hidden,27,48)
+        # single-phase (no 4x overlap, no _phase_batch/_interleave): stage 1's
+        # pool_features_dense already tiles in non-overlapping 20x20 windows
+        # via its internal avg_pool2d(..., GRID=20), so the full 540x960 frame
+        # maps straight to the 27x48 window grid in one encoder pass.
+        b = feat.shape[0]
+        uv = self.uv_tile.to(feat.dtype).expand(b, -1, -1, -1)
+        x = torch.cat([feat, uv], 1)
+        pooled = self.encoder.pool_features_dense(
+            x, ckpt=self.use_checkpoint and self.training)  # (B, h1, 27, 48)
+        return self.encoder.embed(pooled)  # (B, hidden, 27, 48)
+
+    def _tail_v12(self, m_emb):  # (B,hidden,27,48) -> {"heat","offset"} dict
+        b = m_emb.shape[0]
+        m0 = torch.cat([m_emb, self.xy_map.to(m_emb.dtype).expand(b, -1, -1, -1)], 1)
+        m = self.neck(m0)
+        maps = [dq(p(m)) for p, dq in zip(self.pools, self.path_dq)]
+        ctx = self.context(maps)  # (B, d)
+        emb = m.flatten(2).permute(0, 2, 1)  # (B, W, d)
+        own = emb.unsqueeze(2)
+        local = torch.stack([mp.flatten(2).permute(0, 2, 1) for mp in maps], 2)
+        ltoks = torch.cat([own, local], 2)  # (B, W, 4, d), W = 27*48 = 1296
+        out = self.head(ltoks, ctx)  # (B, W, 4): [center_mann, center_tent, dx, dy]
+        out = out.permute(0, 2, 1).reshape(b, 4, self.nh, self.nw)
+        # both train and eval return the same dict: the loss/metrics side
+        # (center_focal_loss/offset_l1, CenterObjectMetrics) always wants raw
+        # heat + offset logits, no cell-average step (v12 predicts at the
+        # native 27x48 window grid, not an overlap-averaged pixel-cell grid)
+        return {"heat": out[:, 0:2], "offset": out[:, 2:4]}
+
     def forward(self, img):
         feat = self._features(img)
+        if self.arch == "v12":
+            return self._tail_v12(self._embed_map_v12(feat))
         if self.arch == "v9":
             return self._tail_v9(self._embed_map_v9(feat))
         if self.dense:
@@ -343,7 +416,7 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
-        if self.arch == "v9":
+        if self.arch in ("v9", "v12"):
             l2 = self.encoder.reg_l2() + self.context.reg_l2() + self.head.reg_l2()
         else:
             l2 = self.encoder.reg_l2() + self.mix.reg_l2() + self.head.reg_l2()

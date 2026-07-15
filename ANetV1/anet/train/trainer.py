@@ -51,10 +51,11 @@ class _Heartbeat:
             self._th.join(timeout=0.2)
 
 from ..model.norm import apply_norm_updates
-from .losses import (balanced_tversky_loss, distill_kl, focal_loss,
-                     focal_norm_loss, focal_tversky_loss, proto_metric_loss,
-                     tversky_loss, weighted_fp_tp_loss)
-from .metrics import CellConfusion, ObjectMetrics, confident_pred
+from .losses import (balanced_tversky_loss, center_focal_loss, distill_kl,
+                     focal_loss, focal_norm_loss, focal_tversky_loss,
+                     offset_l1, proto_metric_loss, tversky_loss,
+                     weighted_fp_tp_loss)
+from .metrics import CellConfusion, CenterObjectMetrics, ObjectMetrics, confident_pred
 
 
 class ModelEMA:
@@ -501,19 +502,41 @@ class Trainer:
                    if self.distill else None)
         band = (batch["band"].to(self.device, non_blocking=True)
                 if "band" in batch else None)
+        # v12 center-heatmap targets (present only when the dataset was built
+        # with center=True) — move to device alongside img/grid so both the
+        # eager and compiled call sites see plain device tensors.
+        heat = (batch["heat"].to(self.device, non_blocking=True)
+                if "heat" in batch else None)
+        offset = (batch["offset"].to(self.device, non_blocking=True)
+                  if "offset" in batch else None)
+        reg_mask = (batch["reg_mask"].to(self.device, non_blocking=True)
+                    if "reg_mask" in batch else None)
         if not self._compiled:  # eager: no fallback needed
-            return self._loss_fn(img, grid, teacher, band)
+            return self._loss_fn(img, grid, teacher, band, heat, offset, reg_mask)
         try:  # lazy compilation happens on the FIRST call — catch + degrade here
-            return self._loss_fn(img, grid, teacher, band)
+            return self._loss_fn(img, grid, teacher, band, heat, offset, reg_mask)
         except Exception as e:
             print(f"torch.compile failed at first step ({type(e).__name__}: {e}) — "
                   "falling back to eager for the rest of training", flush=True)
             self._loss_fn = self._loss_tensors
             self.model_eval = self.model
             self._compiled = False
-            return self._loss_fn(img, grid, teacher, band)
+            return self._loss_fn(img, grid, teacher, band, heat, offset, reg_mask)
 
-    def _loss_tensors(self, img, grid, teacher=None, band=None):
+    def _loss_tensors(self, img, grid, teacher=None, band=None,
+                       heat=None, offset=None, reg_mask=None):
+        c = self.cfg.train
+        if getattr(c, "loss_mode", "combo") == "center":
+            # v12: object center-heatmap detector. Independent per-class
+            # sigmoids (mannequin ch0, tent ch1) — NO softmax competition — so
+            # a frame with both classes present doesn't force them to fight
+            # for probability mass the way the v8/v9 cell softmax does.
+            out = self.model(self._prep_img(img))  # {"heat":(B,2,27,48),"offset":(B,2,27,48)} raw logits
+            loss = center_focal_loss(out["heat"], heat,
+                                     alpha=c.center_alpha, beta=c.center_beta) + \
+                c.offset_weight * offset_l1(out["offset"], offset, reg_mask)
+            l2, l1 = self.model.reg_losses()
+            return loss + c.l2_score_reg * l2 + c.l1_kernel_reg * l1
         out = self.model(self._prep_img(img))
         # v9 training returns {cells, aux, z}; older paths a tensor or (cells,aux)
         if isinstance(out, dict):
@@ -522,7 +545,6 @@ class Trainer:
             cells, aux, zmap = out[0], out[1], None
         else:
             cells, aux, zmap = out, None, None
-        c = self.cfg.train
         ta = getattr(c, "tversky_alpha", 0.7)
         tb = getattr(c, "tversky_beta", 0.3)
         smooth = getattr(c, "ft_smooth", 1.0)
@@ -789,11 +811,16 @@ class Trainer:
                        stats["fp_per_image"], round(time.time() - t0)]
                 with open(log_path, "a", newline="") as f:
                     csv.writer(f).writerow(row)
-                mc = stats["cells"]["mannequin"]
+                # v12 center-heatmap eval carries no per-cell confusion table
+                # (CenterObjectMetrics is peak/object-only) — "cells" is simply
+                # absent from stats in that mode, so every cell-precision-based
+                # print/guard below must degrade instead of KeyError'ing.
+                mc = stats.get("cells", {}).get("mannequin") if "cells" in stats else None
                 print(f"epoch {epoch}: loss={row[1]:.4f} mannequin_r={mann:.3f} "
                       f"(synth {stats['mannequin_recall_synthetic']:.3f}, "
-                      f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
-                      f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
+                      + (f"cell_r={mc['recall']:.3f}, pred_cells={mc['pred_cells']}/{mc['gt_cells']}) "
+                         if mc is not None else "peak-based, no cell table) ")
+                      + f"tent_r={stats['tent_recall']:.3f} fp/img={stats['fp_per_image']:.2f} "
                       f"sel={key:.3f} lr={self.opt.param_groups[0]['lr']:.2e} ({row[-1]}s)")
                 # threshold-free progress: if these climb while mannequin_r stays 0,
                 # the model IS learning under the argmax/conf_thresh bar (not stuck)
@@ -803,8 +830,18 @@ class Trainer:
                 state = getattr(self.model, "_orig_mod", self.model).state_dict()
                 torch.save(state, self.out_dir / "last.pt")
                 # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
-                # -1.0 sentinel, which is how a NaN model got saved as best once)
-                improved = math.isfinite(row[1]) and key > self.best
+                # -1.0 sentinel, which is how a NaN model got saved as best once);
+                # nor a degenerate over-predictor — lighting foreground almost
+                # everywhere maxes OBJECT recall (every GT is "covered") and even
+                # keeps object fp/img low (the fg sea merges into GT-touching
+                # blobs), so sel hit 1.0 and froze best.pt at the epoch-1 all-fg
+                # model. Its CELL precision gives it away (~0.003); a real detector
+                # clears 0.02 trivially, only the fg-everywhere pathology sits below.
+                # The center head has no cell-precision signal at all (peak-based
+                # metrics only), so the degenerate guard simply doesn't apply —
+                # over-prediction there shows up directly as fp_per_image instead.
+                degenerate = mc["precision"] < 0.02 if mc is not None else False
+                improved = math.isfinite(row[1]) and key > self.best and not degenerate
                 if improved:
                     self.best, stale = key, 0
                     torch.save(state, self.out_dir / "best.pt")
@@ -826,7 +863,54 @@ class Trainer:
             # it hands blocks back to the driver, stalling the next epoch's first steps
 
     @torch.no_grad()
+    def _evaluate_center(self, loader, desc="eval"):
+        """v12 eval: the model returns a dict of raw {heat, offset} logits, not
+        a per-cell class tensor, so this path bypasses CellConfusion/ObjectMetrics
+        entirely (peak-based CenterObjectMetrics instead) and returns a stats
+        dict WITHOUT a "cells" key — train() degrades its cell-precision prints
+        accordingly."""
+        self.model.eval()
+        peak_thresh = getattr(self.cfg.train, "peak_thresh", 0.3)
+        obj_m = CenterObjectMetrics(peak_thresh=peak_thresh)
+        # threshold-free soft signal, center-mode equivalent of the cell softmax
+        # version below: mean sigmoid(heat) at the GT PEAK cells (target==1.0)
+        # for each class, so it moves before a peak crosses peak_thresh.
+        soft_sum = {0: 0.0, 1: 0.0}
+        soft_n = {0: 0, 1: 0}
+        argmax_fg = 0  # total 3x3-local-max peak count across both classes/images
+        for batch in tqdm(loader, desc=desc, unit="batch",
+                          dynamic_ncols=True, leave=False):
+            img = self._prep_img(batch["image"].to(self.device, non_blocking=True))
+            with self._autocast():
+                out = self.model_eval(img)
+            hp = torch.sigmoid(out["heat"]).float()
+            op = torch.sigmoid(out["offset"]).float()
+            heat_t = batch.get("heat")
+            if heat_t is not None:
+                heat_t = heat_t.to(hp.device)
+                for c in (0, 1):
+                    m = heat_t[:, c] == 1.0
+                    soft_sum[c] += float(hp[:, c][m].sum()) if m.any() else 0.0
+                    soft_n[c] += int(m.sum())
+            hp_np, op_np = hp.cpu().numpy(), op.cpu().numpy()
+            for i in range(hp_np.shape[0]):
+                obj_m.update(hp_np[i], op_np[i], batch["boxes"][i].numpy(),
+                            bool(batch["vd"][i]))
+                for c in range(2):
+                    rows, _ = CenterObjectMetrics._find_peaks(hp_np[i, c], peak_thresh)
+                    argmax_fg += len(rows)
+        out = obj_m.summary()
+        # 0.0 (not NaN) when the loader never supplied "heat" targets (dataset
+        # built with center=False) — matches the spec's "if available else 0.0".
+        out["soft_mann"] = soft_sum[0] / soft_n[0] if soft_n[0] else 0.0
+        out["soft_tent"] = soft_sum[1] / soft_n[1] if soft_n[1] else 0.0
+        out["argmax_fg"] = argmax_fg
+        return out
+
+    @torch.no_grad()
     def evaluate(self, loader, desc="eval"):
+        if getattr(self.cfg.train, "loss_mode", "combo") == "center":
+            return self._evaluate_center(loader, desc)
         self.model.eval()
         cells_m, obj_m = CellConfusion(), ObjectMetrics()
         thresh = getattr(self.cfg.train, "conf_thresh", 0.0) or 0.0
