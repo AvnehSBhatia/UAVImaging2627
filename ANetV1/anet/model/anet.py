@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -141,6 +143,21 @@ class ANetV1(nn.Module):
                     conv.bias.zero_()
             self.context = SlimContext(d)
             self.head = CenterHead(dim=d, width=head_width, prior_fg=prior_fg)
+            # train-only DEEP SUPERVISION (v12): a 1x1 conv center-heatmap probe
+            # straight off the encoder embedding map, BEFORE the deep neck/Path-A/
+            # context/Tanh head. Pinpoint diagnostic: at init the encoder ranks the
+            # true object windows most-distinct but the separation is tiny (~0.05
+            # in the normalized embedding), so the deep head gets almost no signal
+            # to amplify and training crawls into a constant-output basin. This
+            # short probe gives the ENCODER a direct center_focal gradient to
+            # AMPLIFY that object-vs-background separation, so the main head then
+            # has a strong signal. ~66 params, dropped at eval/export (only the
+            # training forward reads it), so the deploy graph is unchanged.
+            self.aux_center = nn.Conv2d(hidden, 2, 1)
+            if prior_fg:
+                with torch.no_grad():
+                    self.aux_center.bias.fill_(
+                        math.log(prior_fg / max(1.0 - prior_fg, 1e-6)))
         else:
             raise ValueError(f"unknown arch {arch!r} (v8|v9|v12)")
 
@@ -394,11 +411,15 @@ class ANetV1(nn.Module):
         ltoks = torch.cat([own, local], 2)  # (B, W, 4, d), W = 27*48 = 1296
         out = self.head(ltoks, ctx)  # (B, W, 4): [center_mann, center_tent, dx, dy]
         out = out.permute(0, 2, 1).reshape(b, 4, self.nh, self.nw)
-        # both train and eval return the same dict: the loss/metrics side
+        # both train and eval return the same heat/offset: the loss/metrics side
         # (center_focal_loss/offset_l1, CenterObjectMetrics) always wants raw
         # heat + offset logits, no cell-average step (v12 predicts at the
         # native 27x48 window grid, not an overlap-averaged pixel-cell grid)
-        return {"heat": out[:, 0:2], "offset": out[:, 2:4]}
+        result = {"heat": out[:, 0:2], "offset": out[:, 2:4]}
+        # train-only deep-supervision probe on the raw embedding map (see __init__)
+        if self.training and getattr(self, "aux_center", None) is not None:
+            result["aux_heat"] = self.aux_center(m_emb)  # (B, 2, 27, 48)
+        return result
 
     def forward(self, img):
         feat = self._features(img)

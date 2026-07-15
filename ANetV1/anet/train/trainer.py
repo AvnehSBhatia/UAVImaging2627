@@ -535,6 +535,15 @@ class Trainer:
             loss = center_focal_loss(out["heat"], heat,
                                      alpha=c.center_alpha, beta=c.center_beta) + \
                 c.offset_weight * offset_l1(out["offset"], offset, reg_mask)
+            # deep supervision (v12): a direct center_focal gradient on the
+            # encoder-embedding probe (out["aux_heat"], train-only) forces the
+            # encoder to amplify object-vs-background separation instead of
+            # relying on the deep head to extract it from a ~0.05 signal (the
+            # measured constant-output stall). Weight 0 disables.
+            aw = getattr(c, "center_aux_weight", 0.0) or 0.0
+            if aw and "aux_heat" in out:
+                loss = loss + aw * center_focal_loss(
+                    out["aux_heat"], heat, alpha=c.center_alpha, beta=c.center_beta)
             l2, l1 = self.model.reg_losses()
             return loss + c.l2_score_reg * l2 + c.l1_kernel_reg * l1
         out = self.model(self._prep_img(img))

@@ -142,6 +142,14 @@ def anet_cfg(**overrides):
         center_alpha=2.0,             # center_focal_loss positive-term focusing power
         center_beta=4.0,              # center_focal_loss negative-penalty falloff around a peak
         offset_weight=1.0,            # weight of offset_l1 relative to center_focal_loss
+        # v12 DEEP SUPERVISION: weight of a center_focal probe straight off the
+        # encoder embedding map (ANetV1.aux_center, train-only). The pinpoint
+        # diagnostic showed the encoder gives the deep head only a ~0.05 object
+        # signal at init, so training stalled at constant output; this direct
+        # gradient forces the encoder to amplify that separation. 1.0 = full
+        # weight (the encoder is the bottleneck); 0 disables. ANET_AUX_W overrides.
+        center_aux_weight=float(os.environ["ANET_AUX_W"]) if "ANET_AUX_W" in os.environ
+        else 1.0,
         peak_thresh=0.3,              # eval-time 3x3-local-max heatmap threshold (CenterObjectMetrics)
         center_sigma=0.7,             # Gaussian splat sigma (cells) for the heat target (rasterize.py)
         # aux deep-supervision probe (D46): DROPPED in v10. Measured (single

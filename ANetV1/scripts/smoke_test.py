@@ -163,6 +163,9 @@ def v12_checks():
     reg_mask = torch.zeros(2, 1, 27, 48)
     reg_mask[:, 0, 5, 5] = 1.0
     loss = center_focal_loss(out["heat"], heat_t) + offset_l1(out["offset"], offset_t, reg_mask)
+    # train-only deep-supervision probe (exercises aux_center's gradient path)
+    if "aux_heat" in out:
+        loss = loss + center_focal_loss(out["aux_heat"], heat_t)
     l2, l1 = m.reg_losses()
     (loss + 1e-4 * (l2 + l1)).backward()
     missing = [k for k, p in m.named_parameters() if p.grad is None]
