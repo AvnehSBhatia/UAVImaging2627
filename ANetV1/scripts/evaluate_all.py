@@ -21,7 +21,8 @@ from anet import ANetV1  # noqa: E402
 from anet.train.presets import anet_cfg  # noqa: E402
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.data.rasterize import boxes_to_grid, transform_boxes  # noqa: E402
-from anet.train.metrics import CellConfusion, ObjectMetrics, confident_pred  # noqa: E402
+from anet.train.metrics import (CellConfusion, CenterObjectMetrics,  # noqa: E402
+                                ObjectMetrics, confident_pred)
 from anet.train.trainer import pick_device, yolo_device  # noqa: E402
 
 
@@ -75,10 +76,25 @@ def _load_anet(ckpt, device):
     return model
 
 
-def eval_anet(ckpt, ds, device, conf_thresh=0.0):
+def eval_anet(ckpt, ds, device, conf_thresh=0.0, peak_thresh=0.3):
     model = _load_anet(ckpt, device)
-    cells_m, obj_m = CellConfusion(), ObjectMetrics()
     loader = DataLoader(ds, batch_size=4, num_workers=4)
+    if model.arch in ("v12", "v13"):
+        # center-heatmap archs return {"heat","offset"} dicts, and their
+        # object metrics come from peak-finding, not cell argmax. No cell
+        # table — the summary keys mirror ObjectMetrics by design, so the
+        # comparison rows print apples-to-apples and the cell rows show nan.
+        obj_m = CenterObjectMetrics(peak_thresh=peak_thresh)
+        with torch.no_grad():
+            for batch in loader:
+                out = model(batch["image"].to(device))
+                heat = torch.sigmoid(out["heat"].float()).cpu()
+                off = torch.sigmoid(out["offset"].float()).cpu()
+                for i in range(heat.shape[0]):
+                    obj_m.update(heat[i], off[i],
+                                 batch["boxes"][i].numpy(), bool(batch["vd"][i]))
+        return obj_m.summary()
+    cells_m, obj_m = CellConfusion(), ObjectMetrics()
     with torch.no_grad():
         for batch in loader:
             logits = model(batch["image"].to(device)).float()
@@ -136,11 +152,15 @@ def main():
         if args.latency:
             results["yolo"].update(latency_yolo(args.yolo, ds, cfg))
     if args.anet:
-        results["anet"] = eval_anet(args.anet, ds, device, getattr(cfg.train, "conf_thresh", 0.0))
+        results["anet"] = eval_anet(args.anet, ds, device,
+                                    getattr(cfg.train, "conf_thresh", 0.0),
+                                    getattr(cfg.train, "peak_thresh", 0.3))
         if args.latency:
             results["anet"].update(latency_anet(args.anet, device))
     if args.anet_distill:
-        results["anet_distill"] = eval_anet(args.anet_distill, ds, device, getattr(cfg.train, "conf_thresh", 0.0))
+        results["anet_distill"] = eval_anet(args.anet_distill, ds, device,
+                                            getattr(cfg.train, "conf_thresh", 0.0),
+                                            getattr(cfg.train, "peak_thresh", 0.3))
         if args.latency:
             results["anet_distill"].update(latency_anet(args.anet_distill, device))
 
