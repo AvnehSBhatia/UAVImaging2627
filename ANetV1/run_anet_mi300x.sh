@@ -61,15 +61,18 @@ export ANET_VRAM_GB="${ANET_VRAM_GB:-48}"
 
 export ANET_NUM_WORKERS="${ANET_NUM_WORKERS:-0}"
 # batch/accum: LEFT UNSET so presets._auto_batch sizes the batch to ANET_VRAM_GB
-# (≈15 at 48 GB) and holds the effective batch near 96 via accum. Pin
+# (v13: physical 96 / accum 1 — its conv activations are ~0.1 GiB/img; the
+# token archs still get ≈13 at 48 GB with accum holding effective ~96). Pin
 # ANET_BATCH=<n> yourself to override.
 [ -n "${ANET_BATCH:-}" ] && export ANET_BATCH
 [ -n "${ANET_ACCUM:-}" ] && export ANET_ACCUM
-# cap draws/epoch so you get an eval/checkpoint every ~2-4 min instead of ~60.
-# The sampler redraws i.i.d. from a fixed distribution, so this is a pure speed
-# lever (does not change what any step sees). Raise ANET_EPOCHS to keep the
-# total step budget if this becomes the production recipe (13501/6000 ~ 2.25x).
-export ANET_SAMPLES="${ANET_SAMPLES:-6000}"
+# draws/epoch. The 6000 cap was a v12-era speed lever (full epochs were ~60
+# min); v13 runs the FULL dataset in ~15-20 s/epoch, and short epochs are now
+# a NOISE source — at 6000 draws x accum'd batch 96 an epoch is only ~66
+# optimizer steps, so per-epoch eval samples a fast-moving trajectory and
+# recall/fp read as thrash. Default: uncapped (full dataset). Set
+# ANET_SAMPLES=<n> to re-cap (e.g. for a v9/v12 run through this script).
+[ -n "${ANET_SAMPLES:-}" ] && export ANET_SAMPLES
 
 # ---- compile: fuses the tail (neck/head/loss — dozens of tiny tensors) even
 # when the Triton Stage-1 is on; inductor breaks the graph around the custom

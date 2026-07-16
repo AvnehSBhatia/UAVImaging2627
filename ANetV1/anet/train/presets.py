@@ -38,13 +38,14 @@ def _mem_budget_gib():
     return _cuda_total_gib()
 
 
-def _auto_batch():
-    """Memory-safe default batch. The model is ~21k params but Stage-1 convolves
-    the full 540x960 frame across a 4-phase batch, so ACTIVATIONS — not weights —
-    dominate: ~1.9 GiB/img dense-EAGER at hidden=32, and with gradient
-    checkpointing (default on, below) ~0.5 GiB/img. Free VRAM is NOT knowable
-    from the device total — a 192 GB MI300X is routinely shared/partitioned — so
-    the default is deliberately CONSERVATIVE and does not scale to the card:
+def _auto_batch(arch=None):
+    """Memory-safe default batch. For the token-encoder archs (v8/v9/v12) the
+    model is ~21k params but Stage-1 convolves the full 540x960 frame across a
+    4-phase batch, so ACTIVATIONS — not weights — dominate: ~1.9 GiB/img
+    dense-EAGER at hidden=32, and with gradient checkpointing (default on,
+    below) ~0.5 GiB/img. Free VRAM is NOT knowable from the device total — a
+    192 GB MI300X is routinely shared/partitioned — so the default is
+    deliberately CONSERVATIVE and does not scale to the card:
 
       - ANET_BATCH=<n>     : pin the batch directly.
       - ANET_VRAM_GB=<gb>  : size the batch so the dense-eager worst case fits
@@ -53,6 +54,13 @@ def _auto_batch():
       - neither            : batch 16 — trains in ~8-12 GiB with checkpointing,
                              fits alongside other jobs on a shared card.
 
+    v13 (D58) is a plain conv pyramid whose biggest activation is the 16-ch
+    stride-2 stem map — ~0.1 GiB/img with autograd copies, ~20x lighter than
+    v12 — so the 1.9 GiB/img estimate would strand it at batch 13 x accum 7
+    (measured on the first v13 MI300X run: a pure v12 VRAM artifact). v13
+    sizes against 0.12 GiB/img, which puts any budgeted card at the full
+    physical batch 96 / accum 1.
+
     accum_steps holds the effective batch near 96 so the LR schedule/step count
     are stable regardless of the physical batch."""
     if "ANET_BATCH" in os.environ:
@@ -60,13 +68,16 @@ def _auto_batch():
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
+    gib_per_img = 0.12 if arch == "v13" else 1.9
     if "ANET_VRAM_GB" in os.environ:  # explicit budget -> size the batch to it
-        return max(4, min(96, int(budget * 0.55 / 1.9)))
-    return 16  # conservative default; free VRAM on a shared card is unknowable
+        return max(4, min(96, int(budget * 0.55 / gib_per_img)))
+    # conservative defaults; free VRAM on a shared card is unknowable. v13's
+    # batch 96 is still only ~10-12 GiB — modest even beside other jobs.
+    return 96 if arch == "v13" else 16
 
 
 def anet_cfg(**overrides):
-    bs = _auto_batch()
+    bs = _auto_batch(overrides.get("arch"))
     train = dict(
         epochs=30,
         # VRAM-aware batch (see _auto_batch): sized so the dense-EAGER path
