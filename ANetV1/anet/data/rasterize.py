@@ -81,7 +81,15 @@ def _cov_to_grid(cov, coverage_thresh):
     grid = np.zeros((GRID_H, GRID_W), np.int64)
     best = cov.max(0)
     cls = cov.argmax(0)
-    hit = best >= coverage_thresh
+    # best > 0 guard: a zero-coverage cell is background no matter the
+    # threshold. Without it, coverage_thresh=0.0 (evaluate_all's "any touched
+    # cell" YOLO rasterization) made 0.0 >= 0.0 true EVERYWHERE and argmax of
+    # all-zero coverage is class 0 — every empty cell became "mannequin", the
+    # full-frame sea trivially contained every GT box, and YOLO's mannequin
+    # object recall / worst-decile read ~1.0 regardless of its actual boxes
+    # (measured: 2.3M pred mannequin cells over 449 frames, cell precision
+    # 0.0035, while fp/img 0.085 counted only the ~9% background-only frames).
+    hit = (best >= coverage_thresh) & (best > 0)
     grid[hit] = cls[hit] + 1
     return grid
 
