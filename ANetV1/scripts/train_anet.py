@@ -92,8 +92,9 @@ cfg = anet_cfg(
     # any fine-stride learned features existed, which capped object-vs-
     # background embedding separation at ~0.05 and made every from-scratch
     # run crawl (v12 on MI300X: soft p plateaued ~0.09 across two runs at two
-    # LRs). v13 overfits 12 real frames to 19/21 centers past 0.5 in 400
-    # steps on a Mac — the identical harness where v12 stalls at ~0.09.
+    # LRs, ~7k steps). v13 overfits 12 real frames to 19/21 centers past 0.5
+    # in 400 steps / 13 s on a Mac; the v12 control also gets there in this
+    # small harness but needs 867 s — see ARCHITECTURE.md section 15.2.
     arch="v13",
     stem="edge_dq4",         # unused by v13 (kept so v9/v12 swaps stay one-line)
     hidden=32,               # unused by v13 (same reason)

@@ -545,7 +545,7 @@ The per-cell {nothing, mannequin, tent} softmax is replaced by **CenterNet-style
 1. v12 pinpoint diagnostic: true-object windows separate from background by only **~0.05** in the normalized 32-d embedding; the deep head downstream is starved at the source.
 2. The loss is exonerated: bare-logit optimization localizes 16/16 peaks; a small plain CNN learns the identical targets easily.
 3. Two MI300X v12 runs hit the same **soft p(center) ≈ 0.09 ceiling** at two different LRs (1.5e-3: monotonic crawl 0.01→0.063 over 24 epochs; 3e-3: fast climb to 0.09 by epoch 5 then 10 epochs of oscillation with zero net gain) — an architecture ceiling, not a training-dynamics problem.
-4. v13 overfit gate (12 real synthetic frames, 400 steps, ~13 s on an M-series Mac): **19/21 GT centers past 0.5**, passing straight through the same ~0.09 plateau v12 never escapes. v12 in the identical harness stalls at constant output.
+4. v13 overfit gate (12 real synthetic frames, 400 steps, **~13 s** on an M-series Mac): **19/21 GT centers past 0.5**, passing straight through the same ~0.09 level v12's full-scale runs never escape. Honest control: v12 *with the current training fixes* (pos_weight 3, σ 1.5, prior 0.01) also reaches 19/21 in this 12-frame harness — in **867 s** (~65× the wall-clock; the earlier constant-output stall was measured on the pre-fix config). So the overfit gate alone does not separate the architectures; the separation is (1)–(3) above — the ~0.05 embedding ceiling and the ~7,000-step full-scale plateau at two LRs — plus the 65× step cost of the token encoder for the same result.
 
 **The fix** (`anet/model/backbone.py` `V13Backbone`) — learn features at fine stride first, summarize later:
 
