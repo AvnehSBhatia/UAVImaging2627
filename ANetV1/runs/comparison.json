@@ -1,0 +1,52 @@
+{
+  "yolo": {
+    "fp_per_image": 0.08463251670378619,
+    "mannequin_recall": 0.9929078014184397,
+    "tent_recall": 0.991869918699187,
+    "mannequin_recall_synthetic": 0.9929078014184397,
+    "mannequin_recall_visdrone": NaN,
+    "mannequin_recall_smallest_decile": 1.0,
+    "cells": {
+      "mannequin": {
+        "precision": 0.0035260354741592096,
+        "recall": 0.995460679671206,
+        "f1": 0.007027179874239981,
+        "pred_cells": 2301168,
+        "gt_cells": 8151
+      },
+      "tent": {
+        "precision": 0.8500453720508166,
+        "recall": 0.9914009789654716,
+        "f1": 0.9152977099236641,
+        "pred_cells": 26448,
+        "gt_cells": 22677
+      }
+    },
+    "latency_ms_b1": 16.58973217010498,
+    "throughput_img_s": 60.27824860259163,
+    "params": 2375226,
+    "mannequin_cell_precision": 0.0035260354741592096,
+    "mannequin_cell_recall": 0.995460679671206,
+    "mannequin_cell_f1": 0.007027179874239981,
+    "tent_cell_precision": 0.8500453720508166,
+    "tent_cell_recall": 0.9914009789654716,
+    "tent_cell_f1": 0.9152977099236641
+  },
+  "anet": {
+    "fp_per_image": 2.1469933184855234,
+    "mannequin_recall": 0.8368794326241135,
+    "tent_recall": 0.940379403794038,
+    "mannequin_recall_synthetic": 0.8368794326241135,
+    "mannequin_recall_visdrone": NaN,
+    "mannequin_recall_smallest_decile": 0.6428571428571429,
+    "latency_ms_b1": 1.7907476425170898,
+    "throughput_img_s": 5132.499189309904,
+    "params": 25212,
+    "mannequin_cell_precision": NaN,
+    "mannequin_cell_recall": NaN,
+    "mannequin_cell_f1": NaN,
+    "tent_cell_precision": NaN,
+    "tent_cell_recall": NaN,
+    "tent_cell_f1": NaN
+  }
+}
