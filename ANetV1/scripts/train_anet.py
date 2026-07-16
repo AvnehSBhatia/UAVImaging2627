@@ -89,11 +89,16 @@ cfg = anet_cfg(
     hidden=32,               # embedding width (same budget as v9)
     # from-scratch center-heatmap training is SLOW on the rare tiny mannequin:
     # the first real run climbed soft p(center) only ~0.002/epoch and the 40-epoch
-    # cosine decayed LR away mid-climb. More budget + a hotter peak (3e-3, was the
-    # v9-fine-tune-safe 1.5e-3) give it room; pair with center_pos_weight + the
-    # soft-signal selection so it isn't early-stopped before peaks cross 0.5.
+    # cosine decayed LR away mid-climb. The speed levers are center_pos_weight +
+    # the widened center_sigma (measured ~10x: soft p 0.004 -> 0.09 by epoch 5),
+    # NOT a hotter LR — the 3e-3 peak tried alongside them was unstable: the
+    # moment warmup ended, soft p stopped climbing and bounced 0.03-0.09 for 10
+    # straight epochs with zero net gain, ON THE EMA WEIGHTS (raw weights swing
+    # harder), while at 1.5e-3 the climb was strictly monotonic. Keep the 80-epoch
+    # budget so the cosine doesn't decay LR away mid-climb; soft-signal selection
+    # keeps early-stop from firing before peaks cross 0.5.
     epochs=int(os.environ.get("ANET_EPOCHS", 80)),
-    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 3.0e-3,
+    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 1.5e-3,
     # prior_fg 0.01 (RetinaNet §4.1 prior), NOT 0.1/0.05. On the 27x48=1296-cell
     # heatmap only ~1-2 cells per class are objects, so a HIGH init prior makes
     # the ~2590 background cells' penalty-reduced-focal gradient sink the head's
