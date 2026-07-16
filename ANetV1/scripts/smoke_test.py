@@ -228,6 +228,56 @@ def v13_checks():
     print("  v13 checks passed")
 
 
+def v14_checks():
+    """v14 (D59-D63): param budget, shapes, grad flow, and THE contract —
+    a v14 warm-started from a v13 state_dict computes exactly that v13's
+    function at step 0 (every new module identity/zero-gamma init)."""
+    m13 = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    m14 = ANetV1(arch="v14", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m14.parameters())
+    print(f"ANetV1 v14 params: {n:,}")
+    assert n < 40_000, "v14 param budget exceeded"
+
+    # identity-at-init contract (D63): warm-start == the donor v13, exactly
+    missing, unexpected = m14.load_state_dict(m13.state_dict(), strict=False)
+    assert not unexpected, f"v13 keys not consumed by v14: {unexpected}"
+    assert all(k.startswith("backbone.") for k in missing), missing
+    m13.eval(); m14.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        o13, o14 = m13(x), m14(x)
+    d = max((o13["heat"] - o14["heat"]).abs().max().item(),
+            (o13["offset"] - o14["offset"]).abs().max().item())
+    print(f"  v14 identity-at-init vs donor v13: max delta {d:.2e}")
+    assert d < 1e-5, "D63 identity contract broken — a new module is not a no-op at init"
+
+    # from-scratch: shapes, cold-start sanity, full loss backward, valve grads
+    m = ANetV1(arch="v14", use_checkpoint=False, prior_fg=0.01)
+    m.train()
+    out = m(x)
+    assert out["heat"].shape == (2, 2, 27, 48) and out["offset"].shape == (2, 2, 27, 48)
+    assert out["heat"].abs().max() < 50, "v14 cold-start activations blew up"
+    from anet.train.losses import center_focal_loss, offset_l1
+    heat_t = torch.zeros(2, 2, 27, 48); heat_t[:, 0, 5, 5] = 1.0
+    reg_mask = torch.zeros(2, 1, 27, 48); reg_mask[:, 0, 5, 5] = 1.0
+    loss = center_focal_loss(out["heat"], heat_t) + \
+        offset_l1(out["offset"], torch.zeros(2, 2, 27, 48), reg_mask)
+    l2, l1 = m.reg_losses()
+    (loss + 1e-4 * (l2 + l1)).backward()
+    assert not [k for k, p in m.named_parameters() if p.grad is None], "v14 no-grad params"
+    # each identity valve must feel gradient at the identity point, or its
+    # branch can never open (zero-gamma pattern: branch params wake up one
+    # optimizer step after their valve moves — that part is expected)
+    params = dict(m.named_parameters())
+    for valve in ("backbone.skip_gain", "backbone.block_extra.gain",
+                  "backbone.tex.w_gate", "backbone.noise.weight"):
+        assert params[valve].grad.abs().max() > 0, f"dead valve: {valve}"
+
+    m2 = ANetV1.from_state_dict(m.state_dict())
+    assert m2.arch == "v14" and sum(p.numel() for p in m2.parameters()) == n
+    print("  v14 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -240,6 +290,7 @@ def main():
     v9_checks()
     v12_checks()
     v13_checks()
+    v14_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

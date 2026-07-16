@@ -95,9 +95,14 @@ cfg = anet_cfg(
     # LRs, ~7k steps). v13 overfits 12 real frames to 19/21 centers past 0.5
     # in 400 steps / 13 s on a Mac; the v12 control also gets there in this
     # small harness but needs 867 s — see ARCHITECTURE.md section 15.2.
-    arch="v13",
-    stem="edge_dq4",         # unused by v13 (kept so v9/v12 swaps stay one-line)
-    hidden=32,               # unused by v13 (same reason)
+    # v14 (D59-D63) — current default: v13 + identity-init structured priors
+    # (dw7x7 noise filter, 5x dual-quaternion shift, texture-energy gate,
+    # max-pool detail skip, zero-gamma 4th block), each tied to a measured
+    # v13 failure mode (ARCHITECTURE.md section 16). ANET_INIT_FROM a v13
+    # checkpoint warm-starts v14 to EXACTLY that v13 at step 0.
+    arch="v14",
+    stem="edge_dq4",         # unused by v13/v14 (kept so v9/v12 swaps stay one-line)
+    hidden=32,               # unused by v13/v14 (same reason)
     # from-scratch center-heatmap training is SLOW on the rare tiny mannequin:
     # the first real run climbed soft p(center) only ~0.002/epoch and the 40-epoch
     # cosine decayed LR away mid-climb. The speed levers are center_pos_weight +
@@ -152,7 +157,21 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        if model.arch != cfg.train.arch:
+        if model.arch == "v13" and cfg.train.arch == "v14":
+            # v14 is a superset of v13 by construction (same module names for
+            # the shared trunk; every new module identity-init, D63): copy the
+            # v13 weights in and the v14 IS that v13 at step 0 — asserted in
+            # smoke_test. Selection can only move away from a proven optimum.
+            m14 = ANetV1(arch="v14", use_checkpoint=cfg.train.use_checkpoint,
+                         head_width=cfg.train.head_width,
+                         prior_fg=getattr(cfg.train, "prior_fg", None))
+            missing, unexpected = m14.load_state_dict(model.state_dict(),
+                                                      strict=False)
+            assert not unexpected, f"v13->v14 transfer: unexpected {unexpected}"
+            print(f"v13 -> v14 warm start: {len(model.state_dict())} tensors "
+                  f"transferred, {len(missing)} new v14 tensors at identity init")
+            model = m14
+        elif model.arch != cfg.train.arch:
             raise SystemExit(
                 f"{init} is a {model.arch} checkpoint but this script is "
                 f"configured for arch={cfg.train.arch!r} — a run cannot "
@@ -167,11 +186,11 @@ def main():
         print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, "
               f"warmup={cfg.train.warmup_steps})")
     else:
-        # v13 (current default, D58): the conv backbone ignores hidden/h1/stem/
-        # neck/Path-A knobs entirely — its channel plan is fixed in
-        # model/backbone.py; only head_width and prior_fg apply.
+        # v14 (current default, D59-D63; v13 = arch swap): the conv backbones
+        # ignore hidden/h1/stem/neck/Path-A knobs entirely — the channel plan
+        # is fixed in model/backbone.py; only head_width and prior_fg apply.
         model = ANetV1(
-            arch="v13",
+            arch=cfg.train.arch,
             use_checkpoint=cfg.train.use_checkpoint,
             head_width=cfg.train.head_width,
             prior_fg=getattr(cfg.train, "prior_fg", None),

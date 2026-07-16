@@ -68,12 +68,13 @@ def _auto_batch(arch=None):
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
-    gib_per_img = 0.12 if arch == "v13" else 1.9
+    gib_per_img = 0.12 if arch in ("v13", "v14") else 1.9
     if "ANET_VRAM_GB" in os.environ:  # explicit budget -> size the batch to it
         return max(4, min(96, int(budget * 0.55 / gib_per_img)))
-    # conservative defaults; free VRAM on a shared card is unknowable. v13's
-    # batch 96 is still only ~10-12 GiB — modest even beside other jobs.
-    return 96 if arch == "v13" else 16
+    # conservative defaults; free VRAM on a shared card is unknowable. The
+    # conv backbones' batch 96 is still only ~10-14 GiB — modest even beside
+    # other jobs (v14 adds a full-res dw7x7 + s4 texture maps over v13).
+    return 96 if arch in ("v13", "v14") else 16
 
 
 def anet_cfg(**overrides):

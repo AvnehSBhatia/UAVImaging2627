@@ -1,6 +1,6 @@
 # ANetV1 — Full Architecture Specification & Design Record
 
-**Status:** v13 (conv backbone) · 2026-07-15 — v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9–v11 (D39–D56) rebuilt the training path and losses; v12 (D57) replaced per-cell classification with an object center-heatmap readout; v13 (D58) replaces the window-token encoder with a plain multi-scale conv backbone. §3–§5 describe the v6–v8 model; §14 is the v9–v11 delta; **§15 is the current v12/v13 model**.
+**Status:** v14 (structured priors) · 2026-07-16 — v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9–v11 (D39–D56) rebuilt the training path and losses; v12 (D57) replaced per-cell classification with an object center-heatmap readout; v13 (D58) replaced the window-token encoder with a plain multi-scale conv backbone; v14 (D59–D63) adds identity-init structured priors targeting the measured v13-vs-YOLO26n gap. §3–§5 describe the v6–v8 model; §14 is the v9–v11 delta; §15 is the v12/v13 model; **§16 is the current v14 delta**.
 **Task:** object center detection of {mannequin, tent} in UAV survey frames (SUAS-style search area; per-cell region classification through v11, center heatmaps since v12)
 **Deployment target:** Raspberry Pi 5 + AI HAT+ (Hailo-8, 26 TOPS int8) at ≥30 FPS
 **Training target:** Apple Silicon (MPS), PyTorch
@@ -25,6 +25,7 @@
 13. [Implementation notes](#13-implementation-notes)
 14. [v9 — training-stack rebuild](#14-v9--training-stack-rebuild-d39d48)
 15. [v12/v13 — center-heatmap detector and the conv backbone](#15-v12v13--object-center-heatmap-detector-and-the-conv-backbone-d57d58)
+16. [v14 — structured priors as a monotone extension](#16-v14--structured-priors-as-a-monotone-extension-d59d63)
 
 ---
 
@@ -428,6 +429,7 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 | v11 | **weighted FP/TP loss** (D54, replaces focal_norm); **dynamic-box pooling** (D55, gate-mass-normalized Stage-1 readout); **metric-prototype head + `proto_metric_loss` pretraining** (D56, deploy-folds to one conv, +1 param). See §14.6. | v10 fixed the argmax limit cycle but exposed class asymmetry: tent recall 0.999 while mannequin stayed 0 and its softmax prob *decayed* 0.37→0.20 — small objects averaged away by the 400-px pool, and the FP/TP ratio never forces the true class to win the argmax |
 | v12 | **Object center-heatmap readout** (D57): single-phase stride-20 Stage 1 (27×48 grid), CenterHead with two independent per-class sigmoids + sub-cell offset, CenterNet penalty-reduced focal + offset L1, peak/object metrics, soft-signal selection. See §15.1. | the per-cell softmax formulations kept re-creating the same tug-of-war failures (D47→D49→D54 lineage); the task is object-level, and independent sigmoids remove class competition structurally |
 | v13 | **Plain multi-scale conv backbone replaces the window-token encoder** (D58): stem s2 → dw-sep s4 → dw5×5 s5 → 3× dw5×5 residual blocks → 1×1 head; DeployNorm + SiLU throughout; Kaiming init; ~25.2k params. Same D57 readout/targets/loss/metrics. See §15.2. | v12 on MI300X plateaued at soft p(center)≈0.09 at BOTH 1.5e-3 (monotonic crawl) and 3e-3 (oscillation) — pinpoint: tile-local pooling caps object-vs-background embedding separation at ~0.05; the identical targets are learned by bare logits (16/16) and by a small plain CNN in seconds |
+| v14 | **Identity-init structured priors** (D59–D63): residual dw7×7 noise filter; 5× dual-quaternion channel-group shifts (fold to grouped 1×1); texture-energy sigmoid masking as a weighted sum; max-pool s4→s20 detail skip; zero-gamma 4th block. 36.1k params; a v13 checkpoint warm-starts v14 to bit-exact v13 (smoke-asserted). See §16. | trained v13 vs corrected YOLO26n baseline: worst-decile mannequin 0.643 vs 0.857, fp/img 2.15 vs 0.018; viz decomposition: FPs cluster on canopy texture at prob 0.30–0.60, misses are diluted (heat 0.2–0.3) not absent, clutter hits under-confident |
 
 ---
 
@@ -582,3 +584,25 @@ Design points, each load-bearing:
 ### 15.3 Training configuration (v13 defaults)
 
 Identical trainer path to v12 (`loss_mode="center"`): AdamW lr 1.5e-3 (3e-3 measured unstable — see the v12 LR history in §15.2 point 3), cosine over 80 epochs + warmup, `center_pos_weight` 3.0, σ 1.5, prior 0.01, weight EMA, soft-signal selection/early-stop. The fused Triton Stage-1 (D40) does not apply — every v13 op is a native cuDNN/MIOpen conv; there is nothing to fuse. Checkpointing is never engaged (activation footprint is small). `from_state_dict` sniffs v13 by the `backbone.` key prefix; v8/v9/v12 checkpoints still load for evaluation but cannot warm-start v13.
+
+---
+
+## 16. v14 — structured priors as a monotone extension (D59–D63)
+
+Driver: the first trained v13 (25.2k params) measured against the corrected YOLO26n baseline (§10 decision metric): mannequin recall 0.837 vs 0.962, **worst-decile 0.643 vs 0.857** (21 pts behind the ≤15-pt bar), fp/img 2.15 vs 0.018. The 24-frame `runs/viz` stage dump decomposed the gap into three failure modes; v14 adds one targeted, deploy-foldable mechanism per mode — and reintroduces the project's signature dual-quaternion machinery in the one form that survived every prior post-mortem: constant-foldable, identity-initialized, and cheap.
+
+**The D63 contract (the design rule that governs all of it):** every v14 module is identity- or zero-gamma-initialized, and v14 preserves v13's module names for the shared trunk — so a v14 warm-started from a v13 checkpoint computes *exactly* the v13 function at step 0 (`smoke_test` asserts max output delta < 1e-5; measured 0.0). Training can only move away from a proven optimum, never re-roll it. Zero-init is applied to *valves* (per-channel gains) rather than conv weights wherever a DeployNorm sits behind the branch: zeroing the conv would park the norm's running_var at ~0 and fold a ~√(1/ε)≈316× amplifier onto the branch exactly as it wakes (measured on the first draft); with zero-gamma valves every conv keeps Kaiming init and every norm observes real activation stats from the first forward.
+
+| D | Component | Failure mode it targets (measured) | Cost |
+|---|---|---|---|
+| D59 | **Learned 7×7 noise filter** — residual depthwise conv on RGB before the stem, zero-init | FP band: sensor grain/texture aliasing enters the stem unfiltered | 147 |
+| D60 | **5× dual-quaternion shift** (`QuatShift`) — per-4-channel-group Hamilton rotation + dual-part translation, one layer after each stage; folds to constant grouped 1×1 convs (the D5 bake, generalized) | clutter under-confidence: dw-sep stacks under-mix channels; norm-preserving rotation structure at 8 params/group | 416 |
+| D61 | **Texture masking as a weighted sum** (`TextureGate`) — learned high-pass (D32-init) → energy (square) → pooled to s20 → sigmoid mask g; trunk modulated `y·(w_pass + w_gate·g)`, w_gate zero-init | the fp/img 2.15: false peaks at prob 0.30–0.60 cluster on canopy texture — objects must beat the *local* texture floor, not an absolute bar | 2,096 |
+| D62 | **Peak-preserving detail skip** — max-pool(5,5) of the s4 map → 1×1 → DN → zero-gamma gain, added to the s20 trunk | worst-decile misses: missed mannequins peak at heat 0.2–0.3 — evidence *diluted* by the strided-conv average over its 100-px window, not absent; max keeps the brightest 4-px response alive | 2,240 |
+| D63 | **Zero-gamma 4th s20 block** + the identity-init contract itself | clutter discrimination capacity (hits at 0.35–0.55 in clutter vs 0.85–0.98 clear-ground) | 6,016 |
+
+**Total: 36,127 params** (v13's 25,212 + 10,915), inside the <40k budget. Everything folds: quaternion algebra → constant grouped 1×1 convs (bake at export like `DualQuaternionRGB.to_conv`), gates → conv+sigmoid+mul (the D10 idiom), skip → max-pool+1×1, noise filter → one depthwise conv. No data-dependent normalization, no attention, no CPU stage.
+
+Training: unchanged v13 recipe (§15.3). Two entry points: from scratch, or `ANET_INIT_FROM=<v13 ckpt>` — the trainer transfers all shared tensors and reports the new-at-identity count; warm-start begins at the donor's exact metrics. `from_state_dict` distinguishes v14 by the `backbone.noise.weight` key.
+
+What would falsify each piece (pre-registered, in the §9 ablation spirit): D61 fails if fp/img does not drop at matched recall; D62 fails if worst-decile recall does not move; D60/D63 fail if the gains stay at ~0 (the valves report their own uselessness); D59 fails if the learned kernel stays ~0. Each is independently removable — they are additive valved branches, not rewires.
