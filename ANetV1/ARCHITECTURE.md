@@ -1,7 +1,7 @@
 # ANetV1 — Full Architecture Specification & Design Record
 
-**Status:** v9 (training-stack rebuild) · 2026-07-10 — v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9 (D39–D48) rebuilds the training path (fused Triton Stage 1, DeployNorm, focal_norm loss) and rebalances the parameter budget (SlimContext, ConvNeck, wide head). §3–§5 describe the v6–v8 model; §14 is the v9 delta.
-**Task:** per-region classification of UAV survey frames into {mannequin, tent, nothing} (SUAS-style search area)
+**Status:** v13 (conv backbone) · 2026-07-15 — v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9–v11 (D39–D56) rebuilt the training path and losses; v12 (D57) replaced per-cell classification with an object center-heatmap readout; v13 (D58) replaces the window-token encoder with a plain multi-scale conv backbone. §3–§5 describe the v6–v8 model; §14 is the v9–v11 delta; **§15 is the current v12/v13 model**.
+**Task:** object center detection of {mannequin, tent} in UAV survey frames (SUAS-style search area; per-cell region classification through v11, center heatmaps since v12)
 **Deployment target:** Raspberry Pi 5 + AI HAT+ (Hailo-8, 26 TOPS int8) at ≥30 FPS
 **Training target:** Apple Silicon (MPS), PyTorch
 **Headline figures:** v9 default: 20,706 deployed parameters (~83 KB fp32 / ~21 KB int8) · ~3.5 GFLOPs/frame @ 960×540 (v6 locked spec was 17,037 params / ~2.5 GFLOPs) · est. 150–300 FPS on the HAT
@@ -23,6 +23,8 @@
 11. [Training configuration](#11-training-configuration)
 12. [Design version history](#12-design-version-history)
 13. [Implementation notes](#13-implementation-notes)
+14. [v9 — training-stack rebuild](#14-v9--training-stack-rebuild-d39d48)
+15. [v12/v13 — center-heatmap detector and the conv backbone](#15-v12v13--object-center-heatmap-detector-and-the-conv-backbone-d57d58)
 
 ---
 
@@ -424,6 +426,8 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 | v8 | **EdgeDQ stem default** (D33); **per-scale 1×1 conv after Path A** (D36); **per-channel Path A** (D37, ~24–25k params); **CUDA/ROCm training throughput** (batched Stage-1 pass + `torch.compile`, D38) — model math and Hailo export unchanged | `runs/viz/000008`: tent cell-recall ~½, low-contrast tent missed, mannequin/car scale confusion (features fire, head can't resolve scale); MI300X launch-bound at ~1% util |
 | v9 | **DeployNorm** (D39); **fused Triton Stage-1 train kernels** (D40); **Sobel-init 4-orientation stem** (D41); **fc2 post-pool** (D42); **ConvNeck** (D43); **SlimContext replaces Path-B expansions** (D44); **24-wide head** (D45); **aux deep-supervision probe** (D46); **focal_norm loss** (D47); **weight EMA** (D48). ~20.7k deployed params. See §14. | from-scratch v8 runs: mannequin AND tent recall 0.000 at epoch 3 (tent soft-prob actively pushed 0.1→0.003 by the FT loss), 517 s epochs, ~120 GB VRAM at batch 96 (MIOpen int32 → primitive-BN fp32 fallback), stem "Sobel init" was actually random noise ×0.2 |
 | v11 | **weighted FP/TP loss** (D54, replaces focal_norm); **dynamic-box pooling** (D55, gate-mass-normalized Stage-1 readout); **metric-prototype head + `proto_metric_loss` pretraining** (D56, deploy-folds to one conv, +1 param). See §14.6. | v10 fixed the argmax limit cycle but exposed class asymmetry: tent recall 0.999 while mannequin stayed 0 and its softmax prob *decayed* 0.37→0.20 — small objects averaged away by the 400-px pool, and the FP/TP ratio never forces the true class to win the argmax |
+| v12 | **Object center-heatmap readout** (D57): single-phase stride-20 Stage 1 (27×48 grid), CenterHead with two independent per-class sigmoids + sub-cell offset, CenterNet penalty-reduced focal + offset L1, peak/object metrics, soft-signal selection. See §15.1. | the per-cell softmax formulations kept re-creating the same tug-of-war failures (D47→D49→D54 lineage); the task is object-level, and independent sigmoids remove class competition structurally |
+| v13 | **Plain multi-scale conv backbone replaces the window-token encoder** (D58): stem s2 → dw-sep s4 → dw5×5 s5 → 3× dw5×5 residual blocks → 1×1 head; DeployNorm + SiLU throughout; Kaiming init; ~25.2k params. Same D57 readout/targets/loss/metrics. See §15.2. | v12 on MI300X plateaued at soft p(center)≈0.09 at BOTH 1.5e-3 (monotonic crawl) and 3e-3 (oscillation) — pinpoint: tile-local pooling caps object-vs-background embedding separation at ~0.05; the identical targets are learned by bare logits (16/16) and by a small plain CNN in seconds |
 
 ---
 
@@ -516,3 +520,65 @@ v10's fixes stopped the argmax limit cycle but exposed a *class-asymmetric* fail
 **D55 — dynamic-box pooling.** The Stage-1 readout was `avg_pool2d(gate·h, 20)` — it divides the gated sum by the fixed 400-px window area, so a 2–8-px mannequin (0.5–2% of a window) is averaged ~50–90× into the background while a window-filling tent survives. The sigmoid cosine-gate (D10/D42) already computes a soft, data-dependent object mask per window; v11 reads out the **mean inside that soft box** — `Σ(gate·h)/(Σgate + ε)`, ε=0.5 in the sum domain — instead of the area mean. A mannequin covering 1% of the window is now recovered at full strength; a uniform-gate window is unchanged (mass-mean = area-mean), so tents and the cold start are undisturbed. Preserves the cosine-gated-pooling mechanism exactly (only the normalizer changes); stays two avg-pools + a divide (Hailo-legal). Applied bit-consistently across the token reference, dense path, chunked mirror, and the fused Triton fwd/bwd (`D = Σgate + ε`; `∂/∂gate_i = (A_i − Σ_j gate_j A_j /D)/D`), parity-checked at startup.
 
 **D56 — metric-prototype head + pretraining.** The head's final `Linear(width,3)` is replaced by a **distance-to-prototype** readout in the bounded Tanh metric space z: `logit_c = scale·(2 z·p_c − ‖p_c‖²)`, which is exactly `−scale·‖z−p_c‖²` up to the class-independent `+scale·‖z‖²` (drops under softmax/argmax), so it **folds to one conv at export** — no runtime L2-norm, still affine-foldable. Net cost vs the linear head: **+1 param**. The point is not capacity (a linear layer has the same freedom) but that the classifier weights *are* the class prototypes, shaped by `proto_metric_loss`: a class-balanced prototype cross-entropy over `softmax(−scale·‖z−p_c‖²)` on 2×2-priority-pooled window labels, plus a prototype-separation push `mean exp(−‖p_i−p_j‖²)`. This supplies the missing "true class must win here" per-cell signal, in the same geometry the head decides in. Runs jointly (weight 0.5) from step 0 so the embedding clusters continuously; `loss_mode="metric_only"` runs a dedicated embedding-pretraining phase (detection off) to warm-start via `ANET_INIT_FROM`. All existing novel mechanisms — EdgeDQ oriented-edge stem, dual-quaternion colour rotations, cosine-gated mixing, DeployNorm, ConvNeck, Path-A, the multi-cosine SlimContext weave, per-cell region marking — are unchanged.
+
+---
+
+## 15. v12/v13 — object center-heatmap detector and the conv backbone (D57–D58)
+
+Driver: through v11 every generation changed the loss or the head, and every from-scratch run kept converging to the same place — the rare tiny mannequin never wins. v12 changed **what is predicted** (object centers instead of per-cell classes) and v13 changes **what predicts it** (a plain conv pyramid instead of the window-token encoder). v13 is the current default; the D57 readout, targets, loss, and metrics carry over from v12 unchanged.
+
+### 15.1 D57 — object center-heatmap readout (v12, kept by v13)
+
+The per-cell {nothing, mannequin, tent} softmax is replaced by **CenterNet-style center detection** on the 27×48 stride-20 grid (`V12_H/W`; 540 = 20·27, 960 = 20·48):
+
+- **Two independent per-class sigmoid heatmaps** (mannequin ch0, tent ch1) — no softmax competition, so a large easy tent can never eat the mannequin's gradient (the v11 D54/D56 failure, removed structurally instead of re-weighted).
+- **Class-agnostic sub-cell (dx,dy) offset**, sigmoid-bounded to [0,1), supervised only at exact center cells (`offset_l1` + reg_mask).
+- **Targets** (`rasterize.boxes_to_heatmap`): Gaussian center splats, σ=1.5 cells, max-merged across objects; the ring around a peak gets a reduced negative penalty via `(1−target)^β`.
+- **Loss** (`center_focal_loss`, α=2, β=4): penalty-reduced pixel focal normalized by exact-peak count, `pos_weight` (default 3, `ANET_POS_W`) up-weighting the ~1-cell positive term against ~2,590 background cells.
+- **Eval/selection** (`CenterObjectMetrics`): 3×3 local-max peak finding; object recall keys unchanged; best.pt/early-stop selection adds the threshold-free soft p(center-on-GT) signal so sub-0.5 learning is visible to selection.
+- **Init**: RetinaNet prior p=0.01 on both center channels (measured: at 0.1 the shared bias sinks faster than the head can lift true centers).
+
+### 15.2 D58 — plain multi-scale conv backbone (v13, replaces window-token Stage 1)
+
+**The failure it fixes.** Every ANet generation v6–v12 pooled each 20×20 tile into ONE embedding vector with a tile-local encoder *before* any spatially fine learned feature extraction. A 15–30 px mannequin is 2–8% of a tile's 400 tokens, and the only pre-pool features were the stem's fixed-init edge channels — so its evidence was averaged into the tile summary almost untouched. The evidence chain, in order of discovery:
+
+1. v12 pinpoint diagnostic: true-object windows separate from background by only **~0.05** in the normalized 32-d embedding; the deep head downstream is starved at the source.
+2. The loss is exonerated: bare-logit optimization localizes 16/16 peaks; a small plain CNN learns the identical targets easily.
+3. Two MI300X v12 runs hit the same **soft p(center) ≈ 0.09 ceiling** at two different LRs (1.5e-3: monotonic crawl 0.01→0.063 over 24 epochs; 3e-3: fast climb to 0.09 by epoch 5 then 10 epochs of oscillation with zero net gain) — an architecture ceiling, not a training-dynamics problem.
+4. v13 overfit gate (12 real synthetic frames, 400 steps, ~13 s on an M-series Mac): **19/21 GT centers past 0.5**, passing straight through the same ~0.09 plateau v12 never escapes. v12 in the identical harness stalls at constant output.
+
+**The fix** (`anet/model/backbone.py` `V13Backbone`) — learn features at fine stride first, summarize later:
+
+```
+960×540×3
+├─ stem   conv3×3 s2  3→16   + DeployNorm + SiLU        (16, 270, 480)
+├─ down4  dw3×3  s2 + pw 16→32  (DN+SiLU each)          (32, 135, 240)
+├─ block  dw3×3  s1 + pw 32→32  residual                (32, 135, 240)
+├─ down20 dw5×5  s5 + pw 32→64  (DN+SiLU each)          (64, 27, 48)
+├─ 3×     dw5×5  s1 + pw 64→64  residual                (64, 27, 48)
+└─ head   1×1 64→width + SiLU + 1×1 width→4             (4, 27, 48)
+          channels: [center_mann, center_tent, dx, dy]  (D57 contract)
+```
+
+| Block | Params (width=24) |
+|---|---|
+| stem + DN | 464 |
+| down4 | 752 |
+| block@s4 | 1,440 |
+| down20 | 3,040 |
+| 3 × block@s20 | 17,856 |
+| head | 1,660 |
+| **Total** | **25,212** |
+
+Design points, each load-bearing:
+
+- **Kaiming (variance-preserving) init is a functional requirement, not a nicety**: DeployNorm normalizes with *running* stats (D39), so a net whose activations shrink ~10× per stage under torch's default init puts every norm's cold start ~300× off its fixed point — the 8 sequential seeding passes cannot relax a 10-norm cascade that far (measured: 1e23 logits on the first train step). With unit-variance propagation, seeding converges in a couple of passes.
+- **No coordinate channels** — a center detector should be translation-equivariant; "what it looks like", not "where it is".
+- **No global context path** — a per-frame global vector added identically to every cell is exactly the shortcut a collapsing head hides in (D52's noise mechanism, v12's constant-output basin). Receptive field is local-but-large: the three dw5×5 blocks alone give ±6 cells (±120 px) on top of the 100 px stride-5 window and the fine-stride stages — ~250–300 px per cell at 150 ft GSD.
+- **No aux probe** — the gradient path is 8 convs deep; deep supervision was a workaround for the encoder starving the head, and the encoder is gone.
+- **Deploy-legality strictly improves**: conv / affine-foldable DeployNorm / SiLU (single LUT, same as every YOLO the DFC compiles) / residual add. The D17/§14.4 CPU stage disappears — v13 is a single-shot NPU graph with host-side peak-finding only. The signature mechanisms v6–v12 preserved (DQ rotations, cosine gates, gated pooling, the weave) were Hailo-legality *workarounds* for attention-like computation; a conv pyramid needs no workaround.
+- **What stays**: DeployNorm semantics and trainer contract (seeding + deferred EMA updates), the D57 readout/targets/loss/metrics, weight EMA + soft-signal selection, the <40k param budget (25.2k used).
+
+### 15.3 Training configuration (v13 defaults)
+
+Identical trainer path to v12 (`loss_mode="center"`): AdamW lr 1.5e-3 (3e-3 measured unstable — see the v12 LR history in §15.2 point 3), cosine over 80 epochs + warmup, `center_pos_weight` 3.0, σ 1.5, prior 0.01, weight EMA, soft-signal selection/early-stop. The fused Triton Stage-1 (D40) does not apply — every v13 op is a native cuDNN/MIOpen conv; there is nothing to fuse. Checkpointing is never engaged (activation footprint is small). `from_state_dict` sniffs v13 by the `backbone.` key prefix; v8/v9/v12 checkpoints still load for evaluation but cannot warm-start v13.

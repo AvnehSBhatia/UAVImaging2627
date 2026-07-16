@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
+from .backbone import V13Backbone
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
@@ -36,6 +37,24 @@ class ANetV1(nn.Module):
                  neck_rounds=2, head_width=24, aux_head=False, head_proto=True):
         super().__init__()
         self.prior_fg = prior_fg
+        if arch == "v13":
+            # v13 (D58): plain multi-scale conv backbone — the window-token
+            # encoder, neck, Path A, context and token-stream head are all
+            # replaced by backbone.py's conv pyramid ending in the same
+            # {"heat","offset"} contract on the 27x48 stride-20 grid. None of
+            # the stem/uv/xy/cell machinery below applies; params like
+            # hidden/h1/stem/dense are accepted (so callers and presets need
+            # no arch-switch) but unused.
+            self.arch = arch
+            self.use_checkpoint = use_checkpoint  # accepted; v13 never checkpoints
+            self.dense = dense
+            self.stem = "conv"
+            self.fused_pool = None
+            self.nh = self.IMG_H // self.WIN  # 27
+            self.nw = self.IMG_W // self.WIN  # 48
+            self.n_win = self.nh * self.nw
+            self.backbone = V13Backbone(head_width=head_width, prior_fg=prior_fg)
+            return
         if arch == "v12":
             # v12 stage 1 is single-phase, non-overlapping stride-20 windows
             # (no 4x phase overlap): one cell per 20x20 tile, exactly matching
@@ -159,7 +178,7 @@ class ANetV1(nn.Module):
                     self.aux_center.bias.fill_(
                         math.log(prior_fg / max(1.0 - prior_fg, 1e-6)))
         else:
-            raise ValueError(f"unknown arch {arch!r} (v8|v9|v12)")
+            raise ValueError(f"unknown arch {arch!r} (v8|v9|v12|v13)")
 
         # window-relative pixel coords, row-major to match F.unfold token order
         r = torch.arange(self.WIN, dtype=torch.float32)
@@ -200,6 +219,12 @@ class ANetV1(nn.Module):
     def from_state_dict(cls, sd, **kwargs):
         """Rebuild a model with arch/hidden/stem/Path-A inferred from checkpoint
         shapes (v8 pre/post-D37 checkpoints and v9 checkpoints all load)."""
+        if any(k.startswith("backbone.") for k in sd):  # v13 signature
+            model = cls(arch="v13",
+                        head_width=sd["backbone.head.0.weight"].shape[0],
+                        **kwargs)
+            model.load_state_dict(sd, strict=True)
+            return model
         if any(k.startswith("neck.") for k in sd):  # v9 or v12 signature
             stem = "edge_dq4" if any(k.startswith("stem_mod.dq_in.") for k in sd) \
                 else ("edge_dq" if any(k.startswith("stem_mod.") for k in sd)
@@ -422,6 +447,9 @@ class ANetV1(nn.Module):
         return result
 
     def forward(self, img):
+        if self.arch == "v13":
+            out = self.backbone(img)  # (B, 4, 27, 48)
+            return {"heat": out[:, 0:2], "offset": out[:, 2:4]}
         feat = self._features(img)
         if self.arch == "v12":
             return self._tail_v12(self._embed_map_v12(feat))
@@ -437,6 +465,11 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
+        if self.arch == "v13":
+            # no cosine gates or scalar-kernel pools to bound — plain convs
+            # are already deploy-legal; weight decay (optimizer) covers L2
+            z = next(self.parameters()).sum() * 0.0
+            return z, z
         if self.arch in ("v9", "v12"):
             l2 = self.encoder.reg_l2() + self.context.reg_l2() + self.head.reg_l2()
         else:

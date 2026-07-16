@@ -178,6 +178,56 @@ def v12_checks():
     print("  v12 checks passed")
 
 
+def v13_checks():
+    """v13 (D58): conv backbone — param budget, grid, v12-contract shapes,
+    full gradient flow, cold-start sanity (Kaiming init keeps activations
+    unit-scale so DeployNorm seeding converges), state_dict roundtrip."""
+    m = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m.parameters())
+    print(f"ANetV1 v13 params: {n:,}")
+    assert n < 40_000, "v13 param budget exceeded"
+    assert m.nh == 27 and m.nw == 48 and m.n_win == 27 * 48
+
+    x = torch.rand(2, 3, 540, 960)
+    m.train()
+    out = m(x)
+    assert out["heat"].shape == (2, 2, 27, 48), out["heat"].shape
+    assert out["offset"].shape == (2, 2, 27, 48), out["offset"].shape
+    assert "aux_heat" not in out, "v13 has no deep-supervision probe"
+    # cold start: first TRAIN forward runs on init stats (identity affine);
+    # Kaiming init must keep it finite and near the prior, not 1e23 (the
+    # failure mode that motivated the explicit init — see backbone.py)
+    assert out["heat"].abs().max() < 50, "v13 cold-start activations blew up"
+
+    from anet.train.losses import center_focal_loss, offset_l1
+
+    heat_t = torch.zeros(2, 2, 27, 48)
+    heat_t[:, 0, 5, 5] = 1.0
+    offset_t = torch.zeros(2, 2, 27, 48)
+    reg_mask = torch.zeros(2, 1, 27, 48)
+    reg_mask[:, 0, 5, 5] = 1.0
+    loss = center_focal_loss(out["heat"], heat_t) + \
+        offset_l1(out["offset"], offset_t, reg_mask)
+    l2, l1 = m.reg_losses()
+    (loss + 1e-4 * (l2 + l1)).backward()
+    missing = [k for k, p in m.named_parameters() if p.grad is None]
+    assert not missing, f"v13 params without grad: {missing}"
+    m.zero_grad(set_to_none=True)
+
+    m.eval()
+    with torch.no_grad():
+        out_eval = m(x)
+    assert out_eval["heat"].shape == (2, 2, 27, 48)
+    # eval forward at init sits at the fg prior (bias -4.6), not saturated
+    p = torch.sigmoid(out_eval["heat"])
+    assert 0.001 < p.mean() < 0.1, f"init prior off: {p.mean():.4f}"
+
+    m2 = ANetV1.from_state_dict(m.state_dict())
+    assert m2.arch == "v13"
+    assert sum(p.numel() for p in m2.parameters()) == n
+    print("  v13 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -189,6 +239,7 @@ def main():
             assert 15_000 < n < 24_000, "param count off spec (ARCHITECTURE.md §5)"
     v9_checks()
     v12_checks()
+    v13_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

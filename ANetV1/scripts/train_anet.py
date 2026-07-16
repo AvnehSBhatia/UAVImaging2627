@@ -1,14 +1,18 @@
-"""Experiment 2: ANetV1 from scratch — currently v12, the object center-
-heatmap detector (see the workflow spec for v12; v9 region-classification
-remains available, commented, below — see ARCHITECTURE.md section 14 and
-V9_CHANGES.md for its design).
+"""Experiment 2: ANetV1 from scratch — currently v13, the conv-backbone
+center-heatmap detector (ARCHITECTURE.md section 15 / D58; v12's window-token
+variant and v9 region-classification remain available — v9's cfg is commented
+below, see ARCHITECTURE.md section 14 and V9_CHANGES.md for its design).
 
 No yaml, no flags — edit the cfg block below and run:
     python scripts/train_anet.py
 Device-aware defaults (MI300X vs Mac) come from anet/train/presets.py.
 
-What v12 changes vs v9 (current default; same Stage-1 encoder/neck/Path-A/
-context as v9, D39-D45 below all still apply):
+What v13 changes vs v12 (current default): the whole encoder/neck/Path-A/
+context/token-head stack is replaced by one plain multi-scale conv pyramid
+(anet/model/backbone.py, D58) with the same {"heat","offset"} output contract.
+
+What v12 changed vs v9 (v12 kept the same Stage-1 encoder/neck/Path-A/
+context as v9, D39-D45 below applied to it):
   - Single-phase stride-20 Stage-1 (drop v9's 4x overlap) -> a 27x48 grid
     matching one cell per 20x20 tile, not v9's overlap-averaged 54x96.
   - CenterHead: two INDEPENDENT per-class sigmoids (mannequin, tent — no
@@ -56,7 +60,7 @@ from anet.train.trainer import Trainer  # noqa: E402
 
 # --------------------------------------------------------------------------
 # EDIT HERE — anything not listed keeps its preset default.
-# To resume/fine-tune from a checkpoint matching the arch below (v12 by
+# To resume/fine-tune from a checkpoint matching the arch below (v13 by
 # default), set init_from below (or export ANET_INIT_FROM=runs/anet/last.pt).
 # Checkpoints from a DIFFERENT arch (e.g. a v9 or v8 run) still load through
 # from_state_dict for evaluation, but cannot warm-start a run here — the
@@ -81,12 +85,18 @@ cfg = anet_cfg(
     # checkpoint_dir="runs/anet",
     # # init_from="runs/anet/last.pt",   # uncomment to resume, or ANET_INIT_FROM
 
-    # v12 (object center-heatmap) config — current default. Single-phase
-    # stride-20 Stage-1, independent mannequin/tent sigmoids, CenterNet-style
-    # focal + offset-L1 loss (trainer.py loss_mode=="center").
-    arch="v12",
-    stem="edge_dq4",         # 4-orientation Sobel-init edge stem (D41)
-    hidden=32,               # embedding width (same budget as v9)
+    # v13 (conv-backbone center-heatmap) config — current default (D58).
+    # Plain multi-scale conv pyramid (model/backbone.py) with the SAME
+    # center-heatmap contract, targets, loss and metrics as v12. The window-
+    # token encoder is gone: it pooled each 20x20 tile into one vector before
+    # any fine-stride learned features existed, which capped object-vs-
+    # background embedding separation at ~0.05 and made every from-scratch
+    # run crawl (v12 on MI300X: soft p plateaued ~0.09 across two runs at two
+    # LRs). v13 overfits 12 real frames to 19/21 centers past 0.5 in 400
+    # steps on a Mac — the identical harness where v12 stalls at ~0.09.
+    arch="v13",
+    stem="edge_dq4",         # unused by v13 (kept so v9/v12 swaps stay one-line)
+    hidden=32,               # unused by v13 (same reason)
     # from-scratch center-heatmap training is SLOW on the rare tiny mannequin:
     # the first real run climbed soft p(center) only ~0.002/epoch and the 40-epoch
     # cosine decayed LR away mid-climb. The speed levers are center_pos_weight +
@@ -156,23 +166,29 @@ def main():
         print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, "
               f"warmup={cfg.train.warmup_steps})")
     else:
-        # v12 (current default): CenterHead ignores head_proto entirely (it has
-        # no metric-prototype path — see anet/model/head.py CenterHead vs
-        # RegionHeadV9), so it's simply omitted here rather than passed and
-        # unused. v9 (uncomment the v9 cfg block above to switch back) needs it.
+        # v13 (current default, D58): the conv backbone ignores hidden/h1/stem/
+        # neck/Path-A knobs entirely — its channel plan is fixed in
+        # model/backbone.py; only head_width and prior_fg apply.
         model = ANetV1(
-            arch="v12",
+            arch="v13",
             use_checkpoint=cfg.train.use_checkpoint,
-            dense=True,
-            hidden=cfg.train.hidden,
-            h1=cfg.train.h1,
-            stem=cfg.train.stem,
-            neck_rounds=cfg.train.neck_rounds,
             head_width=cfg.train.head_width,
-            aux_head=cfg.train.aux_head,
-            path_a_per_channel=cfg.train.path_a_per_channel,
             prior_fg=getattr(cfg.train, "prior_fg", None),
         )
+        # v12 model construction — swap back alongside a cfg arch="v12":
+        # model = ANetV1(
+        #     arch="v12",
+        #     use_checkpoint=cfg.train.use_checkpoint,
+        #     dense=True,
+        #     hidden=cfg.train.hidden,
+        #     h1=cfg.train.h1,
+        #     stem=cfg.train.stem,
+        #     neck_rounds=cfg.train.neck_rounds,
+        #     head_width=cfg.train.head_width,
+        #     aux_head=cfg.train.aux_head,
+        #     path_a_per_channel=cfg.train.path_a_per_channel,
+        #     prior_fg=getattr(cfg.train, "prior_fg", None),
+        # )
         # v9 model construction — uncomment alongside the v9 cfg block above:
         # model = ANetV1(
         #     arch="v9",
@@ -191,10 +207,11 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     n_aux = model.aux.weight.numel() + model.aux.bias.numel() \
         if getattr(model, "aux", None) is not None else 0
+    enc = getattr(model, "encoder", None)  # v13 has no window encoder
     print(f"ANetV1 {model.arch}: {n_params:,} params "
           f"({n_params - n_aux:,} deployed + {n_aux} aux) | "
-          f"hidden={model.encoder.hidden} h1={model.encoder.h1} "
-          f"stem={model.stem} | "
+          + (f"hidden={enc.hidden} h1={enc.h1} " if enc is not None else "")
+          + f"stem={model.stem} | "
           f"loss={cfg.train.loss_mode} lr={cfg.train.lr} "
           f"epochs={cfg.train.epochs} | "
           f"train {len(train_ds)} | val {len(val_ds)} | data {cfg.data.root}")
