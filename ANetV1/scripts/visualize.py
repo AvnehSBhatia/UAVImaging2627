@@ -1,18 +1,24 @@
 """Per-image stage dump + prediction overlay for deep visual analysis.
 
-Runs a checkpoint on N images containing a target class (tent by default) and,
-for each image, writes a folder with every pipeline stage as a PNG plus a
-prediction overlay (GT boxes vs predicted region boxes). Also writes a contact
-sheet of all overlays for a quick scan.
+Runs a checkpoint on N images containing a target class and, for each image,
+writes a folder with every pipeline stage as a PNG plus a prediction overlay.
+Also writes a contact sheet of all overlays for a quick scan.
 
-  python scripts/visualize.py --ckpt runs/anet/last.pt --n 30 --cls tent
-  -> runs/viz/<stem>/{00_input, 01_stem_*, 02_embedding*, 03_pathA_*,
-                      04_logit_*, 05_prob_*, 06_overlay}.png + stats.txt
-     runs/viz/_contact_sheet.png
+  python scripts/visualize.py --ckpt runs/anet/best.pt --n 30 --cls mannequin
+  v8/v9 -> runs/viz/<stem>/{00_input, 01_stem_*, 02_embedding*, 03_pathA_*,
+                            04_logit_*, 05_prob_*, 06_overlay}.png + stats.txt
+  v13   -> runs/viz/<stem>/{00_input, 01_stem_*, 02_s4_*, 03_s20_*,
+                            04_heat_logit_* / 04_offset_*, 05_heat_prob_*,
+                            06_overlay}.png + stats.txt
+  both  -> runs/viz/_contact_sheet.png
 
-Stages dumped (see ARCHITECTURE.md): stem features (colour + oriented edges for
-edge_dq, or colour + high-pass for highpass), the encoder embedding map, the 3
-Path-A context scales (activation magnitude), and per-class cell logits/probs.
+v8/v9 stages: stem features (colour + oriented edges for edge_dq, or colour +
+high-pass), the encoder embedding map, the 3 Path-A context scales, per-class
+cell logits/probs, connected-cell region boxes vs GT.
+v13 stages (D58 conv backbone): stem s2 map, s4 stage, every s20 block, per-
+class center-heatmap logits/probs, dx/dy offset maps, and a peak-level overlay
+(the same 3x3-local-max + offset de-quantization the metrics use): matched GT
+green, MISSED GT yellow, matched peaks filled dots, false peaks crossed out.
 Deps: torch + numpy + pillow only (no matplotlib).
 """
 
@@ -31,6 +37,7 @@ from anet.train.presets import anet_cfg  # noqa: E402
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.train.trainer import pick_device  # noqa: E402
 from anet.data.rasterize import CANVAS_H, CANVAS_W, GRID_H, GRID_W  # noqa: E402
+from anet.train.metrics import V12_H, V12_W, CenterObjectMetrics  # noqa: E402
 
 CLS = ("background", "mannequin", "tent")
 CELL = CANVAS_H // GRID_H  # 10 px per cell
@@ -128,7 +135,104 @@ def overlay(base_rgb, gt_boxes, pred_grid):
     return im
 
 
-# ---- staged forward --------------------------------------------------------
+# ---- v13 (D58 conv backbone): staged forward + peak-level overlay ----------
+@torch.no_grad()
+def stages_v13(model, img):
+    """Re-run the backbone stage by stage (same modules, same order as
+    V13Backbone.forward) so every intermediate map can be dumped."""
+    bb = model.backbone
+    x_stem = bb.act(bb.stem_norm(bb.stem(img)))   # (1, 16, 270, 480)
+    x_s4 = bb.block4(bb.down4(x_stem))            # (1, 32, 135, 240)
+    x = bb.down20(x_s4)                           # (1, 64, 27, 48)
+    x_blocks = []
+    for blk in bb.blocks:
+        x = blk(x)
+        x_blocks.append(x)
+    out = bb.head(x)                              # (1, 4, 27, 48)
+    return x_stem, x_s4, x_blocks, {"heat": out[:, 0:2], "offset": out[:, 2:4]}
+
+
+def peaks_of(heat_prob, off_prob, thresh=0.3):
+    """Per-class peak list [(cls, cx, cy, p)] in canvas-normalized coords —
+    the exact CenterObjectMetrics pipeline (3x3 local max + offset dequant)."""
+    out = []
+    for c in range(2):
+        rows, cols = CenterObjectMetrics._find_peaks(heat_prob[c], thresh)
+        for r, cc in zip(rows, cols):
+            cx = (cc + off_prob[0, r, cc]) / V12_W
+            cy = (r + off_prob[1, r, cc]) / V12_H
+            out.append((c + 1, float(cx), float(cy), float(heat_prob[c, r, cc])))
+    return out
+
+
+def overlay_center(base_rgb, gt_boxes, peaks):
+    """GT boxes: green if some same-class peak lands inside, YELLOW if missed.
+    Peaks: filled dot when matched to a GT box, crossed-out ring when false."""
+    im = base_rgb.copy()
+    d = ImageDraw.Draw(im)
+    gt = [b for b in gt_boxes if b[0] >= 0]
+    matched_gt, matched_pk = [False] * len(gt), [False] * len(peaks)
+    for gi, box in enumerate(gt):
+        bx, by, bw, bh = box[1], box[2], box[3], box[4]
+        for pi, (pc, px, py, _) in enumerate(peaks):
+            if pc == int(box[0]) + 1 and abs(px - bx) <= bw / 2 and abs(py - by) <= bh / 2:
+                matched_gt[gi] = matched_pk[pi] = True
+    for gi, box in enumerate(gt):
+        cx, cy, w, h = box[1:] * np.array([CANVAS_W, CANVAS_H, CANVAS_W, CANVAS_H])
+        color = GT_COLOR if matched_gt[gi] else (255, 220, 0)  # yellow = MISS
+        d.rectangle([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2],
+                    outline=color, width=2)
+    for pi, (pc, px, py, p) in enumerate(peaks):
+        x, y, rad = px * CANVAS_W, py * CANVAS_H, 5
+        if matched_pk[pi]:
+            d.ellipse([x - rad, y - rad, x + rad, y + rad], fill=BOX_COLOR[pc])
+        else:  # false peak: ring + cross
+            d.ellipse([x - rad, y - rad, x + rad, y + rad], outline=BOX_COLOR[pc], width=2)
+            d.line([x - rad, y - rad, x + rad, y + rad], fill=BOX_COLOR[pc], width=2)
+            d.line([x - rad, y + rad, x + rad, y - rad], fill=BOX_COLOR[pc], width=2)
+        d.text((x + rad + 1, y - rad), f"{p:.2f}", fill=BOX_COLOR[pc])
+    d.text((4, 4), "GT: green=found yellow=MISSED | peaks: dot=match ring+X=false "
+                   "(red=mannequin blue=tent)", fill=(255, 255, 0))
+    return im
+
+
+def dump_v13(model, s, img, d, base):
+    """Full per-image stage dump for the conv backbone. Returns (overlay, stats)."""
+    x_stem, x_s4, x_blocks, out = stages_v13(model, img)
+    montage(x_stem[0].cpu().numpy(), cols=4, scale=1).save(d / "01_stem_montage.png")
+    heat(x_stem[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "01_stem_mag.png")
+    montage(x_s4[0].cpu().numpy(), cols=8, scale=1).save(d / "02_s4_montage.png")
+    heat(x_s4[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "02_s4_mag.png")
+    for bi, xb in enumerate(x_blocks):
+        heat(xb[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / f"03_s20_block{bi}_mag.png")
+    montage(x_blocks[-1][0].cpu().numpy(), cols=8).save(d / "03_s20_final_montage.png")
+    heat_l = out["heat"][0].float().cpu()
+    off_p = torch.sigmoid(out["offset"][0].float()).cpu().numpy()
+    heat_p = torch.sigmoid(heat_l).numpy()
+    for c, name in ((0, "mannequin"), (1, "tent")):
+        heat(heat_l[c], signed=True, size=(CANVAS_W, CANVAS_H)).save(d / f"04_heat_logit_{name}.png")
+        heat(heat_p[c], size=(CANVAS_W, CANVAS_H)).save(d / f"05_heat_prob_{name}.png")
+        prob_overlay(base, heat_p[c], BOX_COLOR[c + 1]).save(d / f"05_heat_prob_{name}_overlay.png")
+    heat(off_p[0], size=(CANVAS_W, CANVAS_H)).save(d / "04_offset_dx.png")
+    heat(off_p[1], size=(CANVAS_W, CANVAS_H)).save(d / "04_offset_dy.png")
+    pks = peaks_of(heat_p, off_p)
+    ov = overlay_center(base, s["boxes"].numpy(), pks)
+    ov.save(d / "06_overlay.png")
+    gt = [b for b in s["boxes"].numpy() if b[0] >= 0]
+    lines = [f"image {s['stem']}"]
+    for c, name in ((1, "mannequin"), (2, "tent")):
+        boxes_c = [b for b in gt if int(b[0]) + 1 == c]
+        pk_c = [p for p in pks if p[0] == c]
+        found = sum(any(p[0] == c and abs(p[1] - b[1]) <= b[3] / 2
+                        and abs(p[2] - b[2]) <= b[4] / 2 for p in pks) for b in boxes_c)
+        lines.append(f"{name}: gt={len(boxes_c)} found={found} peaks={len(pk_c)} "
+                     f"max_p={max((p[3] for p in pk_c), default=0.0):.3f} "
+                     f"max_heat={float(heat_p[c - 1].max()):.3f}")
+    (d / "stats.txt").write_text("\n".join(lines) + "\n")
+    return ov, lines[1:]
+
+
+# ---- staged forward (v8/v9) -------------------------------------------------
 @torch.no_grad()
 def stages(model, img):
     feat = model._features(img)                                    # (1,feat,H,W)
@@ -143,7 +247,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="runs/anet/last.pt")
     ap.add_argument("--n", type=int, default=30)
-    ap.add_argument("--cls", choices=["tent", "mannequin"], default="tent")
+    ap.add_argument("--cls", choices=["tent", "mannequin", "any"], default="tent")
     ap.add_argument("--split", default="val")
     ap.add_argument("--out", default="runs/viz")
     args = ap.parse_args()
@@ -152,13 +256,19 @@ def main():
 
     sd = torch.load(args.ckpt, map_location=device)
     model = ANetV1.from_state_dict(sd, use_checkpoint=False).to(device).eval()
-    print(f"ckpt {args.ckpt} | hidden={model.encoder.hidden} stem={model.stem} | device={device}")
+    enc = getattr(model, "encoder", None)  # v13 has no window encoder
+    print(f"ckpt {args.ckpt} | arch={model.arch} "
+          + (f"hidden={enc.hidden} " if enc is not None else "")
+          + f"stem={model.stem} | device={device}")
 
     ds = SUASCells(cfg.data.root, args.split, coverage_thresh=cfg.data.coverage_thresh)
-    want = 2 if args.cls == "tent" else 1
-    has = 1 if args.cls == "tent" else 0  # ds._has columns: (has_m, has_t)
+    if args.cls == "any":
+        keep = lambda i: any(ds._has[i])  # noqa: E731
+    else:
+        has = 1 if args.cls == "tent" else 0  # ds._has columns: (has_m, has_t)
+        keep = lambda i: ds._has[i][has]  # noqa: E731
     idx = [i for i in range(len(ds))
-           if not ds.is_visdrone(i) and ds._has[i][has]][: args.n]
+           if not ds.is_visdrone(i) and keep(i)][: args.n]
     print(f"{len(idx)} synthetic {args.split} images containing {args.cls}")
 
     out_root = Path(args.out)
@@ -171,6 +281,15 @@ def main():
     for rank, i in enumerate(idx):
         s = ds[i]
         img = s["image"].unsqueeze(0).to(device)
+        if model.arch == "v13":
+            d = out_root / s["stem"]
+            d.mkdir(exist_ok=True)
+            base = chw_to_rgb(s["image"])
+            base.save(d / "00_input.png")
+            ov, stat_lines = dump_v13(model, s, img, d, base)
+            overlays.append(ov)
+            print(f"[{rank + 1}/{len(idx)}] {s['stem']}  " + " | ".join(stat_lines))
+            continue
         feat, m16, maps, cells = stages(model, img)
         cells = cells[0].float().cpu()
         pred = cells.argmax(0).numpy()
