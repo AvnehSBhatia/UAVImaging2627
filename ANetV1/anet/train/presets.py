@@ -234,7 +234,15 @@ def anet_cfg(**overrides):
         # ANET_CKPT=0 disables (a dedicated card with VRAM to spare + compile).
         use_checkpoint=(os.environ["ANET_CKPT"].strip().lower() in ("1", "true", "yes"))
         if "ANET_CKPT" in os.environ else True,
-        amp="bf16" if IS_CUDA else None,  # fp16 NaNs (measured); bf16 validated on MI300X
+        # fp16 NaNs (measured); bf16 validated on MI300X for v9-v13. ANET_AMP
+        # overrides (bf16|fp16|off) — the step-0-NaN bisect knob: a tier-M
+        # v15 NaN'd on the FIRST forward on ROCm while the identical math is
+        # finite in local bf16 (reproduced clean), so suspicion falls on
+        # compile/MIOpen kernels at the new pixel_unshuffle shapes; bisect
+        # with ANET_COMPILE=0 first, then ANET_AMP=off.
+        amp={"off": None, "0": None, "none": None}.get(
+            os.environ.get("ANET_AMP", "").lower(),
+            os.environ.get("ANET_AMP") or ("bf16" if IS_CUDA else None)),
         # ANET_SAMPLES caps draws/epoch (was uncapped on CUDA -> full ~13.5k ->
         # ~60 min/epoch dense). The WeightedRandomSampler redraws i.i.d. from a
         # FIXED distribution every epoch, so capping changes only how often you
