@@ -49,7 +49,7 @@ def evaluate(model, loader, device):
     hit = {0: 0, 1: 0, 2: 0}
     tot = {0: 0, 1: 0, 2: 0}
     for batch in loader:
-        for size, (imgs, _, labels) in batch.items():
+        for size, (imgs, _, labels, _) in batch.items():
             pred = model(imgs.to(device)).argmax(1).cpu()
             for c in (0, 1, 2):
                 sel = labels == c
@@ -122,7 +122,7 @@ def main():
             if not batch_d:
                 continue
             loss = 0.0
-            for size, (imgs, _, labels) in batch_d.items():
+            for size, (imgs, _, labels, _) in batch_d.items():
                 logits = model(imgs.to(device))
                 loss = loss + F.cross_entropy(logits, labels.to(device),
                                               weight=cls_w)

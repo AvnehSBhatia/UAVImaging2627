@@ -73,3 +73,16 @@ checkpoints `runs/fivestack/`.
   machine.
 - `--eval CKPT --split test` on either trainer gives the final-numbers
   pass; val (capped at 800 images) drives checkpoint selection only.
+- **YOLO reference bar**: `scripts/benchmark_probes.py` runs YOLO26n
+  full-frame and maps its boxes into the IDENTICAL crops — its boxes are
+  rasterized through the same `rect_mask` geometry (P1's game) and its
+  best-overlap box classifies each patch (P2's game), so all three columns
+  are apples-to-apples. Dry run (12 test frames): YOLO mask_iou 0.934,
+  bg_white 0.000, mann_r 0.929, tent_r 1.000 at 2.38M params — the bar a
+  52-param colour probe / 5k-param filter bank is measured against.
+
+  ```
+  python scripts/benchmark_probes.py \
+      --whitebox runs/whitebox/best.pt --fivestack runs/fivestack/best.pt \
+      --yolo runs/yolo/yolo26n/weights/best.pt --latency
+  ```

@@ -50,7 +50,7 @@ def evaluate(model, loader, device):
     n_obj = 0
     bg_white = bg_px = 0.0
     for batch in loader:
-        for size, (imgs, masks, labels) in batch.items():
+        for size, (imgs, masks, labels, _) in batch.items():
             p = (torch.sigmoid(model(imgs.to(device))[:, 0]) > 0.5).float().cpu()
             obj = labels > 0
             if obj.any():
@@ -127,7 +127,7 @@ def main():
             if not batch_d:
                 continue
             loss = 0.0
-            for size, (imgs, masks, _) in batch_d.items():
+            for size, (imgs, masks, _, _) in batch_d.items():
                 logits = model(imgs.to(device))[:, 0]
                 loss = loss + F.binary_cross_entropy_with_logits(
                     logits, masks.to(device), pos_weight=pw)

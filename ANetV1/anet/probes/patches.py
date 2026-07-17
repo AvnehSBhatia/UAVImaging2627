@@ -56,9 +56,9 @@ class PatchCrops(Dataset):
             size = CROP.get(c)
             if size is None:
                 continue
-            crop, mask = self._window(img, rects, (x0 + x1) / 2,
-                                      (y0 + y1) / 2, size)
-            out[size].append((crop, mask, c + 1))
+            crop, mask, org = self._window(img, rects, (x0 + x1) / 2,
+                                           (y0 + y1) / 2, size)
+            out[size].append((crop, mask, c + 1, org))
         # background crops: deterministic per image index (resume-safe, same
         # crops every epoch/eval), rejection-sampled off every GT rect
         rng = np.random.default_rng(0xB6 + 9973 * i)
@@ -74,7 +74,8 @@ class PatchCrops(Dataset):
                        for _, x0, y0, x1, y1 in rects):
                     continue
                 out[size].append((img[:, oy:oy + size, ox:ox + size].clone(),
-                                  torch.zeros(size, size), 0))
+                                  torch.zeros(size, size), 0,
+                                  torch.tensor([ox, oy])))
                 made += 1
         return out
 
@@ -83,29 +84,37 @@ class PatchCrops(Dataset):
         ox = int(np.clip(round(cx - size / 2), 0, CANVAS_W - size))
         oy = int(np.clip(round(cy - size / 2), 0, CANVAS_H - size))
         crop = img[:, oy:oy + size, ox:ox + size].clone()
-        mask = torch.zeros(size, size)
-        for _, x0, y0, x1, y1 in rects:
-            xa, ya = max(int(x0) - ox, 0), max(int(y0) - oy, 0)
-            xb = min(int(np.ceil(x1)) - ox, size)
-            yb = min(int(np.ceil(y1)) - oy, size)
-            if xa < xb and ya < yb:
-                mask[ya:yb, xa:xb] = 1.0
-        return crop, mask
+        return crop, rect_mask(rects, ox, oy, size), torch.tensor([ox, oy])
 
     def sample_weights(self):
         w = self.base.sample_weights().numpy()
         return torch.from_numpy(w[np.asarray(self.idx)])
 
 
+def rect_mask(rects, ox, oy, size):
+    """Union of pixel rects rendered white inside a size x size window at
+    (ox, oy). Shared by GT mask building and the YOLO benchmark's
+    prediction rasterizer, so both sides use identical geometry."""
+    mask = torch.zeros(size, size)
+    for _, x0, y0, x1, y1 in rects:
+        xa, ya = max(int(x0) - ox, 0), max(int(y0) - oy, 0)
+        xb = min(int(np.ceil(x1)) - ox, size)
+        yb = min(int(np.ceil(y1)) - oy, size)
+        if xa < xb and ya < yb:
+            mask[ya:yb, xa:xb] = 1.0
+    return mask
+
+
 def collate_patches(items):
-    """Per-image dicts -> {"40": (imgs, masks, labels), "100": ...}.
+    """Per-image dicts -> {"40": (imgs, masks, labels, origins), "100": ...}.
     A size group is absent when the batch has no crops at that size —
     consumers must iterate over whatever keys exist."""
     out = {}
     for size in (40, 100):
-        trip = [t for d in items for t in d[size]]
-        if trip:
-            out[str(size)] = (torch.stack([c for c, _, _ in trip]),
-                              torch.stack([m for _, m, _ in trip]),
-                              torch.tensor([y for _, _, y in trip]))
+        quad = [t for d in items for t in d[size]]
+        if quad:
+            out[str(size)] = (torch.stack([c for c, _, _, _ in quad]),
+                              torch.stack([m for _, m, _, _ in quad]),
+                              torch.tensor([y for _, _, y, _ in quad]),
+                              torch.stack([o for _, _, _, o in quad]))
     return out
