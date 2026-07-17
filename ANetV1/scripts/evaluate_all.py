@@ -79,7 +79,11 @@ def _load_anet(ckpt, device):
 def eval_anet(ckpt, ds, device, conf_thresh=0.0, peak_thresh=0.3):
     model = _load_anet(ckpt, device)
     loader = DataLoader(ds, batch_size=4, num_workers=4)
-    if model.arch in ("v12", "v13"):
+    # every arch since v12 is a center-heatmap detector returning the
+    # {"heat","offset"} dict; only the v8/v9 cell archs return cell logits.
+    # Route by that contract, not an arch whitelist — the whitelist version
+    # silently excluded v14/v15/v16 and crashed on 'dict has no .float()'.
+    if model.arch not in ("v8", "v9"):
         # center-heatmap archs return {"heat","offset"} dicts, and their
         # object metrics come from peak-finding, not cell argmax. No cell
         # table — the summary keys mirror ObjectMetrics by design, so the
