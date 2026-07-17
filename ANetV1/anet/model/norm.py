@@ -59,6 +59,16 @@ class DeployNorm(nn.Module):
         self.momentum = momentum
         self.eps = eps
         self._pending = None  # (mean, var) stashed by observe(), applied post-step
+        # frozen=True pins the running stats (observe/apply become no-ops).
+        # Needed whenever pretrained weights are frozen but the module keeps
+        # seeing shifted inputs (ANET_FREEZE_TRUNK adapter mode): frozen
+        # WEIGHTS were co-adapted to specific stat values, and letting the
+        # stats chase upstream-adapter distribution shifts while the weights
+        # cannot follow is a feedback loop with no restoring force — measured
+        # on MI300X: adapter run collapsed sel 1.712 -> 0.26 with train loss
+        # RISING (function drift, not overfitting). Plain attribute, not a
+        # buffer: state_dicts are unchanged.
+        self.frozen = False
 
     # ------------------------------------------------------------- statistics
     @torch.no_grad()
@@ -86,6 +96,8 @@ class DeployNorm(nn.Module):
     def observe(self, x, channels_last=False):
         """Stash this batch's stats for the post-backward update.
         channels_last=False reads (B, C, H, W) / (N, C); True reads (..., C)."""
+        if self.frozen:
+            return
         self._pending = self._stats(x, channels_last)
 
     @torch.no_grad()
@@ -107,6 +119,9 @@ class DeployNorm(nn.Module):
 
     @torch.no_grad()
     def apply_pending(self):
+        if self.frozen:
+            self._pending = None
+            return
         if self._pending is not None:
             self._update(*self._pending)
             self._pending = None

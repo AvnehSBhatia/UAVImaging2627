@@ -606,3 +606,13 @@ Driver: the first trained v13 (25.2k params) measured against the corrected YOLO
 Training: unchanged v13 recipe (§15.3). Two entry points: from scratch, or `ANET_INIT_FROM=<v13 ckpt>` — the trainer transfers all shared tensors and reports the new-at-identity count; warm-start begins at the donor's exact metrics. `from_state_dict` distinguishes v14 by the `backbone.noise.weight` key.
 
 What would falsify each piece (pre-registered, in the §9 ablation spirit): D61 fails if fp/img does not drop at matched recall; D62 fails if worst-decile recall does not move; D60/D63 fail if the gains stay at ~0 (the valves report their own uselessness); D59 fails if the learned kernel stays ~0. Each is independently removable — they are additive valved branches, not rewires.
+
+### 16.1 Run record and the frozen-stats correction (2026-07-17)
+
+Three MI300X v14 runs, three distinct findings:
+
+1. **From-scratch, unbounded gate**: collapse via the whole-trunk multiplier (fixed — D61 is now bounded).
+2. **Full-tune warm-start, bounded gate, 5e-4**: epoch 0 reproduced the donor exactly (D63 held on hardware: sel 1.700), then val degraded monotonically to ~0.8 by epoch 14 while train loss *fell* 1.42→1.18 — the new capacity fits train in ways that do not generalize.
+3. **Adapter (`ANET_FREEZE_TRUNK=1`), first attempt — INVALID**: sel 1.691→1.712 (ep2) then collapsed to ~0.26 with train loss *RISING* from epoch ~9 — impossible for overfitting, diagnostic for **function drift**: the freeze pinned donor *weights* but left donor DeployNorm *stats* live, and the trainable modules sit upstream of frozen norms (noise→stem_norm, qshift_i→next stage), so the stats chased the adapters' distribution shifts while the frozen weights could not re-adapt — a feedback loop with no restoring force. Fix: `DeployNorm.frozen` pins the stats; the freeze path now freezes donor weights *and* donor stats (verified: zero donor-buffer drift under adapter training). General DeployNorm lesson: **frozen weights require frozen stats whenever anything trainable sits upstream.**
+
+Status: `train_anet.py`'s default arch is **reverted to v13** (the proven model); v14 is opt-in via `ANET_ARCH=v14`. The corrected adapter run is v14's remaining clean shot — with donor weights+stats pinned, the donor function is a true fixed point, and the run either beats the donor's sel or falsifies the D59–D62 priors on this data. Whichever way it lands, the next headroom levers are data (gen2 hard canopy negatives) and center-mode distillation from the YOLO26n teacher, both pre-registered and untried.

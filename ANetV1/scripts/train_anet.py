@@ -97,12 +97,13 @@ cfg = anet_cfg(
     # LRs, ~7k steps). v13 overfits 12 real frames to 19/21 centers past 0.5
     # in 400 steps / 13 s on a Mac; the v12 control also gets there in this
     # small harness but needs 867 s — see ARCHITECTURE.md section 15.2.
-    # v14 (D59-D63) — current default: v13 + identity-init structured priors
-    # (dw7x7 noise filter, 5x dual-quaternion shift, texture-energy gate,
-    # max-pool detail skip, zero-gamma 4th block), each tied to a measured
-    # v13 failure mode (ARCHITECTURE.md section 16). ANET_INIT_FROM a v13
-    # checkpoint warm-starts v14 to EXACTLY that v13 at step 0.
-    arch="v14",
+    # DEFAULT REVERTED to v13 (the proven model) after two full-tune v14 runs
+    # degraded val and the first adapter run was invalidated by live trunk
+    # norm stats (see ARCHITECTURE.md section 16). v14 (D59-D63) is opt-in:
+    # ANET_ARCH=v14, ideally with ANET_INIT_FROM=<v13 ckpt> +
+    # ANET_FREEZE_TRUNK=1 — the corrected adapter test is v14's remaining
+    # clean shot; if it cannot beat the donor's sel, v14 is falsified.
+    arch=os.environ.get("ANET_ARCH") or "v13",
     stem="edge_dq4",         # unused by v13/v14 (kept so v9/v12 swaps stay one-line)
     hidden=32,               # unused by v13/v14 (same reason)
     # from-scratch center-heatmap training is SLOW on the rare tiny mannequin:
@@ -186,9 +187,26 @@ def main():
                     if name in donor_sd:
                         p.requires_grad_(False)
                         frozen += 1
+                # freeze the donor DeployNorm STATS too. The first adapter
+                # run left them live ("updates are ~no-ops") — wrong: the
+                # trainable modules sit UPSTREAM of frozen norms (noise ->
+                # stem_norm, qshift_i -> next frozen stage), so the stats
+                # chased the adapters' distribution shifts while the frozen
+                # weights could not re-adapt. Measured: sel 1.712 -> 0.26
+                # with train loss RISING from epoch ~9 — function drift, not
+                # overfitting. With stats pinned, the donor function is a
+                # fixed point again and only the adapter params move.
+                from anet.model.norm import DeployNorm
+                n_norms = 0
+                for name, mod in m14.named_modules():
+                    if isinstance(mod, DeployNorm) \
+                            and f"{name}.running_mean" in donor_sd:
+                        mod.frozen = True
+                        n_norms += 1
                 trainable = sum(p.numel() for p in m14.parameters()
                                 if p.requires_grad)
-                print(f"ANET_FREEZE_TRUNK=1: {frozen} donor tensors frozen; "
+                print(f"ANET_FREEZE_TRUNK=1: {frozen} donor tensors + "
+                      f"{n_norms} donor DeployNorm stat sets frozen; "
                       f"{trainable:,} params (new v14 modules only) train")
             model = m14
         elif model.arch != cfg.train.arch:
