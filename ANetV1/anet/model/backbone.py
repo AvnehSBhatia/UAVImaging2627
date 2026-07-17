@@ -431,3 +431,118 @@ class V15Backbone(nn.Module):
         x = self.act(self.spd_norm(self.spd_proj(x)))
         x = self.blocks(x)
         return self.head(x)
+
+
+class CosineWeaveTexture(nn.Module):
+    """Auxiliary cosine-weave texture channel (v16, D66) — user-directed test
+    of the texture-prior hypothesis on the UNSCALED v13, in its fairest form.
+
+    Pre-registered expectations (ARCHITECTURE.md 16.4): per the 16.2 capacity
+    verdict, a prior on v13 is unlikely to lift recall (the worst-decile
+    misses are objects v13 cannot represent); but the canopy FP band
+    (false peaks at prob 0.30-0.60 on high-frequency texture) is a
+    decision-boundary problem, so fp/img reduction AT HELD RECALL is the
+    plausible win and the falsifier this module is judged on.
+
+    Mechanism — the project's signature multi-cosine weave (SlimContext/D44
+    idiom), applied SPATIALLY and deploy-legally:
+
+        e   = DN(highpass(x_s4)^2)         texture energy at s4 (D32-init hp)
+        E   = avgpool5(e)                  -> the 27x48 grid
+        u   = tanh(1x1: ch_mid -> K)       bounded states, |u| < 1
+        W   = [cos(f1*u + p1), cos(f2*u + p2)]   2 harmonics x K states
+        g   = sigmoid(1x1: 2K -> ch_top)   per-channel texture mask
+        y'  = y * (1 + tanh(w_gate) * g)   bounded modulation (v14 D61 lesson:
+                                           factor in (1-g,1+g) subset (0,2) —
+                                           trunk shutdown unrepresentable)
+
+    Deploy legality is the same LUT contract as every cosine in this repo:
+    tanh bounds each state to (-1,1), so the cosine argument lives in
+    (-|f|-|p|, |f|+|p|) with the frequencies L2-regularized through
+    reg_l2() -> the existing D24 l2_score_reg hook keeps them inside one
+    period for int8 LUTs. tanh/cos/sigmoid are single LUTs; everything else
+    is conv/DN/mul/avg-pool.
+
+    Every v14 safety lesson is load-bearing here: identity at init
+    (w_gate=0), DN observes real energy stats from the first forward (no
+    zero-valve behind a norm), bounded gate, and v13 module names untouched
+    upstream so a v13 checkpoint warm-starts v16 bit-exactly (D63 contract,
+    asserted in smoke). ~1.8k params — v16 stays inside the ORIGINAL <40k
+    budget (~27k total)."""
+
+    def __init__(self, ch_mid, ch_top, k=8):
+        super().__init__()
+        self.hp = nn.Conv2d(ch_mid, ch_mid, 3, 1, 1, groups=ch_mid, bias=False)
+        with torch.no_grad():  # isotropic high-pass init (D32 stem kernel)
+            self.hp.weight.fill_(-1.0 / 9.0)
+            self.hp.weight[:, :, 1, 1] += 1.0
+        self.norm = DeployNorm(ch_mid)
+        self.state = nn.Conv2d(ch_mid, k, 1)
+        # two harmonics per state, frequencies started inside one period and
+        # held there by reg_l2 (D24); phases learnable, unregularized
+        self.freq = nn.Parameter(torch.tensor([1.0, 2.0]).repeat_interleave(k))
+        self.phase = nn.Parameter(torch.zeros(2 * k))
+        self.mix = nn.Conv2d(2 * k, ch_top, 1)
+        self.w_gate = nn.Parameter(torch.zeros(1, ch_top, 1, 1))
+
+    def forward(self, x_s4, y):
+        e = self.hp(x_s4)
+        e = self.norm(e * e)                            # texture energy
+        e = F.avg_pool2d(e, 5, 5)                       # 135x240 -> 27x48
+        u = torch.tanh(self.state(e))                   # bounded states (B,K,27,48)
+        uu = torch.cat([u, u], 1)                       # (B,2K,...) one per harmonic
+        w = torch.cos(uu * self.freq.reshape(1, -1, 1, 1)
+                      + self.phase.reshape(1, -1, 1, 1))  # the weave
+        g = torch.sigmoid(self.mix(w))                  # (B, ch_top, 27, 48)
+        return y * (1.0 + torch.tanh(self.w_gate) * g)
+
+    def reg_l2(self):  # D24: cosine frequencies bounded to one LUT period
+        return (self.freq ** 2).sum()
+
+
+class V16Backbone(nn.Module):
+    """v13 trunk (module names preserved verbatim — D63 warm-start contract)
+    + the CosineWeaveTexture channel between the blocks and the head. The
+    single-variable ablation the texture hypothesis deserves: ~1.8k new
+    params, everything else bit-identical to v13."""
+
+    def __init__(self, head_width=24, prior_fg=None, channels=(16, 32, 64),
+                 n_blocks=3):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        self.weave = CosineWeaveTexture(ch_mid, ch_top)
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        for mod in (self.stem, self.down4, self.block4, self.down20,
+                    self.blocks, self.head):
+            for m in mod.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.weave.state.bias)
+        nn.init.zeros_(self.weave.mix.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def forward(self, img):  # (B, 3, 540, 960) -> (B, 4, 27, 48)
+        x = self.act(self.stem_norm(self.stem(img)))
+        x_s4 = self.block4(self.down4(x))
+        y = self.blocks(self.down20(x_s4))
+        y = self.weave(x_s4, y)                          # D66
+        return self.head(y)

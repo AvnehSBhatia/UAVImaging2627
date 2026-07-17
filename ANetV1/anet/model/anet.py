@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from .backbone import V13Backbone, V14Backbone, V15Backbone
+from .backbone import V13Backbone, V14Backbone, V15Backbone, V16Backbone
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
@@ -38,7 +38,7 @@ class ANetV1(nn.Module):
                  channels=None, n_blocks=None):
         super().__init__()
         self.prior_fg = prior_fg
-        if arch in ("v13", "v14", "v15"):
+        if arch in ("v13", "v14", "v15", "v16"):
             # v13 (D58): plain multi-scale conv backbone — the window-token
             # encoder, neck, Path A, context and token-stream head are all
             # replaced by backbone.py's conv pyramid ending in the same
@@ -66,7 +66,10 @@ class ANetV1(nn.Module):
                 self.backbone = V14Backbone(head_width=head_width,
                                             prior_fg=prior_fg)
             else:
-                cls_bb = V15Backbone if arch == "v15" else V13Backbone
+                # v16 (D66): v13 trunk + the auxiliary cosine-weave texture
+                # channel — the single-variable texture-hypothesis test.
+                cls_bb = {"v15": V15Backbone, "v16": V16Backbone}.get(
+                    arch, V13Backbone)
                 kw = dict(head_width=head_width, prior_fg=prior_fg)
                 if channels is not None:
                     kw["channels"] = tuple(channels)
@@ -247,6 +250,11 @@ class ANetV1(nn.Module):
                 w = sd["backbone.spd_proj.weight"]
                 channels = (sd["backbone.stem.weight"].shape[0],
                             w.shape[1] // 25, w.shape[0])
+            elif "backbone.weave.mix.weight" in sd:  # v16's unique key
+                arch = "v16"
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            sd["backbone.down4.pw.weight"].shape[0],
+                            sd["backbone.head.0.weight"].shape[1])
             elif "backbone.noise.weight" in sd:
                 arch, channels = "v14", None  # v14 pins the spec channels
             else:
@@ -485,7 +493,7 @@ class ANetV1(nn.Module):
         return result
 
     def forward(self, img):
-        if self.arch in ("v13", "v14", "v15"):
+        if self.arch in ("v13", "v14", "v15", "v16"):
             out = self.backbone(img)  # (B, 4, 27, 48)
             return {"heat": out[:, 0:2], "offset": out[:, 2:4]}
         feat = self._features(img)
@@ -503,6 +511,11 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
+        if self.arch == "v16":
+            # the weave's cosine frequencies are the one thing to bound
+            # (D24: one LUT period); no scalar-kernel pools to L1
+            l2 = self.backbone.weave.reg_l2()
+            return l2, l2 * 0.0
         if self.arch in ("v13", "v14", "v15"):
             # no cosine gates or scalar-kernel pools to bound — plain convs
             # are already deploy-legal; weight decay (optimizer) covers L2

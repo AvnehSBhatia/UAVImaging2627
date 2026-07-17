@@ -171,19 +171,26 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        if model.arch == "v13" and cfg.train.arch == "v14":
-            # v14 is a superset of v13 by construction (same module names for
-            # the shared trunk; every new module identity-init, D63): copy the
-            # v13 weights in and the v14 IS that v13 at step 0 — asserted in
-            # smoke_test. Selection can only move away from a proven optimum.
-            m14 = ANetV1(arch="v14", use_checkpoint=cfg.train.use_checkpoint,
+        if model.arch == "v13" and cfg.train.arch in ("v14", "v16"):
+            # v14/v16 are supersets of v13 by construction (same module names
+            # for the shared trunk; every new module identity-init, D63): copy
+            # the v13 weights in and the target IS that v13 at step 0 —
+            # asserted in smoke_test. Selection can only move away from a
+            # proven optimum. v16 inherits the donor's channel plan/depth so
+            # scaled-v13 donors warm-start too; v14 pins the spec shapes.
+            extra = (dict(channels=model.backbone.channels,
+                          n_blocks=len(model.backbone.blocks))
+                     if cfg.train.arch == "v16" else {})
+            m14 = ANetV1(arch=cfg.train.arch,
+                         use_checkpoint=cfg.train.use_checkpoint,
                          head_width=cfg.train.head_width,
-                         prior_fg=getattr(cfg.train, "prior_fg", None))
+                         prior_fg=getattr(cfg.train, "prior_fg", None), **extra)
             donor_sd = model.state_dict()
             missing, unexpected = m14.load_state_dict(donor_sd, strict=False)
-            assert not unexpected, f"v13->v14 transfer: unexpected {unexpected}"
-            print(f"v13 -> v14 warm start: {len(donor_sd)} tensors "
-                  f"transferred, {len(missing)} new v14 tensors at identity init")
+            assert not unexpected, \
+                f"v13->{cfg.train.arch} transfer: unexpected {unexpected}"
+            print(f"v13 -> {cfg.train.arch} warm start: {len(donor_sd)} tensors "
+                  f"transferred, {len(missing)} new tensors at identity init")
             if os.environ.get("ANET_FREEZE_TRUNK") == "1":
                 # Adapter mode: only the identity-init v14 modules train; the
                 # donor v13 trunk is immutable, so the run can test whether

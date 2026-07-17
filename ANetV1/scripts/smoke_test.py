@@ -332,6 +332,44 @@ def v15_checks():
     print("  v15 checks passed")
 
 
+def v16_checks():
+    """v16 (D66): cosine-weave texture channel on the v13 trunk — identity
+    contract, bounded gate, D24 frequency regularization, budget."""
+    m13 = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    m16 = ANetV1(arch="v16", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m16.parameters())
+    print(f"ANetV1 v16 params: {n:,}")
+    assert n < 40_000, "v16 must stay inside the ORIGINAL budget"
+
+    missing, unexpected = m16.load_state_dict(m13.state_dict(), strict=False)
+    assert not unexpected and all("weave" in k for k in missing)
+    m13.eval(); m16.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        d = max((m13(x)["heat"] - m16(x)["heat"]).abs().max().item(),
+                (m13(x)["offset"] - m16(x)["offset"]).abs().max().item())
+    print(f"  v16 identity-at-init vs donor v13: max delta {d:.2e}")
+    assert d < 1e-5, "D63 identity contract broken in v16"
+
+    with torch.no_grad():  # bounded modulation: no trunk kill-switch
+        m16.backbone.weave.w_gate.fill_(-1e6)
+        assert m16(x)["heat"].isfinite().all(), "v16 gate not collapse-safe"
+        m16.backbone.weave.w_gate.zero_()
+
+    m16.train()
+    out = m16(x)
+    l2, l1 = m16.reg_losses()  # v16: weave frequency bound (D24)
+    (out["heat"].square().mean() + 3e-3 * (l2 + l1)).backward()
+    p = dict(m16.named_parameters())
+    assert p["backbone.weave.w_gate"].grad.abs().max() > 0, "dead valve"
+    assert p["backbone.weave.freq"].grad.abs().max() > 0, "D24 reg not reaching freqs"
+    assert not [k for k, q in m16.named_parameters() if q.grad is None]
+
+    r = ANetV1.from_state_dict(m16.state_dict())
+    assert r.arch == "v16" and sum(q.numel() for q in r.parameters()) == n
+    print("  v16 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -346,6 +384,7 @@ def main():
     v13_checks()
     v14_checks()
     v15_checks()
+    v16_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 
