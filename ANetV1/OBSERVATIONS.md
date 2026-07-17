@@ -1,5 +1,12 @@
 # Observations — side probes
 
+> **2026-07-17, owner verdict: ABANDONED before first full run** ("it's a
+> failure regardless"). The probe code, trainers and YOLO benchmark stay
+> in-tree and runnable, but no results will be collected; the conv-block
+> question moved to the v20 re-render-cycle trunk (ARCHITECTURE.md §16.8,
+> D70), which restructures the transitions inside ANet itself instead of
+> probing them from outside.
+
 Standalone micro-experiments that live NEXT TO ANetV1 (same folders, same
 train protocol: `ANET_*` env knobs, device pick, best.pt on a gated
 selection score) but are not part of the detector. ARCHITECTURE.md records

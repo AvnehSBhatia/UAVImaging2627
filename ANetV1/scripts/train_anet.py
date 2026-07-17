@@ -171,7 +171,34 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        if model.arch == "v13" and cfg.train.arch in ("v14", "v16", "v17", "v18", "v19"):
+        if model.arch == "v13" and cfg.train.arch == "v20":
+            # v20 (D70) REPLACES down4/down20 with embed/unembed pairs, so
+            # this is a PARTIAL warm start, not a D63 identity transfer:
+            # stem/block4/blocks/head land (~20.5k of the donor's 25.2k
+            # params), the donor's transition tensors are expected
+            # leftovers, and the new pairs start Kaiming — the model is NOT
+            # the donor at step 0. Full fine-tune only: ANET_FREEZE_TRUNK
+            # would strand the fresh transitions between frozen stages
+            # whose DN stats then chase them (the measured v14 adapter
+            # failure mode, in reverse).
+            m20 = ANetV1(arch="v20",
+                         use_checkpoint=cfg.train.use_checkpoint,
+                         head_width=cfg.train.head_width,
+                         prior_fg=getattr(cfg.train, "prior_fg", None),
+                         channels=model.backbone.channels,
+                         n_blocks=len(model.backbone.blocks))
+            donor_sd = model.state_dict()
+            missing, unexpected = m20.load_state_dict(donor_sd, strict=False)
+            leftovers = [k for k in unexpected
+                         if not k.startswith(("backbone.down4.",
+                                              "backbone.down20."))]
+            assert not leftovers, f"v13->v20 transfer: unexpected {leftovers}"
+            print(f"v13 -> v20 partial warm start: "
+                  f"{len(donor_sd) - len(unexpected)} tensors transferred, "
+                  f"{len(unexpected)} donor transition tensors dropped, "
+                  f"{len(missing)} new tensors at Kaiming init")
+            model = m20
+        elif model.arch == "v13" and cfg.train.arch in ("v14", "v16", "v17", "v18", "v19"):
             # v14/v16 are supersets of v13 by construction (same module names
             # for the shared trunk; every new module identity-init, D63): copy
             # the v13 weights in and the target IS that v13 at step 0 —

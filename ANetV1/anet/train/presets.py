@@ -70,8 +70,8 @@ def _auto_batch(arch=None):
         return 4  # Mac / CPU
     if arch in ("v13", "v14", "v16", "v17", "v18", "v19"):  # v16-v19 = v13 + tiny modules
         gib_per_img = 0.12
-    elif arch == "v15":
-        gib_per_img = 0.22  # SPD tier-M (wider s4 stage) worst case
+    elif arch in ("v15", "v20"):
+        gib_per_img = 0.22  # SPD/pixel_unshuffle activations worst case
     else:
         gib_per_img = 1.9
     if "ANET_VRAM_GB" in os.environ:  # explicit budget -> size the batch to it
@@ -104,7 +104,8 @@ def anet_cfg(**overrides):
         # in one layer, and the first v15 runs over-fired violently while
         # still INSIDE the 300-step warmup (fp/img 572 at epoch 1).
         warmup_steps=int(os.environ["ANET_WARMUP"]) if "ANET_WARMUP" in os.environ
-        else ((600 if overrides.get("arch") == "v15" else 300) if IS_CUDA else 0),
+        else ((600 if overrides.get("arch") in ("v15", "v20") else 300)
+              if IS_CUDA else 0),
         # LR schedule after warmup: "cosine" (smooth decay to 0, default),
         # "restarts" (cosine warm restarts — periodic LR spikes to re-escape a
         # plateau; good for a stuck class), "plateau" (ReduceLROnPlateau on the
@@ -144,7 +145,9 @@ def anet_cfg(**overrides):
         # is a coin flip, so v15 defaults compile OFF; ANET_COMPILE=1 opts a
         # known-good tier back in. v15 is conv-dominated (MIOpen does the
         # work), so the lost tail fusion is small.
-        compile=IS_CUDA and overrides.get("arch") != "v15",
+        # v20 carries the same pixel_unshuffle shapes -> same ROCm inductor
+        # miscompile family -> same default-off treatment as v15.
+        compile=IS_CUDA and overrides.get("arch") not in ("v15", "v20"),
         compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search

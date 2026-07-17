@@ -435,6 +435,7 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 | v17 | **PowerBlend A^v injectors** (D67, user-directed): learned 3×3 exponent-rate matrix over chromaticity — `out_j = Σ_i relu(exp(W_ij·v_i) − τ_j)` — injected at four stage boundaries through zero-gamma valves; any D65 channel plan (scaled-v13 donors warm-start bit-exactly). +~900 params. See §16.5. | owner-directed; attached to the BIG tier per the §16.3 reopening condition. Judged strictly on the delta vs the plain tier at matched training |
 | v18 | **Exposure-mask + bg-mask aux heads** (D68, user-directed): dual-exposure front (shared weights, +1.5 stops) blended at s4 by a state-vector-driven mask through a tanh-bounded valve; train-only background head with a smoothness prior. +603 params (25,815). See §16.6. | from-scratch scaling dead (0-for-6); owner thesis: capacity via auxiliary heads. Falsifiers: worst-decile (exposure mask) and fp at held recall (bg head) vs v13_best |
 | v19 | **The attribution build** (D69): every mechanism valved — A bias injectors (the autopsy-endorsed worker + built-in §16.5 control), B owner's LearnedAct (bounded learned-SiLU + Gaussian bump, one LUT/site), C owner's 4-bump exposure head from a stolen micro-latent (+1.5-stop cap, D17 CPU micro-stage), D QuatShift + bg-aux. 27,111 params. Post-training per-valve ablation assigns credit. See §16.7. | v17 autopsy: wackiness unused, bias recalibration + training signals are the measured winners — v19 tests owner asks and evidence-endorsed mechanisms under one attribution harness |
+| v20 | **Re-render cycles** (D70, owner-directed): both v13 stage transitions become embed→unembed pairs — lossless `pixel_unshuffle` + 1×1 funnel into an E=16 latent (LearnedAct) then cheap 1×1 expansion to a fresh full-width visual (identity-init QuatShift remix). Stem/block4/blocks/head keep v13 shapes → partial warm start (58 of 82 donor tensors land). 37,236 params. See §16.8. | owner pivot after v16–v19: stop bolting modules ONTO the trunk, restructure the trunk's transitions themselves — the two strided convs are where v14's diagnosis located evidence dilution (D62) and where v15 measured the funnel's leverage |
 
 ---
 
@@ -720,3 +721,54 @@ Gate record: the first v19 gate run NaN'd from scratch — at the identity point
 
 
 **D69 verdict (adapter run, ANET_BG_W=0): falsified, informatively.** Same harness that produced v17's 1.955: v19 (A+B+C+D) scored test 0.809/0.951, fp **2.450**, decile 0.524 — worse than the donor on every axis and 0.5 fp worse than bias-alone. Mechanism interference is real: adding the LearnedAct, exposure bumps, and quat shift ON TOP of bias injectors undid the bias win. Family law, third confirmation: bias recalibration and training signals are the only measured positives; every additional input/feature-manipulation mechanism has measured zero or negative. The v19 attribution question answered itself — the stack lost to its own subset.
+
+### 16.8 v20 — re-render cycles (D70, owner-directed)
+
+**Owner direction (2026-07-17, after the v19 verdict):** "conv → embed →
+then maybe unembed into a completely diff visual → conv, and repeat this
+instead. embedding should be aided by successful components. unembed is
+just expanding it back up cheaply."
+
+**D70.** Both of v13's strided transitions (`down4` k3s2, `down20` k5s5)
+are replaced by an explicit embed → unembed pair:
+
+```
+conv stage ──► EMBED: pixel_unshuffle (lossless, D64) → 1×1 funnel → E=16
+              latent → DeployNorm → LearnedAct (bounded, D69-B)
+          ──► UNEMBED: 1×1 E→C cheap expansion → DN → SiLU →
+              identity-init QuatShift remix (D60/D63)
+          ──► next conv stage … repeat
+```
+
+Cycle 1: s2→s4 (`embed1` 64→16, `unembed1` 16→32). Cycle 2: s4→s20
+(`spd_proj` 800→16, `unembed2` 16→64) — the funnel keeps the `spd_proj`
+NAME on purpose so the trainer's slow-LR group (0.2×, the measured v15
+stability fix for exactly this fan-in-800 shape) matches it. 37,236 params
+(budget-legal). ROCm: same pixel_unshuffle shape family as v15 → compile
+defaults OFF for v20 too; warmup 600.
+
+Why the bottleneck is the mechanism: E=16 ≪ 64 (cycle 1) and ≪ 800
+(cycle 2) forces every transition to RE-ENCODE — the next stage sees a
+freshly rendered visual, not a strided copy. This attacks the two
+locations where the family's diagnostics actually pointed: D62 located
+worst-decile evidence DILUTION at the s4→s20 stride, and v15 measured
+that same funnel as the highest-leverage (and touchiest) tensor in the
+net. Unlike v16–v19 this is not a module ON the trunk — it is the trunk's
+transitions, rebuilt from measured-good parts only (D64 lossless descent,
+D69-B bounded LearnedAct, D60/D63 identity QuatShift, D58 Kaiming, DN).
+
+Warm start is PARTIAL by construction (no D63 identity contract): stem,
+block4, the three s20 blocks and the head keep v13 shapes, so 58 of the
+donor's 82 tensors land via strict=False; the 24 transition tensors are
+dropped and the 36 new tensors start Kaiming. Full fine-tune only —
+ANET_FREEZE_TRUNK would strand fresh transitions between frozen stages
+(the v14 adapter failure mode, mirrored). Falsifier, same ladder as
+v16–v19: test recall/fp vs v13_best 0.837/0.940/2.147 and worst-decile
+vs the immovable 0.571–0.643 band — a transition rebuild that cannot move
+the decile confirms the capacity verdict from yet another angle.
+
+Run: `ANET_ARCH=v20 ANET_INIT_FROM=runs/anet/v13_best.pt python
+scripts/train_anet.py` (lr auto-capped 1.5e-3, warmup 100 on warm start;
+from-scratch fallback is legal — v13 itself trained from scratch at this
+scale). **Status: built, smoke-passed (partial-transfer + sniff-order +
+all-live-grads asserted); MI300X run pending.**

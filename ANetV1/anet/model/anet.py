@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from .backbone import (V13Backbone, V14Backbone, V15Backbone,
+from .backbone import (V13Backbone, V14Backbone, V15Backbone, V20Backbone,
                        V16Backbone, V17Backbone, V18Backbone,
                        V19Backbone)
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
@@ -40,7 +40,7 @@ class ANetV1(nn.Module):
                  channels=None, n_blocks=None):
         super().__init__()
         self.prior_fg = prior_fg
-        if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19"):
+        if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20"):
             # v13 (D58): plain multi-scale conv backbone — the window-token
             # encoder, neck, Path A, context and token-stream head are all
             # replaced by backbone.py's conv pyramid ending in the same
@@ -72,7 +72,7 @@ class ANetV1(nn.Module):
                 # channel — the single-variable texture-hypothesis test.
                 cls_bb = {"v15": V15Backbone, "v16": V16Backbone,
           "v17": V17Backbone, "v18": V18Backbone,
-          "v19": V19Backbone}.get(arch, V13Backbone)
+          "v19": V19Backbone, "v20": V20Backbone}.get(arch, V13Backbone)
                 kw = dict(head_width=head_width, prior_fg=prior_fg)
                 if channels is not None:
                     kw["channels"] = tuple(channels)
@@ -248,7 +248,15 @@ class ANetV1(nn.Module):
             # v15's D64 SPD projection and v14's D59 noise filter are their
             # unique keys; a bare backbone. prefix is v13. Channel plan and
             # depth are inferred from shapes so D65-scaled checkpoints load.
-            if "backbone.spd_proj.weight" in sd:
+            if "backbone.unembed1.weight" in sd:
+                # v20's unique key — MUST be sniffed before v15: both archs
+                # carry a spd_proj (v20 reuses the name to inherit the
+                # slow-LR group), but only v20 has the embed/unembed pairs.
+                arch = "v20"
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            sd["backbone.unembed1.weight"].shape[0],
+                            sd["backbone.head.0.weight"].shape[1])
+            elif "backbone.spd_proj.weight" in sd:
                 arch = "v15"
                 w = sd["backbone.spd_proj.weight"]
                 channels = (sd["backbone.stem.weight"].shape[0],
@@ -511,7 +519,8 @@ class ANetV1(nn.Module):
         return result
 
     def forward(self, img):
-        if self.arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19"):
+        if self.arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19",
+                         "v20"):
             out = self.backbone(img)  # (B, 4, 27, 48); v18 train: (out, bg)
             aux_bg = None
             if isinstance(out, tuple):
@@ -544,9 +553,10 @@ class ANetV1(nn.Module):
             l2 = self.backbone.reg_l2() if self.arch == "v17" \
                 else self.backbone.weave.reg_l2()
             return l2, l2 * 0.0
-        if self.arch in ("v13", "v14", "v15"):
+        if self.arch in ("v13", "v14", "v15", "v20"):
             # no cosine gates or scalar-kernel pools to bound — plain convs
             # are already deploy-legal; weight decay (optimizer) covers L2
+            # (v20's LearnedActs/QuatShifts are bounded by construction)
             z = next(self.parameters()).sum() * 0.0
             return z, z
         if self.arch in ("v9", "v12"):

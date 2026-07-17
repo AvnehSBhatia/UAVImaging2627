@@ -518,6 +518,45 @@ def v19_checks():
     print("  v19 checks passed")
 
 
+def v20_checks():
+    """v20 (D70): re-render cycles — shape contract, partial v13 warm start
+    (transitions dropped, everything else lands), sniff order vs v15, budget,
+    all-live grads, slow-LR name."""
+    from anet.train.losses import center_focal_loss
+
+    m = ANetV1(arch="v20", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m.parameters())
+    print(f"ANetV1 v20 params: {n:,}")
+    assert n < 40_000
+    # spd_proj must exist under that exact name — the trainer's slow-LR
+    # group (the v15 stability fix) matches it by name
+    assert any("spd_proj" in k for k, _ in m.named_parameters())
+
+    # partial warm start: only the donor's down4/down20 have nowhere to go
+    m13 = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    missing, unexpected = m.load_state_dict(m13.state_dict(), strict=False)
+    assert all(k.startswith(("backbone.down4.", "backbone.down20."))
+               for k in unexpected), unexpected
+    transferred = len(m13.state_dict()) - len(unexpected)
+    print(f"  v20 partial warm start: {transferred} donor tensors land, "
+          f"{len(unexpected)} transition tensors dropped, {len(missing)} new")
+    assert transferred > 0 and missing
+
+    m.train()
+    x = torch.rand(2, 3, 540, 960)
+    out = m(x)
+    assert out["heat"].shape == (2, 2, 27, 48)
+    assert out["offset"].shape == (2, 2, 27, 48)
+    heat_t = torch.zeros(2, 2, 27, 48); heat_t[:, 0, 5, 5] = 1.0
+    center_focal_loss(out["heat"], heat_t).backward()
+    assert not [k for k, q in m.named_parameters() if q.grad is None]
+
+    # roundtrip must sniff v20, not v15 (both carry spd_proj)
+    r = ANetV1.from_state_dict(m.state_dict())
+    assert r.arch == "v20"
+    print("  v20 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -536,6 +575,7 @@ def main():
     v17_checks()
     v18_checks()
     v19_checks()
+    v20_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

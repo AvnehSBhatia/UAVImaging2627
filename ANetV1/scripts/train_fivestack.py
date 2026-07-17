@@ -113,6 +113,10 @@ def main():
     # bg crops outnumber objects ~2:1 per image and per class; mild reweight
     cls_w = torch.tensor([0.5, 1.0, 1.0], device=device)
 
+    log_every = int(os.environ.get("ANET_LOG_EVERY", "100"))
+    n_steps = len(train_loader)
+    print(f"train: {n_steps} steps/epoch x {epochs} epochs "
+          f"(batch {batch} images)", flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
     best = -1.0
     for ep in range(epochs):
@@ -131,6 +135,10 @@ def main():
             opt.step()
             sched.step()
             tot, nb = tot + float(loss.detach()), nb + 1
+            if nb % log_every == 0:
+                r = nb * batch / (time.time() - t0)
+                print(f"  ep {ep} step {nb}/{n_steps}: "
+                      f"loss={tot / nb:.4f} ({r:.0f} img/s)", flush=True)
         m = evaluate(model, val_loader, device)
         flag = ""
         if m["sel"] > best:

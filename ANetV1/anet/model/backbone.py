@@ -898,3 +898,84 @@ class V19Backbone(nn.Module):
         if self.training:
             return out, self.bg_head(y)
         return out
+
+
+class V20Backbone(nn.Module):
+    """v20 (D70): the RE-RENDER CYCLE trunk (owner direction) — both of
+    v13's strided transitions become an explicit embed -> unembed pair:
+
+        conv stage -> EMBED (lossless space-to-depth + 1x1 funnel into a
+        narrow latent, LearnedAct) -> UNEMBED (cheap 1x1 expansion back to
+        a full-width feature image, identity-init QuatShift remix)
+        -> conv stage -> repeat.
+
+    The bottleneck (E=16 << 4*ch_stem=64 and 25*ch_mid=800) forces the next
+    stage's input to be a RE-RENDERED visual: information survives the
+    transition only by being re-encoded, and the unembed stays cheap
+    (owner: "unembed is just expanding it back up cheaply"). Assembled from
+    measured-good parts only: pixel_unshuffle descent (D64's lossless
+    projection), bounded LearnedAct (D69-B), identity-init QuatShift
+    (D60/D63), Kaiming init (D58, load-bearing), DeployNorm throughout.
+
+    Everything OUTSIDE the two pairs keeps v13's exact shapes — stem,
+    block4, blocks, head warm-start from a v13 checkpoint via strict=False
+    (~20.5k of 25.2k donor params land). The s4->s20 funnel is named
+    spd_proj ON PURPOSE: the trainer's slow-LR group (0.2x, the measured
+    v15 stability fix for exactly this fan-in-800 layer) matches by name.
+    ROCm: pixel_unshuffle shapes are the v15 inductor-miscompile family ->
+    presets default compile OFF for v20 too.
+    Hailo: space-to-depth, 1x1 convs, one-LUT activations, foldable
+    quaternions — all legal. ~36.5k params at spec.
+    """
+
+    def __init__(self, head_width=24, prior_fg=None, n_blocks=3,
+                 channels=(16, 32, 64), e1=16, e2=16):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        # cycle 1: s2 -> s4 (480x270 -> 240x135)
+        self.embed1 = nn.Conv2d(4 * ch_stem, e1, 1, bias=False)
+        self.embed1_norm = DeployNorm(e1)
+        self.embed1_act = LearnedAct()
+        self.unembed1 = nn.Conv2d(e1, ch_mid, 1, bias=False)
+        self.unembed1_norm = DeployNorm(ch_mid)
+        self.qshift1 = QuatShift(ch_mid)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        # cycle 2: s4 -> s20 (240x135 -> 48x27)
+        self.spd_proj = nn.Conv2d(25 * ch_mid, e2, 1, bias=False)
+        self.spd_norm = DeployNorm(e2)
+        self.spd_act = LearnedAct()
+        self.unembed2 = nn.Conv2d(e2, ch_top, 1, bias=False)
+        self.unembed2_norm = DeployNorm(ch_top)
+        self.qshift2 = QuatShift(ch_top)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        for mod in self.modules():
+            if isinstance(mod, nn.Conv2d):
+                nn.init.kaiming_normal_(mod.weight, nonlinearity="relu")
+                if mod.bias is not None:
+                    nn.init.zeros_(mod.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def forward(self, img):  # (B, 3, 540, 960) -> (B, 4, 27, 48)
+        x = self.act(self.stem_norm(self.stem(img)))
+        z = self.embed1_act(self.embed1_norm(
+            self.embed1(F.pixel_unshuffle(x, 2))))
+        x = self.qshift1(self.act(self.unembed1_norm(self.unembed1(z))))
+        x = self.block4(x)
+        z = self.spd_act(self.spd_norm(
+            self.spd_proj(F.pixel_unshuffle(x, 5))))
+        x = self.qshift2(self.act(self.unembed2_norm(self.unembed2(z))))
+        return self.head(self.blocks(x))
