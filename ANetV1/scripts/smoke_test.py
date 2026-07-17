@@ -370,6 +370,54 @@ def v16_checks():
     print("  v16 checks passed")
 
 
+def v17_checks():
+    """v17 (D67): PowerBlend (A^v) injectors on the v13 trunk — identity
+    contract at any channel plan, init math, exp clamp, valve wake-up."""
+    import torch.nn.functional as F  # noqa: F401
+    from anet.model.backbone import PowerBlend
+
+    donor = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01,
+                   channels=(24, 48, 96), n_blocks=4)
+    m = ANetV1(arch="v17", use_checkpoint=False, prior_fg=0.01,
+               channels=(24, 48, 96), n_blocks=4)
+    n = sum(p.numel() for p in m.parameters())
+    print(f"ANetV1 v17 params (big tier): {n:,}")
+    missing, unexpected = m.load_state_dict(donor.state_dict(), strict=False)
+    assert not unexpected and all(".pb" in k for k in missing)
+    donor.eval(); m.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        d = (donor(x)["heat"] - m(x)["heat"]).abs().max().item()
+    print(f"  v17 identity-at-init vs scaled-v13 donor: max delta {d:.2e}")
+    assert d < 1e-5, "D63 identity contract broken in v17"
+
+    pb = PowerBlend()  # W=0 -> A^v = 1 -> out = 3*relu(1 - tau) = 1.5
+    out = pb(torch.rand(2, 3, 8, 8))
+    assert torch.allclose(out, torch.full_like(out, 1.5))
+    with torch.no_grad():
+        pb.w.fill_(100.0)  # exp argument must saturate, not overflow
+    assert pb(torch.rand(2, 3, 8, 8)).isfinite().all()
+
+    # valve pattern: pb params silent at exact identity (w=0 is also the
+    # reg minimum), alive as soon as the gains crack open
+    m.train()
+    with torch.no_grad():
+        for site in (m.backbone.pb1, m.backbone.pb2, m.backbone.pb3,
+                     m.backbone.pb4):
+            site.gain.fill_(0.01)
+    o = m(x)
+    l2, l1 = m.reg_losses()
+    (o["heat"].square().mean() + 3e-3 * (l2 + l1)).backward()
+    p = dict(m.named_parameters())
+    for k in ("backbone.pb1.pb.w", "backbone.pb1.pb.tau", "backbone.pb4.gain"):
+        assert p[k].grad is not None and p[k].grad.abs().max() > 0, k
+    assert not [k for k, q in m.named_parameters() if q.grad is None]
+
+    r = ANetV1.from_state_dict(m.state_dict())
+    assert r.arch == "v17" and r.backbone.channels == (24, 48, 96)
+    print("  v17 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -385,6 +433,7 @@ def main():
     v14_checks()
     v15_checks()
     v16_checks()
+    v17_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

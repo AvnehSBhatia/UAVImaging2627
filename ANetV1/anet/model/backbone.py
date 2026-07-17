@@ -546,3 +546,112 @@ class V16Backbone(nn.Module):
         y = self.blocks(self.down20(x_s4))
         y = self.weave(x_s4, y)                          # D66
         return self.head(y)
+
+
+class PowerBlend(nn.Module):
+    """Learned power-law RGB activation (v17, D67) — the owner's A^v op.
+
+    Per pixel, with v = normalized RGB (chromaticity, v_i = c_i / sum(c),
+    bounded [0,1]) and a learned 3x3 exponent-rate matrix W (= ln A):
+
+        M_ij  = exp(W_ij * v_i)          # A^v, row i powered by v_i
+        M'_ij = relu(M_ij - tau_j)       # learned threshold zeroes entries
+        out_j = sum_i M'_ij              # column sum blends all 3 channels
+
+    A sum of exponentials with learned rates, sparsified by a learned
+    threshold — a learned activation over chromaticity. Deploy-legal by the
+    house rules: exp is one LUT with its argument bounded (|arg| <= |W|
+    with v in [0,1]; W is L2-held through reg_l2 -> the D24 hook, plus a
+    hard clamp(-4,4) as belt-and-braces saturation), threshold = bias+relu,
+    channel repeat = concat, the fixed column sum = a constant 1x1 conv.
+    12 params."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(9))     # W_ij, i-major; 0 -> A = 1
+        self.tau = nn.Parameter(torch.full((3,), 0.5))
+
+    def forward(self, rgb):  # (B, 3, H, W) raw RGB in [0,1]
+        v = rgb / rgb.sum(1, keepdim=True).clamp_min(1e-4)   # chromaticity
+        v9 = v.repeat_interleave(3, dim=1)                   # [v1 v1 v1 v2 ...]
+        m = torch.exp((v9 * self.w.reshape(1, 9, 1, 1)).clamp(-4.0, 4.0))
+        m = F.relu(m - self.tau.repeat(3).reshape(1, 9, 1, 1))
+        return m.reshape(m.shape[0], 3, 3, *m.shape[2:]).sum(1)  # (B,3,H,W)
+
+    def reg_l2(self):  # D24: keep the exp argument inside the LUT range
+        return (self.w ** 2).sum()
+
+
+class _PBInject(nn.Module):
+    """One v17 injection site: PowerBlend of the (pooled) input RGB ->
+    1x1 to the stage's channels -> zero-gamma gain -> added to the stage
+    features. Identity at init (gain 0); the norms-free path means no
+    cold-start or stat-drift hazards."""
+
+    def __init__(self, ch, pool):
+        super().__init__()
+        self.pool = pool
+        self.pb = PowerBlend()
+        self.proj = nn.Conv2d(3, ch, 1)
+        self.gain = nn.Parameter(torch.zeros(1, ch, 1, 1))
+
+    def forward(self, x, rgb):
+        r = F.avg_pool2d(rgb, self.pool, self.pool) if self.pool > 1 else rgb
+        return x + self.gain * self.proj(self.pb(r))
+
+
+class V17Backbone(nn.Module):
+    """v13 trunk (any D65 channel plan; module names preserved — a plain or
+    scaled v13 checkpoint warm-starts v17 bit-exactly) + a PowerBlend
+    injector between every stage (D67): after the stem (s2), after the s4
+    stage, at the s20 entry, and before the head. ~0.6-1.3k added params
+    depending on width.
+
+    Pre-registered judgment (16.5): v17-at-tier vs the PLAIN tier at matched
+    training — the injectors are judged on that delta alone, so the
+    capacity-curve datapoint stays unconfounded."""
+
+    def __init__(self, head_width=24, prior_fg=None, channels=(16, 32, 64),
+                 n_blocks=3):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        self.pb1 = _PBInject(ch_stem, pool=2)    # after stem   (270x480)
+        self.pb2 = _PBInject(ch_mid, pool=4)     # after s4     (135x240)
+        self.pb3 = _PBInject(ch_top, pool=20)    # s20 entry    (27x48)
+        self.pb4 = _PBInject(ch_top, pool=20)    # pre-head     (27x48)
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        for mod in (self.stem, self.down4, self.block4, self.down20,
+                    self.blocks, self.head):
+            for m in mod.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def forward(self, img):  # (B, 3, 540, 960) -> (B, 4, 27, 48)
+        x = self.pb1(self.act(self.stem_norm(self.stem(img))), img)
+        x = self.pb2(self.block4(self.down4(x)), img)
+        x = self.pb3(self.down20(x), img)
+        x = self.pb4(self.blocks(x), img)
+        return self.head(x)
+
+    def reg_l2(self):
+        return sum(p.pb.reg_l2() for p in (self.pb1, self.pb2, self.pb3, self.pb4))
