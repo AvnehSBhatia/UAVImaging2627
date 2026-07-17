@@ -140,11 +140,26 @@ def main():
     ap.add_argument("--anet-distill", help="distilled checkpoint (runs/anet_distill/best.pt)")
     ap.add_argument("--latency", action="store_true",
                     help="also measure b1 latency and throughput per model")
+    ap.add_argument("--split", default="test",
+                    help="dataset split (train/val/test). --split train answers "
+                         "the capacity-vs-data question: train recall ~= test "
+                         "recall means the model UNDERFITS (capacity ceiling); "
+                         "train >> test means a generalization gap (data lever)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="cap images for the ANet eval (0 = all; the full train "
+                         "split is ~14k images). YOLO eval ignores the cap.")
     ap.add_argument("--out", default="runs/comparison.json")
     args = ap.parse_args()
     cfg = anet_cfg()
 
-    ds = SUASCells(cfg.data.root, "test", coverage_thresh=cfg.data.coverage_thresh)
+    ds = SUASCells(cfg.data.root, args.split,
+                   coverage_thresh=cfg.data.coverage_thresh)
+    ds_anet = ds
+    if args.limit and args.limit < len(ds):
+        from torch.utils.data import Subset
+        ds_anet = Subset(ds, range(args.limit))
+        print(f"ANet eval capped at first {args.limit}/{len(ds)} "
+              f"{args.split} images")
     device = pick_device()
     results = {}
     if args.yolo:
@@ -152,13 +167,13 @@ def main():
         if args.latency:
             results["yolo"].update(latency_yolo(args.yolo, ds, cfg))
     if args.anet:
-        results["anet"] = eval_anet(args.anet, ds, device,
+        results["anet"] = eval_anet(args.anet, ds_anet, device,
                                     getattr(cfg.train, "conf_thresh", 0.0),
                                     getattr(cfg.train, "peak_thresh", 0.3))
         if args.latency:
             results["anet"].update(latency_anet(args.anet, device))
     if args.anet_distill:
-        results["anet_distill"] = eval_anet(args.anet_distill, ds, device,
+        results["anet_distill"] = eval_anet(args.anet_distill, ds_anet, device,
                                             getattr(cfg.train, "conf_thresh", 0.0),
                                             getattr(cfg.train, "peak_thresh", 0.3))
         if args.latency:
