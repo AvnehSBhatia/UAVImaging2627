@@ -436,6 +436,7 @@ ANetV1 defaults: AdamW lr 3e-3 (cosine schedule), weight_decay 0, focal γ=2 α=
 | v18 | **Exposure-mask + bg-mask aux heads** (D68, user-directed): dual-exposure front (shared weights, +1.5 stops) blended at s4 by a state-vector-driven mask through a tanh-bounded valve; train-only background head with a smoothness prior. +603 params (25,815). See §16.6. | from-scratch scaling dead (0-for-6); owner thesis: capacity via auxiliary heads. Falsifiers: worst-decile (exposure mask) and fp at held recall (bg head) vs v13_best |
 | v19 | **The attribution build** (D69): every mechanism valved — A bias injectors (the autopsy-endorsed worker + built-in §16.5 control), B owner's LearnedAct (bounded learned-SiLU + Gaussian bump, one LUT/site), C owner's 4-bump exposure head from a stolen micro-latent (+1.5-stop cap, D17 CPU micro-stage), D QuatShift + bg-aux. 27,111 params. Post-training per-valve ablation assigns credit. See §16.7. | v17 autopsy: wackiness unused, bias recalibration + training signals are the measured winners — v19 tests owner asks and evidence-endorsed mechanisms under one attribution harness |
 | v20 | **Re-render cycles** (D70, owner-directed): both v13 stage transitions become embed→unembed pairs — lossless `pixel_unshuffle` + 1×1 funnel into an E=16 latent (LearnedAct) then cheap 1×1 expansion to a fresh full-width visual (identity-init QuatShift remix). Stem/block4/blocks/head keep v13 shapes → partial warm start (58 of 82 donor tensors land). 37,236 params. See §16.8. | owner pivot after v16–v19: stop bolting modules ONTO the trunk, restructure the trunk's transitions themselves — the two strided convs are where v14's diagnosis located evidence dilution (D62) and where v15 measured the funnel's leverage |
+| v21 | **Two-stage filter front-end** (D71, owner spec): line-sampled mean RGB conditions three `A^chan` 11×11 kernels (thresholded, L1-normed, per-sample conv); mean-RGB MLP weights blend the 3 filtered images; smoothing quat (dedicated bg-TV loss) → edge quat + Sobel-init 7×7; saliency = pooled edge energy → center focal; peaks → **literal 100×100 crops** → 5.1k-param CropCNN → {BG, mannequin, tent}. 5,633 params total, no dense classifier (owner call). See §16.9. | owner direction — a detect-then-classify architecture with the feature extractor almost entirely hand-designed (~540 front-end params); evaluated on the same CenterObjectMetrics ladder as v13–v20 |
 
 ---
 
@@ -772,3 +773,63 @@ scripts/train_anet.py` (lr auto-capped 1.5e-3, warmup 100 on warm start;
 from-scratch fallback is legal — v13 itself trained from scratch at this
 scale). **Status: built, smoke-passed (partial-transfer + sniff-order +
 all-live-grads asserted); MI300X run pending.**
+
+### 16.9 v21 — the two-stage filter front-end (D71, owner spec)
+
+**Owner direction (2026-07-17):** mean-RGB from 20 random rows + 20 random
+columns; three learned 11×11 matrices raised elementwise to the R/G/B
+means (`A_k^chan`, colors normalized [0,1]) with a learned set-to-zero
+threshold; triplicate the image through the three kernels; mean-RGB
+through 3→8→SiLU→8→3 for blend weights → one composite; a quaternion
+trained on a separate background-smoothing loss; a second quaternion as a
+learned Sobel; find object centers on the filtered image (center loss),
+expand **literal 100×100 crops**, classify each with a very small CNN
+(BG/tent/mannequin). Dense-conv equivalent explicitly declined.
+
+**D71 — implementation choices** (`anet/model/twostage.py`,
+`scripts/train_twostage.py`, `runs/twostage/`):
+
+- `A_k = exp(W_k)` so `A^chan = exp(chan·W)` is positive and
+  differentiable; exponent clamped ±4 (D24 discipline applied to
+  exponents — v17's exact parametrization). Threshold = `relu(· − τ)`
+  (v17's form of "below n → 0"), then L1-normalized for scale stability.
+  Per-image kernels run as one grouped conv with per-sample weights.
+- Blend MLP last layer zero-init with bias 1/3: the composite starts as
+  the plain average of the three filtered images.
+- The smoothing quaternion is pointwise; its dedicated loss is mean
+  |x − avgpool3(x)| of the composite on background cells (mask from the
+  GT heat). It sits in the main path, so main-task gradients also reach
+  it — a STRICTLY separate loss for an in-path module would require
+  cutting the main gradient. Recorded, not hidden.
+- A pointwise quaternion cannot BE a spatial Sobel (zero spatial
+  extent), so quat #2 feeds a Sobel-init 7×7 depthwise kernel — the
+  D5/D33 EdgeDQStem pattern: the quaternion picks WHICH colour axis the
+  edge operator sees.
+- Saliency = channel-L2 of the edge image, max-pooled 20×20 to the
+  family 27×48 grid, affine-calibrated, trained with `center_focal_loss`
+  (class-agnostic: max-over-class Gaussian targets).
+- Stage 2 is the literal owner spec: 3×3 local-max peaks (top-12) →
+  100×100 crops from the edge image (PatchCrops clamp geometry) →
+  CropCNN (3→8→16→24 strided, GroupNorm — crop batches are small and
+  variable — GAP → 3). Crop training set per step: GT-centered crops
+  (their class), 2 random bg crops/img, ≤4 unmatched predicted peaks as
+  hard negatives.
+- Eval runs the REAL deploy path (peaks → crops → classify) and writes
+  each detection's class prob at its peak cell into a family
+  (heat, offset) pair, so CenterObjectMetrics and the v13–v20 ladder
+  numbers are directly comparable.
+
+Params: **5,633** total (front end ~540, CropCNN ~5.1k) — the smallest
+model in the family by 4×. Deploy caveats recorded up front: per-image
+kernels are dynamic conv weights (not Hailo-compilable as-is; the 16.8
+basis-expansion `K0 + chan·K1` fix applies if it ever earns deployment)
+and the crop gather is a CPU stage. Pre-registered falsifier, same ladder
+as v16–v20: test recall/fp vs v13_best 0.837/0.940/2.147; the structural
+risk is proposal recall — stage 2 can never recover an object the
+~540-param front end fails to peak.
+
+**Status: built; smoke + 1-epoch micro-run pass** (all-live grads, crop
+CE cold-starts at ln 3, center focal 18→12 in 3 steps, detect contract
+emits family tensors). MI300X run pending:
+`python scripts/train_twostage.py` (knobs: ANET_LR 1.5e-3, ANET_EPOCHS
+15, ANET_BATCH 16, ANET_SMOOTH_W 0.1, ANET_CACHE=1 recommended).
