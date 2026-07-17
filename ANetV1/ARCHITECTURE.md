@@ -630,3 +630,29 @@ The one measurement the v14 arc was missing was taken last: **object recall on t
 **The generalization gap is zero — the student underfits its own training data.** The tiny/occluded mannequins in the worst decile are seen thousands of times with exact labels and still cannot be fit at 25k params / stride 20. This closes every remaining mitigation in one stroke: more data cannot help (nothing to generalize better), distillation cannot help (GT already supervises perfectly — a teacher's soft target adds nothing the student isn't already failing to fit), further training cannot help (measured three times: fine-tunes shuffle the operating point, test recall is invariant at ~0.83). It also retro-explains v14: structured priors could not fix a representational ceiling, and their extra capacity had nowhere useful to go, so it went to train-specific fitting.
 
 **§10 decision, per the pre-registered rule** (15+ points behind on worst-decile after mitigations → fly YOLO26n): final standing is 0.586–0.643 vs 0.857 — **the SUAS 2026 flight model is YOLO26n** (ONNX via `scripts/train_export_yolo26n.py`, Hailo DFC compile as the remaining step). ANetV1 continues as the research track: 25,212 params / 3.3 ms / 1,132 img/s at 0.835/0.95 recall is a legitimate efficiency-frontier artifact, and the one open, well-posed follow-up is a **capacity scaling curve** — relax the (self-imposed) 40k budget stepwise (50k → 100k → 200k) and measure where train-split decile recall lifts off; that curve is both the honest characterization of this architecture family and the natural spine of any write-up.
+
+### 16.3 YOLO26n weight anatomy → v15, the scaling-curve architecture (D64–D65)
+
+A weight-level study of the trained YOLO26n (the model that *does* fit this data) asked: where does its capacity live, and is either model saturated?
+
+| finding | number | implication |
+|---|---|---|
+| YOLO backbone+neck params at stride ≤8 | 4.8% | small-object power is NOT fat early layers |
+| …at stride 32 | **73.7%** | it is deep semantics… |
+| …dedicated stride-8 head branch | ~21k params (P3 cv2+cv3) | …fused into a **fine detection grid**; YOLO never strides by more than 2× |
+| effective rank (95%-energy / full), 1×1 convs | YOLO 0.67 vs v13 0.70 | *neither* saturated by this probe — blind width scaling has weak support |
+| prunable norm gammas (\|γ\|<0.1) | YOLO 0.0%, v13 0.3% | no dead capacity anywhere; capacity must be *placed*, not just added |
+
+Combined with §16.2 (underfit) and the §15.2 miss anatomy (worst-decile heat 0.2–0.3 = diluted, not absent), the indictment lands on one component: **v13's `down20` funnels every fine-scale feature through a 5×-strided depthwise average and a single 2,048-param 1×1** — a compression YOLO's architecture never commits (max stride step 2×, fine grid kept for detection).
+
+**D64 — SPD projection.** `down20` is replaced by `pixel_unshuffle(5)` + learned 1×1: the s4 map (ch_mid, 135, 240) is rearranged **losslessly** to (25·ch_mid, 27, 48) — every s4 pixel's features arrive at the detection grid intact — and the 1×1 (51k params at tier S) learns what to keep. This is SPD-Conv (Sunkara & Luo, 2022: strided convs/pooling destroy small-object evidence), and it is Hailo-native (space-to-depth, the YOLOv5 Focus layer; ONNX SpaceToDepth). The capacity is spent exactly where §15.2 measured the evidence dying.
+
+**D65 — the pre-registered curve** (relaxed budget per §16.2; `ANET_CH`/`ANET_BLOCKS`/`ANET_PARAM_BUDGET`):
+
+| tier | config | params | isolates |
+|---|---|---|---|
+| origin | v13 | 25,212 | — |
+| v15-S | defaults (16,32,64)×3 | ~73.5k | the SPD projection alone |
+| v15-M | ANET_CH=16,48,96 ANET_BLOCKS=4 | ~170k | + width/depth (YOLO's deep-heavy ratio) |
+
+Verdict keys, committed in advance: (1) **train-split worst-decile recall** — where it lifts off is the capacity the task needs (if v15-M still underfits, the stride-20 grid itself is the binding constraint and the next move is a finer grid, i.e., a target-contract change); (2) **the canopy FP band** — if it persists once the model fits its training data, the texture-prior question (v14, falsified at 25k) honestly reopens, with capacity to spend. The auxiliary cosine-weave texture channel proposed at this stage is deferred on those grounds, not rejected: priors were falsified *at the capacity ceiling*; they get re-examined only after the ceiling moves.

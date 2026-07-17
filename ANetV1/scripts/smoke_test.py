@@ -287,6 +287,51 @@ def v14_checks():
     print("  v14 checks passed")
 
 
+def v15_checks():
+    """v15 (D64/D65): SPD projection + capacity tiers — shapes, grads,
+    lossless rearrangement property, tier construction, scaled roundtrips."""
+    from anet.train.losses import center_focal_loss, offset_l1
+
+    m = ANetV1(arch="v15", use_checkpoint=False, prior_fg=0.01)  # tier S
+    n_s = sum(p.numel() for p in m.parameters())
+    m_m = ANetV1(arch="v15", use_checkpoint=False, prior_fg=0.01,
+                 channels=(16, 48, 96), n_blocks=4)              # tier M
+    n_m = sum(p.numel() for p in m_m.parameters())
+    print(f"ANetV1 v15 params: tier-S {n_s:,} | tier-M {n_m:,}")
+    assert n_s < 100_000 and n_m < 300_000, "v15 tiers off their budgets"
+
+    x = torch.rand(2, 3, 540, 960)
+    m.train()
+    out = m(x)
+    assert out["heat"].shape == (2, 2, 27, 48) and out["offset"].shape == (2, 2, 27, 48)
+    assert out["heat"].abs().max() < 50, "v15 cold-start activations blew up"
+    heat_t = torch.zeros(2, 2, 27, 48); heat_t[:, 0, 5, 5] = 1.0
+    reg_mask = torch.zeros(2, 1, 27, 48); reg_mask[:, 0, 5, 5] = 1.0
+    loss = center_focal_loss(out["heat"], heat_t) + \
+        offset_l1(out["offset"], torch.zeros(2, 2, 27, 48), reg_mask)
+    l2, l1 = m.reg_losses()
+    (loss + 1e-4 * (l2 + l1)).backward()
+    assert not [k for k, p in m.named_parameters() if p.grad is None], "v15 no-grad params"
+
+    # the D64 point: pixel_unshuffle(5) is a lossless rearrangement — every
+    # s4 feature value appears exactly once in the (25*ch, 27, 48) tensor
+    import torch.nn.functional as F
+    t = torch.arange(32 * 135 * 240, dtype=torch.float32).reshape(1, 32, 135, 240)
+    u = F.pixel_unshuffle(t, 5)
+    assert u.shape == (1, 32 * 25, 27, 48)
+    assert torch.equal(torch.sort(u.flatten()).values, torch.sort(t.flatten()).values)
+
+    # roundtrips: tier-M v15 and a scaled v13 both sniff back exactly
+    r = ANetV1.from_state_dict(m_m.state_dict())
+    assert r.arch == "v15" and r.backbone.channels == (16, 48, 96)
+    assert sum(p.numel() for p in r.parameters()) == n_m
+    v13w = ANetV1(arch="v13", use_checkpoint=False, channels=(24, 48, 96),
+                  n_blocks=4, prior_fg=0.01)
+    r13 = ANetV1.from_state_dict(v13w.state_dict())
+    assert r13.arch == "v13" and r13.backbone.channels == (24, 48, 96)
+    print("  v15 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -300,6 +345,7 @@ def main():
     v12_checks()
     v13_checks()
     v14_checks()
+    v15_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

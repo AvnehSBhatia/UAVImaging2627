@@ -103,21 +103,24 @@ class V13Backbone(nn.Module):
     """(B, 3, 540, 960) in [0,1] -> (B, 4, 27, 48) raw logits
     [center_mannequin, center_tent, dx, dy]."""
 
-    CH_STEM, CH_MID, CH_TOP = 16, 32, 64
+    CH_STEM, CH_MID, CH_TOP = 16, 32, 64  # spec defaults (v14 pins these)
 
-    def __init__(self, head_width=24, prior_fg=None, n_blocks=3):
+    def __init__(self, head_width=24, prior_fg=None, n_blocks=3,
+                 channels=(16, 32, 64)):
         super().__init__()
-        self.stem = nn.Conv2d(3, self.CH_STEM, 3, 2, 1, bias=False)
-        self.stem_norm = DeployNorm(self.CH_STEM)
+        ch_stem, ch_mid, ch_top = channels  # scalable for the D65 curve
+        self.channels = tuple(channels)
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
         self.act = nn.SiLU()
-        self.down4 = _DWSep(self.CH_STEM, self.CH_MID, k=3, stride=2)
-        self.block4 = _DWSep(self.CH_MID, self.CH_MID, k=3, stride=1)
-        self.down20 = _DWSep(self.CH_MID, self.CH_TOP, k=5, stride=5)
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
         self.blocks = nn.Sequential(
-            *[_DWSep(self.CH_TOP, self.CH_TOP, k=5, stride=1)
+            *[_DWSep(ch_top, ch_top, k=5, stride=1)
               for _ in range(n_blocks)])
         self.head = nn.Sequential(
-            nn.Conv2d(self.CH_TOP, head_width, 1),
+            nn.Conv2d(ch_top, head_width, 1),
             nn.SiLU(),
             nn.Conv2d(head_width, 4, 1),
         )
@@ -356,4 +359,75 @@ class V14Backbone(nn.Module):
         x = self.qshift4(x)
         x = self.qshift5(self.block_extra(self.blocks(x)))  # D63
         x = self.tex(x_s4, x)                               # D61
+        return self.head(x)
+
+
+class V15Backbone(nn.Module):
+    """v15 (D64/D65): the capacity-scaling architecture, sized by the YOLO26n
+    weight-anatomy study (ARCHITECTURE.md section 16.3).
+
+    Two findings drive it. (1) v13's train-split eval proved UNDERFITTING
+    (train recall == test recall at ~0.83/0.59-decile) — the ceiling is
+    representational. (2) YOLO26n's weights show where a model that CAN fit
+    tiny objects spends parameters: 73.7% at stride 32 (deep semantics), a
+    dedicated fine-grid head — and never a stride jump greater than 2. v13
+    funnels ALL fine-scale evidence through one lossy 2,048-param strided
+    pipe (down20.pw after a 5x-strided depthwise average); the measured
+    symptom was worst-decile mannequins peaking at heat 0.2-0.3 — diluted,
+    not absent.
+
+    D64 — SPD projection (space-to-depth, SPD-Conv, Sunkara & Luo 2022):
+    the s4 map is rearranged losslessly to the s20 grid via
+    pixel_unshuffle(5) — (ch_mid, 135, 240) -> (25*ch_mid, 27, 48) — then a
+    learned 1x1 selects what to keep. Every s4 pixel's features reach the
+    detection grid intact; the projection IS the capacity spend, placed
+    exactly where v13's evidence died. Hailo-native (space_to_depth, the
+    YOLOv5 Focus layer), exports as ONNX SpaceToDepth.
+
+    D65 — deep-heavy tiers, per the YOLO allocation (pre-registered curve;
+    the self-imposed 40k budget is deliberately relaxed for these runs):
+      tier S (defaults):        channels (16,32,64),  3 blocks  ~74k params
+      tier M (ANET_CH/BLOCKS):  channels (16,48,96),  4 blocks  ~170k params
+    v13 (25k) is the curve's origin. Verdict key: where train-split
+    worst-decile recall lifts off; the FP band's response decides whether
+    the texture-prior question (v14, falsified at 25k) reopens.
+    """
+
+    def __init__(self, head_width=24, prior_fg=None, channels=(16, 32, 64),
+                 n_blocks=3, n_s4_blocks=1):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.s4_blocks = nn.Sequential(
+            *[_DWSep(ch_mid, ch_mid, k=3, stride=1) for _ in range(n_s4_blocks)])
+        self.spd_proj = nn.Conv2d(ch_mid * 25, ch_top, 1, bias=False)  # D64
+        self.spd_norm = DeployNorm(ch_top)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        for mod in self.modules():  # same cold-start requirement as v13 (D58)
+            if isinstance(mod, nn.Conv2d):
+                nn.init.kaiming_normal_(mod.weight, nonlinearity="relu")
+                if mod.bias is not None:
+                    nn.init.zeros_(mod.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def forward(self, img):  # (B, 3, 540, 960) -> (B, 4, 27, 48)
+        x = self.act(self.stem_norm(self.stem(img)))
+        x = self.s4_blocks(self.down4(x))          # (B, ch_mid, 135, 240)
+        x = F.pixel_unshuffle(x, 5)                # lossless -> (B, 25*ch_mid, 27, 48)
+        x = self.act(self.spd_norm(self.spd_proj(x)))
+        x = self.blocks(x)
         return self.head(x)

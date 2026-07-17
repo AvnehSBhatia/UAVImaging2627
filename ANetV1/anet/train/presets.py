@@ -68,7 +68,12 @@ def _auto_batch(arch=None):
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
-    gib_per_img = 0.12 if arch in ("v13", "v14") else 1.9
+    if arch in ("v13", "v14"):
+        gib_per_img = 0.12
+    elif arch == "v15":
+        gib_per_img = 0.22  # SPD tier-M (wider s4 stage) worst case
+    else:
+        gib_per_img = 1.9
     if "ANET_VRAM_GB" in os.environ:  # explicit budget -> size the batch to it
         return max(4, min(96, int(budget * 0.55 / gib_per_img)))
     # conservative defaults; free VRAM on a shared card is unknowable. The

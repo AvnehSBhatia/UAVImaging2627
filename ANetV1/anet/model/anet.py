@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from .backbone import V13Backbone, V14Backbone
+from .backbone import V13Backbone, V14Backbone, V15Backbone
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
@@ -34,10 +34,11 @@ class ANetV1(nn.Module):
 
     def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
                  path_a_per_channel=True, prior_fg=None, arch="v8", h1=48,
-                 neck_rounds=2, head_width=24, aux_head=False, head_proto=True):
+                 neck_rounds=2, head_width=24, aux_head=False, head_proto=True,
+                 channels=None, n_blocks=None):
         super().__init__()
         self.prior_fg = prior_fg
-        if arch in ("v13", "v14"):
+        if arch in ("v13", "v14", "v15"):
             # v13 (D58): plain multi-scale conv backbone — the window-token
             # encoder, neck, Path A, context and token-stream head are all
             # replaced by backbone.py's conv pyramid ending in the same
@@ -48,6 +49,8 @@ class ANetV1(nn.Module):
             # v14 (D59-D63): v13 + identity-init structured priors (noise
             # filter, 5x QuatShift, texture gate, detail skip, extra block) —
             # same contract; a v13 checkpoint warm-starts it exactly.
+            # v15 (D64/D65): SPD projection + capacity tiers via channels/
+            # n_blocks (the scaling-curve architecture, section 16.3).
             self.arch = arch
             self.use_checkpoint = use_checkpoint  # accepted; never checkpoints
             self.dense = dense
@@ -56,8 +59,20 @@ class ANetV1(nn.Module):
             self.nh = self.IMG_H // self.WIN  # 27
             self.nw = self.IMG_W // self.WIN  # 48
             self.n_win = self.nh * self.nw
-            cls_bb = V14Backbone if arch == "v14" else V13Backbone
-            self.backbone = cls_bb(head_width=head_width, prior_fg=prior_fg)
+            if arch == "v14":
+                assert channels is None and n_blocks is None, \
+                    "v14 has a fixed channel plan (its D63 identity contract " \
+                    "is tied to the v13 default shapes)"
+                self.backbone = V14Backbone(head_width=head_width,
+                                            prior_fg=prior_fg)
+            else:
+                cls_bb = V15Backbone if arch == "v15" else V13Backbone
+                kw = dict(head_width=head_width, prior_fg=prior_fg)
+                if channels is not None:
+                    kw["channels"] = tuple(channels)
+                if n_blocks is not None:
+                    kw["n_blocks"] = n_blocks
+                self.backbone = cls_bb(**kw)
             return
         if arch == "v12":
             # v12 stage 1 is single-phase, non-overlapping stride-20 windows
@@ -223,11 +238,28 @@ class ANetV1(nn.Module):
     def from_state_dict(cls, sd, **kwargs):
         """Rebuild a model with arch/hidden/stem/Path-A inferred from checkpoint
         shapes (v8 pre/post-D37 checkpoints and v9 checkpoints all load)."""
-        if any(k.startswith("backbone.") for k in sd):  # v13/v14 signature
-            # v14's D59 noise filter is its unique key; v13 lacks it.
-            arch = "v14" if "backbone.noise.weight" in sd else "v13"
+        if any(k.startswith("backbone.") for k in sd):  # v13/v14/v15 signature
+            # v15's D64 SPD projection and v14's D59 noise filter are their
+            # unique keys; a bare backbone. prefix is v13. Channel plan and
+            # depth are inferred from shapes so D65-scaled checkpoints load.
+            if "backbone.spd_proj.weight" in sd:
+                arch = "v15"
+                w = sd["backbone.spd_proj.weight"]
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            w.shape[1] // 25, w.shape[0])
+            elif "backbone.noise.weight" in sd:
+                arch, channels = "v14", None  # v14 pins the spec channels
+            else:
+                arch = "v13"
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            sd["backbone.down4.pw.weight"].shape[0],
+                            sd["backbone.head.0.weight"].shape[1])
+            n_blocks = sum(1 for k in sd if k.startswith("backbone.blocks.")
+                           and k.endswith(".dw.weight"))
             model = cls(arch=arch,
                         head_width=sd["backbone.head.0.weight"].shape[0],
+                        channels=channels,
+                        n_blocks=None if arch == "v14" else n_blocks,
                         **kwargs)
             model.load_state_dict(sd, strict=True)
             return model
@@ -453,7 +485,7 @@ class ANetV1(nn.Module):
         return result
 
     def forward(self, img):
-        if self.arch in ("v13", "v14"):
+        if self.arch in ("v13", "v14", "v15"):
             out = self.backbone(img)  # (B, 4, 27, 48)
             return {"heat": out[:, 0:2], "offset": out[:, 2:4]}
         feat = self._features(img)
@@ -471,7 +503,7 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
-        if self.arch in ("v13", "v14"):
+        if self.arch in ("v13", "v14", "v15"):
             # no cosine gates or scalar-kernel pools to bound — plain convs
             # are already deploy-legal; weight decay (optimizer) covers L2
             z = next(self.parameters()).sum() * 0.0

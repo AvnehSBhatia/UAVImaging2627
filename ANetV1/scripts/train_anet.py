@@ -44,7 +44,9 @@ ANET_EPOCHS, ANET_COMPILE, ANET_FUSED, ANET_FUSED_BWD, ANET_CACHE,
 ANET_NUM_WORKERS, ANET_PRIOR_FG, ANET_CONF, ANET_INIT_FROM, ANET_PATIENCE,
 ANET_MIN_EP, ANET_LOSS_MODE, DATA_ROOT. ANET_FREEZE_TRUNK=1 (with a v13
 ANET_INIT_FROM): adapter mode — freeze the transferred v13 trunk, train only
-the identity-init v14 modules.
+the identity-init v14 modules. ANET_ARCH picks the arch (default v13);
+ANET_CH="stem,mid,top" + ANET_BLOCKS size a v13/v15 capacity tier;
+ANET_PARAM_BUDGET overrides the param assert (v15 defaults to 300k, D65).
 """
 
 import os
@@ -227,11 +229,21 @@ def main():
         # v14 (current default, D59-D63; v13 = arch swap): the conv backbones
         # ignore hidden/h1/stem/neck/Path-A knobs entirely — the channel plan
         # is fixed in model/backbone.py; only head_width and prior_fg apply.
+        # D65 scaling-curve knobs: ANET_CH="stem,mid,top" and ANET_BLOCKS
+        # size a v13/v15 tier (unset = the spec defaults). Registered tiers,
+        # section 16.3: v13 25k (origin) | v15-S defaults ~74k | v15-M
+        # ANET_CH=16,48,96 ANET_BLOCKS=4 ~170k.
+        channels = (tuple(int(c) for c in os.environ["ANET_CH"].split(","))
+                    if "ANET_CH" in os.environ else None)
+        n_blocks = (int(os.environ["ANET_BLOCKS"])
+                    if "ANET_BLOCKS" in os.environ else None)
         model = ANetV1(
             arch=cfg.train.arch,
             use_checkpoint=cfg.train.use_checkpoint,
             head_width=cfg.train.head_width,
             prior_fg=getattr(cfg.train, "prior_fg", None),
+            channels=channels,
+            n_blocks=n_blocks,
         )
         # v12 model construction — swap back alongside a cfg arch="v12":
         # model = ANetV1(
@@ -273,7 +285,13 @@ def main():
           f"loss={cfg.train.loss_mode} lr={cfg.train.lr} "
           f"epochs={cfg.train.epochs} | "
           f"train {len(train_ds)} | val {len(val_ds)} | data {cfg.data.root}")
-    assert n_params < 40_000, "param budget exceeded (must stay under 40k)"
+    # the historic <40k budget stands for the deploy-track archs; v15 is the
+    # pre-registered budget relaxation for the D65 capacity curve (section
+    # 16.3, sanctioned by 16.2's measured underfit). ANET_PARAM_BUDGET pins it.
+    budget = int(os.environ.get("ANET_PARAM_BUDGET",
+                                300_000 if cfg.train.arch == "v15" else 40_000))
+    assert n_params < budget, \
+        f"param budget exceeded: {n_params:,} >= {budget:,} (ANET_PARAM_BUDGET overrides)"
     Trainer(model, train_ds, val_ds, cfg).train()
 
 
