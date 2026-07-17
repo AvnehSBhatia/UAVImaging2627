@@ -191,6 +191,13 @@ def anet_cfg(**overrides):
         # lacks). Real operating points are a few fp/img; over-fire episodes
         # measured 40-1800.
         max_sel_fp=25.0,
+        # per-layer LR for the v15 funnel conv (trainer builds a slow param
+        # group; muP-style: fan-in 800-1200 vs 32-96 everywhere else). 0.2 ~
+        # sqrt(64/800) against v13's biggest matrices. ANET_SLOW_MULT
+        # overrides; 1.0 disables. Harmless for archs without a spd_proj.
+        slow_lr_pattern="spd_proj",
+        slow_lr_mult=float(os.environ["ANET_SLOW_MULT"])
+        if "ANET_SLOW_MULT" in os.environ else 0.2,
         # Gaussian splat sigma (cells) for the heat target (rasterize.py). 1.5
         # (was 0.7 ~ a single cell) gives a ~3x3 soft core so cells adjacent to a
         # true center carry a near-1 target and are barely penalized as negatives

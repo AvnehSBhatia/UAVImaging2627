@@ -303,16 +303,38 @@ class Trainer:
                 print(f"torch.compile setup FAILED ({type(e).__name__}: {e}) — "
                       "falling back to eager", flush=True)
 
+        # per-layer LR (muP-style step scaling): v15's funnel conv holds ~70%
+        # of ALL params in one matrix with fan-in 800-1200, vs 32-96 for every
+        # other matrix in the family. A single global LR cannot serve both: at
+        # v13's 1.5e-3 the funnel swings the whole function (measured fp/img
+        # excursions to 1766), and globally halving twice (7.5e-4) still left
+        # tier runs seesawing while starving the small layers. Big-fan-in
+        # matrices get proportionally smaller steps instead — the standard
+        # width-scaling rule. Pattern/mult from presets (slow_lr_pattern,
+        # slow_lr_mult; ANET_SLOW_MULT overrides); no match = one group, and
+        # every scheduler below handles groups natively (_base_lrs is per-group).
+        slow_pat = getattr(cfg.train, "slow_lr_pattern", "spd_proj")
+        slow_mult = float(getattr(cfg.train, "slow_lr_mult", 0.2))
+        named = list(self.model.named_parameters())
+        slow = [p for n, p in named if slow_pat in n]
+        if slow and slow_mult != 1.0:
+            groups = [{"params": [p for n, p in named if slow_pat not in n]},
+                      {"params": slow, "lr": cfg.train.lr * slow_mult}]
+            print(f"per-layer LR: {sum(p.numel() for p in slow):,} params "
+                  f"matching {slow_pat!r} at lr x{slow_mult}", flush=True)
+        else:
+            groups = [p for _, p in named]  # list, not generator: the fused->
+            # foreach fallback below constructs AdamW twice
         # fused AdamW: one multi-tensor kernel per step instead of ~6 tiny
         # launches per parameter tensor — real money on a launch-bound model
         try:
             self.opt = torch.optim.AdamW(
-                self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0,
+                groups, lr=cfg.train.lr, weight_decay=0.0,
                 fused=self.device.type == "cuda",
             )
         except RuntimeError:  # fused unsupported on this build — foreach fallback
             self.opt = torch.optim.AdamW(
-                self.model.parameters(), lr=cfg.train.lr, weight_decay=0.0,
+                groups, lr=cfg.train.lr, weight_decay=0.0,
                 foreach=True,
             )
         opt_steps_per_epoch = max(len(self.train_loader) // cfg.train.accum_steps, 1)
