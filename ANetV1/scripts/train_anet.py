@@ -42,7 +42,9 @@ What v9 changes vs v8 (summary; full rationale in the docs):
 Env overrides (all optional): ANET_BATCH, ANET_ACCUM, ANET_LR, ANET_WARMUP,
 ANET_EPOCHS, ANET_COMPILE, ANET_FUSED, ANET_FUSED_BWD, ANET_CACHE,
 ANET_NUM_WORKERS, ANET_PRIOR_FG, ANET_CONF, ANET_INIT_FROM, ANET_PATIENCE,
-ANET_MIN_EP, ANET_LOSS_MODE, DATA_ROOT.
+ANET_MIN_EP, ANET_LOSS_MODE, DATA_ROOT. ANET_FREEZE_TRUNK=1 (with a v13
+ANET_INIT_FROM): adapter mode — freeze the transferred v13 trunk, train only
+the identity-init v14 modules.
 """
 
 import os
@@ -165,11 +167,29 @@ def main():
             m14 = ANetV1(arch="v14", use_checkpoint=cfg.train.use_checkpoint,
                          head_width=cfg.train.head_width,
                          prior_fg=getattr(cfg.train, "prior_fg", None))
-            missing, unexpected = m14.load_state_dict(model.state_dict(),
-                                                      strict=False)
+            donor_sd = model.state_dict()
+            missing, unexpected = m14.load_state_dict(donor_sd, strict=False)
             assert not unexpected, f"v13->v14 transfer: unexpected {unexpected}"
-            print(f"v13 -> v14 warm start: {len(model.state_dict())} tensors "
+            print(f"v13 -> v14 warm start: {len(donor_sd)} tensors "
                   f"transferred, {len(missing)} new v14 tensors at identity init")
+            if os.environ.get("ANET_FREEZE_TRUNK") == "1":
+                # Adapter mode: only the identity-init v14 modules train; the
+                # donor v13 trunk is immutable, so the run can test whether
+                # the D59-D63 priors ADD value without being able to damage a
+                # proven optimum. (Both full-tune v14 runs degraded val while
+                # train loss fell — this isolates whether the new modules'
+                # concept generalizes at all.) Trunk DeployNorm stats still
+                # EMA-track the data; the donor trained on this distribution,
+                # so those updates are ~no-ops.
+                frozen = 0
+                for name, p in m14.named_parameters():
+                    if name in donor_sd:
+                        p.requires_grad_(False)
+                        frozen += 1
+                trainable = sum(p.numel() for p in m14.parameters()
+                                if p.requires_grad)
+                print(f"ANET_FREEZE_TRUNK=1: {frozen} donor tensors frozen; "
+                      f"{trainable:,} params (new v14 modules only) train")
             model = m14
         elif model.arch != cfg.train.arch:
             raise SystemExit(
