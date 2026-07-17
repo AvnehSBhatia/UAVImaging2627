@@ -717,3 +717,6 @@ Response to the owner's v19 directive, reconciled with the v17 autopsy (which sh
 
 
 Gate record: the first v19 gate run NaN'd from scratch — at the identity point the new params see gradients in the 1e2–1e3 range (`qshift.qr` 2.1e3, `act` γ 3.5e2) and the original unbounded β/γ flew before any schedule could react. All LearnedAct parameters are now **bounded by construction** (β ∈ (0.5,1.5) via tanh, γ ∈ (−0.5,0.5), μ ∈ (−1,1), σ ≥ 0.25 — identity at init preserved exactly, and stricter LUT hygiene as a bonus); the re-run passes 21/21 at 800 steps. Same family lesson, third appearance: every scalar that multiplies or reshapes the trunk must be bounded by construction (D61 gate → D69 activation), not by hope.
+
+
+**D69 verdict (adapter run, ANET_BG_W=0): falsified, informatively.** Same harness that produced v17's 1.955: v19 (A+B+C+D) scored test 0.809/0.951, fp **2.450**, decile 0.524 — worse than the donor on every axis and 0.5 fp worse than bias-alone. Mechanism interference is real: adding the LearnedAct, exposure bumps, and quat shift ON TOP of bias injectors undid the bias win. Family law, third confirmation: bias recalibration and training signals are the only measured positives; every additional input/feature-manipulation mechanism has measured zero or negative. The v19 attribution question answered itself — the stack lost to its own subset.
