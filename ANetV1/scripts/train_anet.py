@@ -171,7 +171,7 @@ def main():
     if init:
         sd = torch.load(init, map_location="cpu")
         model = ANetV1.from_state_dict(sd, use_checkpoint=cfg.train.use_checkpoint)
-        if model.arch == "v13" and cfg.train.arch in ("v14", "v16", "v17", "v18"):
+        if model.arch == "v13" and cfg.train.arch in ("v14", "v16", "v17", "v18", "v19"):
             # v14/v16 are supersets of v13 by construction (same module names
             # for the shared trunk; every new module identity-init, D63): copy
             # the v13 weights in and the target IS that v13 at step 0 —
@@ -180,7 +180,7 @@ def main():
             # scaled-v13 donors warm-start too; v14 pins the spec shapes.
             extra = (dict(channels=model.backbone.channels,
                           n_blocks=len(model.backbone.blocks))
-                     if cfg.train.arch in ("v16", "v17", "v18") else {})
+                     if cfg.train.arch in ("v16", "v17", "v18", "v19") else {})
             m14 = ANetV1(arch=cfg.train.arch,
                          use_checkpoint=cfg.train.use_checkpoint,
                          head_width=cfg.train.head_width,

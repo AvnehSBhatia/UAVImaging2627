@@ -68,7 +68,7 @@ def _auto_batch(arch=None):
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
-    if arch in ("v13", "v14", "v16", "v17", "v18"):  # v16-v18 = v13 + tiny modules
+    if arch in ("v13", "v14", "v16", "v17", "v18", "v19"):  # v16-v19 = v13 + tiny modules
         gib_per_img = 0.12
     elif arch == "v15":
         gib_per_img = 0.22  # SPD tier-M (wider s4 stage) worst case

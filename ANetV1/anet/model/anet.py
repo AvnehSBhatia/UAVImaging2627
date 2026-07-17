@@ -6,7 +6,8 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from .backbone import (V13Backbone, V14Backbone, V15Backbone,
-                       V16Backbone, V17Backbone, V18Backbone)
+                       V16Backbone, V17Backbone, V18Backbone,
+                       V19Backbone)
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
@@ -39,7 +40,7 @@ class ANetV1(nn.Module):
                  channels=None, n_blocks=None):
         super().__init__()
         self.prior_fg = prior_fg
-        if arch in ("v13", "v14", "v15", "v16", "v17", "v18"):
+        if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19"):
             # v13 (D58): plain multi-scale conv backbone — the window-token
             # encoder, neck, Path A, context and token-stream head are all
             # replaced by backbone.py's conv pyramid ending in the same
@@ -70,7 +71,8 @@ class ANetV1(nn.Module):
                 # v16 (D66): v13 trunk + the auxiliary cosine-weave texture
                 # channel — the single-variable texture-hypothesis test.
                 cls_bb = {"v15": V15Backbone, "v16": V16Backbone,
-          "v17": V17Backbone, "v18": V18Backbone}.get(arch, V13Backbone)
+          "v17": V17Backbone, "v18": V18Backbone,
+          "v19": V19Backbone}.get(arch, V13Backbone)
                 kw = dict(head_width=head_width, prior_fg=prior_fg)
                 if channels is not None:
                     kw["channels"] = tuple(channels)
@@ -251,6 +253,11 @@ class ANetV1(nn.Module):
                 w = sd["backbone.spd_proj.weight"]
                 channels = (sd["backbone.stem.weight"].shape[0],
                             w.shape[1] // 25, w.shape[0])
+            elif "backbone.bumps.head.weight" in sd:  # v19's unique key
+                arch = "v19"
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            sd["backbone.down4.pw.weight"].shape[0],
+                            sd["backbone.head.0.weight"].shape[1])
             elif "backbone.mask_out.weight" in sd:  # v18's unique key
                 arch = "v18"
                 channels = (sd["backbone.stem.weight"].shape[0],
@@ -504,7 +511,7 @@ class ANetV1(nn.Module):
         return result
 
     def forward(self, img):
-        if self.arch in ("v13", "v14", "v15", "v16", "v17", "v18"):
+        if self.arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19"):
             out = self.backbone(img)  # (B, 4, 27, 48); v18 train: (out, bg)
             aux_bg = None
             if isinstance(out, tuple):
@@ -528,9 +535,9 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
-        if self.arch == "v18":
+        if self.arch in ("v18", "v19"):
             z = next(self.parameters()).sum() * 0.0
-            return z, z  # blend gain is tanh-bounded; nothing to regularize
+            return z, z  # gains/valves are tanh- or sigmoid-bounded; nothing to regularize
         if self.arch in ("v16", "v17"):
             # the one thing to bound (D24, one LUT period): v16's weave
             # frequencies / v17's PowerBlend exponent rates

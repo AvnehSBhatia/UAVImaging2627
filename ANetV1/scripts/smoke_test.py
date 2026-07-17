@@ -466,6 +466,58 @@ def v18_checks():
     print("  v18 checks passed")
 
 
+def v19_checks():
+    """v19 (D69): the attribution build — A bias / B LearnedAct / C
+    ExposureBumps / D quat+bg — identity, unit properties, all-live grads."""
+    import torch.nn.functional as F
+    from anet.model.backbone import ExposureBumps, LearnedAct
+    from anet.train.losses import center_focal_loss
+
+    la = LearnedAct()  # parametric identity: beta=1,gamma=0 == SiLU exactly
+    t = torch.randn(512)
+    assert torch.allclose(la(t), F.silu(t), atol=1e-6)
+    eb = ExposureBumps()  # valve=0 == identity; extreme valve stays in [0,1]
+    im = torch.rand(1, 3, 540, 960)
+    assert torch.equal(eb(im), im.clamp(0, 1))
+    with torch.no_grad():
+        eb.valve.fill_(10.0); eb.head.bias.fill_(5.0)
+    o = eb(im)
+    assert o.isfinite().all() and o.max() <= 1.0 and o.min() >= 0.0
+
+    m13 = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    m = ANetV1(arch="v19", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m.parameters())
+    print(f"ANetV1 v19 params: {n:,}")
+    assert n < 40_000
+    missing, unexpected = m.load_state_dict(m13.state_dict(), strict=False)
+    assert not unexpected
+    m13.eval(); m.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        d = (m13(x)["heat"] - m(x)["heat"]).abs().max().item()
+    # 5e-5: LearnedAct(beta=1) = x*sigmoid(x) vs the donor's FUSED F.silu
+    # kernel — ~1e-7/site rounding amplified through the DN folds. Benign.
+    print(f"  v19 identity-at-init vs donor v13: max delta {d:.2e}")
+    assert d < 5e-5
+
+    m.train()
+    out = m(x)
+    assert "aux_bg" in out
+    heat_t = torch.zeros(2, 2, 27, 48); heat_t[:, 0, 5, 5] = 1.0
+    loss = center_focal_loss(out["heat"], heat_t) + 0.3 * \
+        F.binary_cross_entropy_with_logits(
+            out["aux_bg"].float(), 1.0 - heat_t.max(1, keepdim=True).values)
+    loss.backward()
+    p = dict(m.named_parameters())
+    for k in ("backbone.bias1", "backbone.bumps.valve", "backbone.act.g",
+              "backbone.qshift.qr", "backbone.bg_head.weight"):
+        assert p[k].grad is not None and p[k].grad.abs().max() > 0, k
+    assert not [k for k, q in m.named_parameters() if q.grad is None]
+    r = ANetV1.from_state_dict(m.state_dict())
+    assert r.arch == "v19"
+    print("  v19 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -483,6 +535,7 @@ def main():
     v16_checks()
     v17_checks()
     v18_checks()
+    v19_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

@@ -753,3 +753,148 @@ class V18Backbone(nn.Module):
         if self.training:
             return out, self.bg_head(y)                    # + aux bg logits
         return out
+
+
+class LearnedAct(nn.Module):
+    """v19 (D69-B): owner's learned per-layer activation — a learned-slope
+    SiLU plus a learned Gaussian bump, weights shared across the layer:
+
+        f(x) = x * sigmoid(beta * x) + gamma * exp(-(x - mu)^2 / (2 sigma^2))
+
+    Parametric identity at init (beta=1, gamma=0 -> exactly SiLU), so no
+    valve is needed. 4 scalars per site. Deploy: any scalar function of x
+    is ONE Hailo LUT — the cheapest mechanism in the family."""
+
+    def __init__(self):
+        super().__init__()
+        # ALL bounded by construction (first v19 gate run NaN'd: at the
+        # identity point these params see gradients in the 1e2-1e3 range,
+        # and unbounded beta/gamma fly before any scheduler can help):
+        #   beta  = 1 + 0.5*tanh(b)   in (0.5, 1.5), init exactly 1
+        #   gamma = 0.5*tanh(g)       in (-0.5, 0.5), init exactly 0
+        #   mu    = tanh(m)           in (-1, 1)
+        #   sigma = softplus(rho)+0.25 >= 0.25
+        self.b = nn.Parameter(torch.zeros(()))
+        self.g = nn.Parameter(torch.zeros(()))
+        self.m = nn.Parameter(torch.zeros(()))
+        self.rho = nn.Parameter(torch.zeros(()))
+
+    def forward(self, x):
+        beta = 1.0 + 0.5 * torch.tanh(self.b)
+        gamma = 0.5 * torch.tanh(self.g)
+        mu = torch.tanh(self.m)
+        sigma = F.softplus(self.rho) + 0.25
+        return x * torch.sigmoid(beta * x) \
+            + gamma * torch.exp(-(x - mu) ** 2 / (2 * sigma * sigma))
+
+
+class ExposureBumps(nn.Module):
+    """v19 (D69-C): the owner's simplified exposure mechanism — steal a
+    latent from a MICRO look at the image (8x-pooled, two tiny convs, GAP),
+    and a small head emits 4 normalized (x,y) coords + a per-bump exposure
+    amount (sigmoid-capped at +1.5 stops). Gaussian bumps are rendered at
+    those coords and applied to the INPUT (exposure lives in image space):
+
+        img' = clamp(img * (1 + tanh(valve) * E), 0, 1),
+        E    = sum_k amt_k * exp(-((X-x_k)^2 + (Y-y_k)^2) / (2 s^2))
+
+    Identity at init (valve=0). Deploy: the micro-head is 4 scalar triples
+    per frame — a D17-style CPU stage (microseconds); the bump multiply is
+    elementwise. ~1.6k params."""
+
+    MAX_GAIN = 2.0 ** 1.5 - 1.0  # +1.5 stops, the owner's number
+
+    def __init__(self, k=4):
+        super().__init__()
+        self.k = k
+        self.enc = nn.Sequential(
+            nn.Conv2d(3, 8, 3, 2, 1), nn.SiLU(),
+            nn.Conv2d(8, 16, 3, 2, 1), nn.SiLU(),
+        )
+        self.head = nn.Linear(16, k * 3)
+        self.log_s = nn.Parameter(torch.tensor(-2.5))  # bump radius ~0.08
+        self.valve = nn.Parameter(torch.zeros(()))
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, img):  # (B,3,H,W) in [0,1] -> adjusted image
+        z = self.enc(F.avg_pool2d(img, 8)).mean((2, 3))
+        p = self.head(z).reshape(-1, self.k, 3)
+        xy = torch.sigmoid(p[..., :2])                       # (B,k,2) in [0,1]
+        amt = torch.sigmoid(p[..., 2]) * self.MAX_GAIN       # (B,k)
+        B, _, H, W = img.shape
+        ys = torch.linspace(0, 1, H, device=img.device).reshape(1, 1, H, 1)
+        xs = torch.linspace(0, 1, W, device=img.device).reshape(1, 1, 1, W)
+        s2 = (self.log_s.exp() ** 2) * 2.0
+        d2 = (xs - xy[..., 0].reshape(B, self.k, 1, 1)) ** 2 \
+            + (ys - xy[..., 1].reshape(B, self.k, 1, 1)) ** 2
+        E = (amt.reshape(B, self.k, 1, 1) * torch.exp(-d2 / s2)).sum(
+            1, keepdim=True)
+        return (img * (1.0 + torch.tanh(self.valve) * E)).clamp(0.0, 1.0)
+
+
+class V19Backbone(nn.Module):
+    """v19 (D69): the ATTRIBUTION build — every mechanism behind its own
+    valve so one training run + per-mechanism ablation (the v17 autopsy
+    method, built in) splits credit. On the untouched v13 trunk:
+
+      A  bias injectors at 4 stage boundaries (176 params) — the mechanism
+         the v17 autopsy identified as the actual worker; doubles as the
+         pre-registered 16.5 bias-only control (ablate everything else).
+      B  LearnedAct at every _DWSep pw-activation + post-stem (owner ask).
+      C  ExposureBumps on the input (owner ask; replaces v18's mask).
+      D  one identity-init QuatShift post-stem (owner invitation; reused
+         from D60) + the v18 bg-aux training head (the family's fp-record
+         earner; train-only, free at deploy).
+
+    Identity-at-init contract (D63) holds for the whole assembly."""
+
+    def __init__(self, head_width=24, prior_fg=None, channels=(16, 32, 64),
+                 n_blocks=3):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.bumps = ExposureBumps()                       # C
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = LearnedAct()                            # B (post-stem)
+        self.qshift = QuatShift(ch_stem)                   # D
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        for blk in (self.down4, self.block4, self.down20, *self.blocks):
+            blk.act = LearnedAct()                         # B (shared per layer)
+        self.bias1 = nn.Parameter(torch.zeros(1, ch_stem, 1, 1))   # A
+        self.bias2 = nn.Parameter(torch.zeros(1, ch_mid, 1, 1))
+        self.bias3 = nn.Parameter(torch.zeros(1, ch_top, 1, 1))
+        self.bias4 = nn.Parameter(torch.zeros(1, ch_top, 1, 1))
+        self.bg_head = nn.Conv2d(ch_top, 1, 1)             # D (train-only)
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        for mod in (self.stem, self.down4, self.block4, self.down20,
+                    self.blocks, self.head):
+            for m in mod.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def forward(self, img):
+        x = self.bumps(img)                                # C
+        x = self.qshift(self.act(self.stem_norm(self.stem(x)))) + self.bias1
+        x = self.block4(self.down4(x)) + self.bias2
+        x = self.down20(x) + self.bias3
+        y = self.blocks(x) + self.bias4
+        out = self.head(y)
+        if self.training:
+            return out, self.bg_head(y)
+        return out
