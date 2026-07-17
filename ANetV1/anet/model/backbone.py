@@ -233,14 +233,23 @@ class TextureGate(nn.Module):
     local texture energy at s4 (learned high-pass, init as the D32 isotropic
     high-pass kernel; energy = elementwise square), pools it to the s20 grid,
     and produces a per-channel sigmoid mask g. It modulates the trunk as a
-    weighted sum
+    BOUNDED weighted sum
 
-        y' = y * (w_pass + w_gate * g),   w_pass init 1, w_gate init 0
+        y' = y * (1 + tanh(w_gate) * g),   w_gate init 0
 
-    so the layer is exact identity at init (D63) and training decides, per
-    channel, how much texture-conditioned suppression/boost to apply. All ops
-    fold-legal: depthwise conv, mul (square), DeployNorm affine, avg-pool,
-    1x1 convs, sigmoid, mul."""
+    Exact identity at init (D63); the factor lives in (1-g, 1+g) subset of
+    (0, 2), so per-channel texture-conditioned suppression/boost is
+    expressible but GLOBAL TRUNK SHUTDOWN IS NOT. The first draft used an
+    unbounded w_pass + w_gate*g, and the first from-scratch MI300X v14 run
+    found the collapse channel: the cheapest way to satisfy the background
+    focal term everywhere is to shrink the whole-trunk multiplier toward
+    zero — measured mann_r 0.52 -> 0.009 across epochs ~13-20 with train
+    loss near-flat, recovering only as the cosine decayed, early-stopped at
+    24. v13 had no whole-trunk multiplier, hence no such channel; bounding
+    the gate restores that safety while keeping the mechanism. tanh acts on
+    a WEIGHT (constant at export), so the layer still folds to
+    conv+sigmoid+mul; all ops remain depthwise conv, mul (square),
+    DeployNorm affine, avg-pool, 1x1 convs, sigmoid, mul."""
 
     def __init__(self, ch_in, ch_out, hidden=16):
         super().__init__()
@@ -252,7 +261,6 @@ class TextureGate(nn.Module):
         self.fc1 = nn.Conv2d(ch_in, hidden, 1)
         self.fc2 = nn.Conv2d(hidden, ch_out, 1)
         self.act = nn.SiLU()
-        self.w_pass = nn.Parameter(torch.ones(1, ch_out, 1, 1))
         self.w_gate = nn.Parameter(torch.zeros(1, ch_out, 1, 1))
 
     def forward(self, x_s4, y):  # texture stats from s4 modulate the s20 trunk
@@ -260,7 +268,7 @@ class TextureGate(nn.Module):
         e = self.norm(e * e)                              # local texture energy
         e = F.avg_pool2d(e, 5, 5)                         # 135x240 -> 27x48
         g = torch.sigmoid(self.fc2(self.act(self.fc1(e))))
-        return y * (self.w_pass + self.w_gate * g)
+        return y * (1.0 + torch.tanh(self.w_gate) * g)
 
 
 class V14Backbone(nn.Module):

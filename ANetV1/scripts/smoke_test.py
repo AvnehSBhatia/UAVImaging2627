@@ -272,6 +272,15 @@ def v14_checks():
     for valve in ("backbone.skip_gain", "backbone.block_extra.gain",
                   "backbone.tex.w_gate", "backbone.noise.weight"):
         assert params[valve].grad.abs().max() > 0, f"dead valve: {valve}"
+    # the texture modulation must be BOUNDED: no parameter setting may zero
+    # the trunk (the unbounded first draft collapsed the from-scratch MI300X
+    # run — see TextureGate docstring). Factor = 1 + tanh(w)*g > 1 - g > 0.
+    with torch.no_grad():
+        m.backbone.tex.w_gate.fill_(-1e6)  # worst case: maximum suppression
+        out_sup = m(x)
+    assert out_sup["heat"].isfinite().all(), "texture gate not collapse-safe"
+    with torch.no_grad():
+        m.backbone.tex.w_gate.zero_()
 
     m2 = ANetV1.from_state_dict(m.state_dict())
     assert m2.arch == "v14" and sum(p.numel() for p in m2.parameters()) == n
