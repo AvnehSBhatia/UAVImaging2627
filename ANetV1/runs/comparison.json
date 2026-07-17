@@ -1,47 +1,11 @@
 {
-  "yolo": {
-    "fp_per_image": 0.017817371937639197,
-    "mannequin_recall": 0.9621749408983451,
-    "tent_recall": 0.991869918699187,
-    "mannequin_recall_synthetic": 0.9621749408983451,
-    "mannequin_recall_visdrone": NaN,
-    "mannequin_recall_smallest_decile": 0.8571428571428571,
-    "cells": {
-      "mannequin": {
-        "precision": 0.7263157894736842,
-        "recall": 0.965034965034965,
-        "f1": 0.8288288288288289,
-        "pred_cells": 10830,
-        "gt_cells": 8151
-      },
-      "tent": {
-        "precision": 0.8500453720508166,
-        "recall": 0.9914009789654716,
-        "f1": 0.9152977099236641,
-        "pred_cells": 26448,
-        "gt_cells": 22677
-      }
-    },
-    "latency_ms_b1": 18.213043212890625,
-    "throughput_img_s": 54.90570621894924,
-    "params": 2375226,
-    "mannequin_cell_precision": 0.7263157894736842,
-    "mannequin_cell_recall": 0.965034965034965,
-    "mannequin_cell_f1": 0.8288288288288289,
-    "tent_cell_precision": 0.8500453720508166,
-    "tent_cell_recall": 0.9914009789654716,
-    "tent_cell_f1": 0.9152977099236641
-  },
   "anet": {
-    "fp_per_image": 2.1469933184855234,
-    "mannequin_recall": 0.8368794326241135,
-    "tent_recall": 0.940379403794038,
-    "mannequin_recall_synthetic": 0.8368794326241135,
+    "fp_per_image": 1.955456570155902,
+    "mannequin_recall": 0.83451536643026,
+    "tent_recall": 0.94579945799458,
+    "mannequin_recall_synthetic": 0.83451536643026,
     "mannequin_recall_visdrone": NaN,
-    "mannequin_recall_smallest_decile": 0.6428571428571429,
-    "latency_ms_b1": 1.706690788269043,
-    "throughput_img_s": 4838.0835933489825,
-    "params": 25212,
+    "mannequin_recall_smallest_decile": 0.5714285714285714,
     "mannequin_cell_precision": NaN,
     "mannequin_cell_recall": NaN,
     "mannequin_cell_f1": NaN,
