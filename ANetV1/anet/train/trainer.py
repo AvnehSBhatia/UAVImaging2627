@@ -568,6 +568,21 @@ class Trainer:
                 loss = loss + aw * center_focal_loss(
                     out["aux_heat"], heat, alpha=c.center_alpha,
                     beta=c.center_beta, pos_weight=pw)
+            # D68 (v18) background-mask aux: supervised bg (1 - max Gaussian)
+            # + the smoothness prior on the PREDICTED background. Train-only
+            # head; shapes trunk features, never the deploy graph.
+            bgw = getattr(c, "bg_aux_weight", 0.0) or 0.0
+            if bgw and "aux_bg" in out:
+                bg_t = 1.0 - heat.max(1, keepdim=True).values
+                p_bg = torch.sigmoid(out["aux_bg"].float())
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    out["aux_bg"].float(), bg_t)
+                local_mean = torch.nn.functional.avg_pool2d(
+                    torch.nn.functional.pad(p_bg, (1, 1, 1, 1),
+                                            mode="replicate"), 3, 1)
+                smooth = (p_bg - local_mean).abs().mean()
+                loss = loss + bgw * (
+                    bce + getattr(c, "bg_smooth_weight", 0.3) * smooth)
             l2, l1 = self.model.reg_losses()
             return loss + c.l2_score_reg * l2 + c.l1_kernel_reg * l1
         out = self.model(self._prep_img(img))

@@ -655,3 +655,101 @@ class V17Backbone(nn.Module):
 
     def reg_l2(self):
         return sum(p.pb.reg_l2() for p in (self.pb1, self.pb2, self.pb3, self.pb4))
+
+
+class V18Backbone(nn.Module):
+    """v13 trunk + the D68 auxiliary heads (owner-directed):
+
+    (a) STATE-DRIVEN EXPOSURE MASK — "add ~1.5 stops of brightness to
+        selected areas": the front of the trunk (stem/down4/block4, shared
+        weights) runs on the image AND on a 2^1.5x brightened copy; a mask
+        head — a global state vector (GAP of s4; JEPA-STYLE latent, not JEPA
+        training) biasing a local 1x1 head — blends the two s4 maps:
+            s4' = s4 + tanh(blend_gain) * m * (s4_bright - s4)
+        Identity at init (blend_gain = 0). Mechanistic target: the
+        worst-decile canopy/shadow mannequins — underexposed objects the
+        shared trunk never sees well. Deploy-legal: the front runs twice
+        (two subgraphs, shared weights), GAP + 1x1s + sigmoid + mul.
+        The bright pass runs with the front's DeployNorms frozen so its
+        activation statistics never contaminate the running stats the
+        normal branch (and the deploy graph) normalize against.
+
+    (b) BACKGROUND-MASK AUX HEAD (train-only, dropped at eval/export like
+        the D46 probe): 1x1 -> 1 bg logit per cell off the pre-head
+        features, supervised from the heat targets (bg = 1 - max Gaussian)
+        plus the owner's smoothness prior on the PREDICTED background
+        (penalize high-frequency bg — trainer side, bg_smooth_weight).
+        Different mechanism from the falsified D61/D66/D67 gates: this adds
+        TRAINING SIGNAL that shapes trunk features rather than inference
+        machinery that reweights them.
+
+    Trunk module names preserved verbatim — any v13/scaled-v13 checkpoint
+    warm-starts v18 bit-exactly (D63 contract, smoke-asserted)."""
+
+    def __init__(self, head_width=24, prior_fg=None, channels=(16, 32, 64),
+                 n_blocks=3, stops=1.5):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.exposure = 2.0 ** stops
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        self.mask_hidden = nn.Conv2d(ch_mid, 8, 1)
+        self.mask_state = nn.Linear(ch_mid, 8)  # global state -> mask bias
+        self.mask_out = nn.Conv2d(8, 1, 1)
+        self.blend_gain = nn.Parameter(torch.zeros(()))
+        self.bg_head = nn.Conv2d(ch_top, 1, 1)  # train-only aux
+        for mod in (self.stem, self.down4, self.block4, self.down20,
+                    self.blocks, self.head):
+            for m in mod.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def _front_norms(self):
+        for mod in (self.stem_norm, self.down4.dw_norm, self.down4.pw_norm,
+                    self.block4.dw_norm, self.block4.pw_norm):
+            yield mod
+
+    def _front(self, img, observe=True):
+        if not observe:  # bright pass: never let its stats into the buffers
+            saved = [(m, m.frozen) for m in self._front_norms()]
+            for m, _ in saved:
+                m.frozen = True
+        x = self.block4(self.down4(self.act(self.stem_norm(self.stem(img)))))
+        if not observe:
+            for m, was in saved:
+                m.frozen = was
+        return x
+
+    def forward(self, img):
+        s4 = self._front(img)
+        bright = self._front((img * self.exposure).clamp(max=1.0),
+                             observe=False)
+        z = s4.mean((2, 3))                                # state vector
+        h = F.silu(self.mask_hidden(s4)
+                   + self.mask_state(z).unsqueeze(-1).unsqueeze(-1))
+        m = torch.sigmoid(self.mask_out(h))                # (B,1,135,240)
+        s4 = s4 + torch.tanh(self.blend_gain) * m * (bright - s4)
+        y = self.blocks(self.down20(s4))
+        out = self.head(y)
+        if self.training:
+            return out, self.bg_head(y)                    # + aux bg logits
+        return out

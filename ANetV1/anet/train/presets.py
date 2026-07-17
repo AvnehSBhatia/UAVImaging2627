@@ -68,7 +68,7 @@ def _auto_batch(arch=None):
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
-    if arch in ("v13", "v14", "v16", "v17"):  # v16/v17 = v13 + tiny modules
+    if arch in ("v13", "v14", "v16", "v17", "v18"):  # v16-v18 = v13 + tiny modules
         gib_per_img = 0.12
     elif arch == "v15":
         gib_per_img = 0.22  # SPD tier-M (wider s4 stage) worst case
@@ -196,6 +196,12 @@ def anet_cfg(**overrides):
         # sqrt(64/800) against v13's biggest matrices. ANET_SLOW_MULT
         # overrides; 1.0 disables. Harmless for archs without a spd_proj.
         slow_lr_pattern="spd_proj",
+        # D68 background-mask aux head: weight of BCE(bg logits, 1 - max
+        # Gaussian) + the owner's smoothness prior on the PREDICTED bg
+        # (penalize deviation from a 3x3 local mean). ANET_BG_W / 0 disables.
+        bg_aux_weight=float(os.environ["ANET_BG_W"])
+        if "ANET_BG_W" in os.environ else 0.3,
+        bg_smooth_weight=0.3,
         slow_lr_mult=float(os.environ["ANET_SLOW_MULT"])
         if "ANET_SLOW_MULT" in os.environ else 0.2,
         # Gaussian splat sigma (cells) for the heat target (rasterize.py). 1.5

@@ -418,6 +418,54 @@ def v17_checks():
     print("  v17 checks passed")
 
 
+def v18_checks():
+    """v18 (D68): exposure-mask + bg-aux heads on the v13 trunk — identity,
+    train/eval contract, DN bright-pass isolation, valve/aux gradients."""
+    import torch.nn.functional as F
+    from anet.model.norm import DeployNorm
+
+    m13 = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    m = ANetV1(arch="v18", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m.parameters())
+    print(f"ANetV1 v18 params: {n:,}")
+    assert n < 40_000
+    missing, unexpected = m.load_state_dict(m13.state_dict(), strict=False)
+    assert not unexpected
+    m13.eval(); m.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        d = (m13(x)["heat"] - m(x)["heat"]).abs().max().item()
+    print(f"  v18 identity-at-init vs donor v13: max delta {d:.2e}")
+    assert d < 1e-5
+    assert "aux_bg" not in m(x), "bg head must be train-only"
+
+    m.train()
+    out = m(x)
+    assert out["aux_bg"].shape == (2, 1, 27, 48)
+    # bright pass must not contaminate front DN stats: pendings must equal a
+    # normal-branch-only front pass
+    pend = {k: mod._pending[0].clone() for k, mod in m.named_modules()
+            if isinstance(mod, DeployNorm) and mod._pending is not None
+            and any(t in k for t in ("stem_norm", "down4", "block4"))}
+    m.backbone._front(x)
+    for k, v in pend.items():
+        assert torch.equal(m.get_submodule(k)._pending[0], v), k
+
+    from anet.train.losses import center_focal_loss
+    heat_t = torch.zeros(2, 2, 27, 48); heat_t[:, 0, 5, 5] = 1.0
+    bg_t = 1.0 - heat_t.max(1, keepdim=True).values
+    loss = center_focal_loss(out["heat"], heat_t) + 0.3 * \
+        F.binary_cross_entropy_with_logits(out["aux_bg"].float(), bg_t)
+    loss.backward()
+    p = dict(m.named_parameters())
+    assert p["backbone.blend_gain"].grad.abs() > 0, "dead blend valve"
+    assert p["backbone.bg_head.weight"].grad.abs().max() > 0, "dead bg head"
+    assert not [k for k, q in m.named_parameters() if q.grad is None]
+    r = ANetV1.from_state_dict(m.state_dict())
+    assert r.arch == "v18"
+    print("  v18 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -434,6 +482,7 @@ def main():
     v15_checks()
     v16_checks()
     v17_checks()
+    v18_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 
