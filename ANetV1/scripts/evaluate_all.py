@@ -152,6 +152,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="cap images for the ANet eval (0 = all; the full train "
                          "split is ~14k images). YOLO eval ignores the cap.")
+    ap.add_argument("--peak-thresh", type=float, default=None,
+                    help="override the center-arch peak threshold (presets "
+                         "0.3) — sweep it to map the recall-vs-fp operating "
+                         "curve of a checkpoint")
     ap.add_argument("--out", default="runs/comparison.json")
     args = ap.parse_args()
     cfg = anet_cfg()
@@ -173,13 +177,15 @@ def main():
     if args.anet:
         results["anet"] = eval_anet(args.anet, ds_anet, device,
                                     getattr(cfg.train, "conf_thresh", 0.0),
-                                    getattr(cfg.train, "peak_thresh", 0.3))
+                                    args.peak_thresh
+                                    or getattr(cfg.train, "peak_thresh", 0.3))
         if args.latency:
             results["anet"].update(latency_anet(args.anet, device))
     if args.anet_distill:
         results["anet_distill"] = eval_anet(args.anet_distill, ds_anet, device,
                                             getattr(cfg.train, "conf_thresh", 0.0),
-                                            getattr(cfg.train, "peak_thresh", 0.3))
+                                            args.peak_thresh
+                                            or getattr(cfg.train, "peak_thresh", 0.3))
         if args.latency:
             results["anet_distill"].update(latency_anet(args.anet_distill, device))
 
