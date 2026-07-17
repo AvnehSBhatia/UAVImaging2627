@@ -136,7 +136,15 @@ def anet_cfg(**overrides):
         # root-caused to fork()ed spawn workers + the inductor compile-worker
         # fork storm, both fixed (spawn ctx, TORCHINDUCTOR_COMPILE_THREADS=1).
         # ANET_COMPILE=0 is the quick kill switch if a container misbehaves.
-        compile=IS_CUDA,
+        # v15 EXCEPTION: inductor on ROCm MISCOMPILES the v15 tier-M shapes —
+        # loss=nan on the literal first forward (before any weight update),
+        # bisected on-box: ANET_COMPILE=0 trains, and the identical math is
+        # finite in local bf16 (loss 17.4, clean stats). Tier-S happened to
+        # compile fine, but a shape-dependent miscompile means every new tier
+        # is a coin flip, so v15 defaults compile OFF; ANET_COMPILE=1 opts a
+        # known-good tier back in. v15 is conv-dominated (MIOpen does the
+        # work), so the lost tail fusion is small.
+        compile=IS_CUDA and overrides.get("arch") != "v15",
         compile_mode="default",
         # benchmark=True is a win on NVIDIA (cuDNN picks fast algos per shape,
         # shapes here are static) but forces an exhaustive ~27-min MIOpen search

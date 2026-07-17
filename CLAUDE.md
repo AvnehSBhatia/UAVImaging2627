@@ -44,7 +44,7 @@ python scripts/export_onnx.py --ckpt runs/anet/best.pt --bench   # portable ONNX
 
 **There is no yaml config.** Hyperparameter defaults live in `ANetV1/anet/train/presets.py` (`anet_cfg()`, device-aware: MI300X vs Mac) and are overridden inline in each train script's cfg block. Env knobs: `ANET_BATCH/ACCUM/LR/EPOCHS/COMPILE/FUSED/FUSED_BWD/CACHE/CONF/INIT_FROM/LOSS_MODE`, `DATA_ROOT`.
 
-Training runs on MPS locally (`PYTORCH_ENABLE_MPS_FALLBACK=1` if an op is unsupported) and on ROCm remotely. ROCm quirks are load-bearing: dataloader workers must be 0 (spawn deadlocks on fork'd MIOpen mutexes — a background prefetch thread hides the loader cost instead), `TORCHINDUCTOR_COMPILE_THREADS=1` (host-OOM guard), `MIOPEN_FIND_MODE=FAST`. The run scripts set all of this.
+Training runs on MPS locally (`PYTORCH_ENABLE_MPS_FALLBACK=1` if an op is unsupported) and on ROCm remotely. ROCm quirks are load-bearing: dataloader workers must be 0 (spawn deadlocks on fork'd MIOpen mutexes — a background prefetch thread hides the loader cost instead), `TORCHINDUCTOR_COMPILE_THREADS=1` (host-OOM guard), `MIOPEN_FIND_MODE=FAST`, and inductor MISCOMPILES some v15 (pixel_unshuffle) tier shapes to step-0 NaN — v15 defaults `compile=False` (presets), `ANET_COMPILE=1` opts a known-good tier back in. The run scripts set all of this.
 
 Dataset generation (from `datasetgen-2026/`, must be the cwd — package-relative imports):
 
