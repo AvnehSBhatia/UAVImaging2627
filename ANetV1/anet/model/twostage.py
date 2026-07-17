@@ -47,21 +47,29 @@ IMG_H, IMG_W = 540, 960
 
 
 class CropCNN(nn.Module):
-    """100x100x3 -> 3 logits (BG, mannequin, tent). ~5.1k params.
-    GroupNorm: the crop batch is small and variable (K peaks + GT + bg
-    crops per step) — batch statistics would be noise."""
+    """100x100x9 crop + 4 context scalars -> 3 logits (BG, mannequin,
+    tent). ~5.7k params. The crop stacks EVERYTHING the pipeline knows
+    about the window (v21.1, owner: "use all of our info"): raw RGB
+    (color is the family's strongest class signal), the smoothed
+    composite, and the edge image. The context vector rides past the
+    conv stack into the head: the peak's saliency prob (stage-1
+    confidence) + the frame's mean RGB (the same scene stats that
+    condition the kernels). GroupNorm: the crop batch is small and
+    variable (K peaks + GT + bg crops per step) — batch statistics
+    would be noise."""
 
-    def __init__(self):
+    def __init__(self, in_ch=9, n_ctx=4):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 8, 3, 2, 1), nn.GroupNorm(4, 8), nn.SiLU(),
+            nn.Conv2d(in_ch, 8, 3, 2, 1), nn.GroupNorm(4, 8), nn.SiLU(),
             nn.Conv2d(8, 16, 3, 2, 1), nn.GroupNorm(4, 16), nn.SiLU(),
             nn.Conv2d(16, 24, 3, 2, 1), nn.GroupNorm(4, 24), nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(24, 3),
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
         )
+        self.fc = nn.Linear(24 + n_ctx, 3)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, ctx):
+        return self.fc(torch.cat([self.net(x), ctx], 1))
 
 
 class V21TwoStage(nn.Module):
@@ -138,7 +146,14 @@ class V21TwoStage(nn.Module):
         sal = edge.norm(dim=1, keepdim=True)               # 7
         pooled = F.max_pool2d(sal, STRIDE).squeeze(1)      # (B,27,48)
         sal_logits = self.sal_a * pooled + self.sal_b
-        return {"sal_logits": sal_logits, "smooth": smooth, "edge": edge}
+        return {"sal_logits": sal_logits, "smooth": smooth, "edge": edge,
+                "means": means}
+
+    @staticmethod
+    def stack_maps(img, out):
+        """The 9-channel crop source (v21.1): raw RGB + smoothed
+        composite + edge image, concatenated once per batch."""
+        return torch.cat([img, out["smooth"], out["edge"]], 1)
 
     # ------------------------------------------------------------ stage 2
     @torch.no_grad()
@@ -173,6 +188,7 @@ class V21TwoStage(nn.Module):
         out = self.forward(img)
         prob = torch.sigmoid(out["sal_logits"])
         peaks = self.find_peaks(prob, peak_thresh)
+        stacked = self.stack_maps(img, out)
         B = img.shape[0]
         heat = torch.zeros(B, 2, GRID_H, GRID_W)
         offset = torch.full((B, 2, GRID_H, GRID_W), 0.5)
@@ -180,9 +196,12 @@ class V21TwoStage(nn.Module):
             if not peaks[b]:
                 continue
             crops = torch.stack([
-                self.crop_at(out["edge"][b], (c + 0.5) * STRIDE,
+                self.crop_at(stacked[b], (c + 0.5) * STRIDE,
                              (r + 0.5) * STRIDE) for r, c, _ in peaks[b]])
-            cls_p = torch.softmax(self.crop_cnn(crops), 1)  # (P,3)
+            ctx = torch.stack([
+                torch.cat([torch.tensor([v], device=img.device),
+                           out["means"][b]]) for _, _, v in peaks[b]])
+            cls_p = torch.softmax(self.crop_cnn(crops, ctx), 1)  # (P,3)
             for (r, c, _), p in zip(peaks[b], cls_p):
                 if int(p.argmax()) > 0:
                     heat[b, int(p.argmax()) - 1, r, c] = float(p.max())

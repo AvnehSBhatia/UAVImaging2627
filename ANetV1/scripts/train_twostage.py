@@ -46,17 +46,26 @@ OUT = Path("runs/twostage")
 MAX_SEL_FP = 25.0
 
 
-def _gather_crops(model, edge, batch, peaks, device):
+def _gather_crops(model, stacked, prob, means, batch, peaks, device):
     """Assemble the training crop set: GT centers (label = class),
-    random bg (label 0), unmatched predicted peaks (label 0)."""
-    crops, labels = [], []
+    random bg (label 0), unmatched predicted peaks (label 0). Each crop
+    is the 9-channel stack; its context = [saliency prob at the crop's
+    cell, frame mean RGB] (v21.1: the classifier sees all of stage 1)."""
+    crops, ctxs, labels = [], [], []
     boxes_all = batch["boxes"].numpy()
     rng = np.random.default_rng(int(batch["seed"]))
-    for b in range(edge.shape[0]):
+
+    def _add(b, cx_px, cy_px, label):
+        r = min(max(int(cy_px / STRIDE), 0), prob.shape[1] - 1)
+        c = min(max(int(cx_px / STRIDE), 0), prob.shape[2] - 1)
+        crops.append(model.crop_at(stacked[b], cx_px, cy_px))
+        ctxs.append(torch.cat([prob[b, r, c].reshape(1), means[b]]))
+        labels.append(label)
+
+    for b in range(stacked.shape[0]):
         boxes = [x for x in boxes_all[b] if x[0] >= 0]
         for cls, cx, cy, w, h in boxes:
-            crops.append(model.crop_at(edge[b], cx * IMG_W, cy * IMG_H))
-            labels.append(int(cls) + 1)
+            _add(b, cx * IMG_W, cy * IMG_H, int(cls) + 1)
         for _ in range(2):  # random background crops
             for _try in range(10):
                 cx = rng.uniform(CROP / 2, IMG_W - CROP / 2)
@@ -65,8 +74,7 @@ def _gather_crops(model, edge, batch, peaks, device):
                            and abs(cy / IMG_H - x[2]) < (x[4] / 2 + CROP / IMG_H / 2)
                            for x in boxes)
                 if not near:
-                    crops.append(model.crop_at(edge[b], cx, cy))
-                    labels.append(0)
+                    _add(b, cx, cy, 0)
                     break
         hard = 0
         for r, c, _ in peaks[b]:
@@ -76,13 +84,12 @@ def _gather_crops(model, edge, batch, peaks, device):
             hit = any(abs(cx - x[1]) <= x[3] / 2 and abs(cy - x[2]) <= x[4] / 2
                       for x in boxes)
             if not hit:  # predicted peak on background -> hard negative
-                crops.append(model.crop_at(edge[b], (c + 0.5) * STRIDE,
-                                           (r + 0.5) * STRIDE))
-                labels.append(0)
+                _add(b, (c + 0.5) * STRIDE, (r + 0.5) * STRIDE, 0)
                 hard += 1
     if not crops:
-        return None, None
-    return torch.stack(crops), torch.tensor(labels, device=device)
+        return None, None, None
+    return (torch.stack(crops), torch.stack(ctxs).detach(),
+            torch.tensor(labels, device=device))
 
 
 @torch.no_grad()
@@ -125,11 +132,15 @@ def main():
         assert all(v.isfinite().all() for v in out.values())
         heat_t = torch.zeros(2, 1, 27, 48, device=device)
         heat_t[:, 0, 5, 5] = 1.0
-        loss = center_focal_loss(out["sal_logits"].unsqueeze(1), heat_t)
-        crop = model.crop_at(out["edge"][0], 30.0, 520.0)  # corner clamp
-        assert crop.shape == (3, CROP, CROP)
+        loss = center_focal_loss(out["sal_logits"].unsqueeze(1), heat_t,
+                                 pos_weight=3.0)
+        stacked = model.stack_maps(x, out)
+        crop = model.crop_at(stacked[0], 30.0, 520.0)  # corner clamp
+        assert crop.shape == (9, CROP, CROP)
+        ctx = torch.cat([torch.tensor([0.5], device=device),
+                         out["means"][0]]).unsqueeze(0)
         loss = loss + F.cross_entropy(
-            model.crop_cnn(crop.unsqueeze(0)),
+            model.crop_cnn(crop.unsqueeze(0), ctx),
             torch.tensor([1], device=device))
         loss.backward()
         assert not [k for k, p in model.named_parameters() if p.grad is None]
@@ -156,6 +167,7 @@ def main():
     batch = int(os.environ.get("ANET_BATCH", "16"))
     limit = int(os.environ.get("ANET_SAMPLES", "0"))
     smooth_w = float(os.environ.get("ANET_SMOOTH_W", "0.1"))
+    pos_w = float(os.environ.get("ANET_POS_W", "3.0"))
     workers = 0 if torch.version.hip else 2
     cache = os.environ.get("ANET_CACHE") == "1"
 
@@ -191,9 +203,13 @@ def main():
             img = batch_d["image"].to(device)
             heat_t = batch_d["heat"].to(device)          # (B,2,27,48)
             out = model(img)
-            # 1) class-agnostic center loss on the saliency grid
+            # 1) class-agnostic center loss on the saliency grid.
+            # pos_weight=3: the v12-measured fix for the slow positive
+            # climb (ANET_POS_W overrides) — epoch-0 viz showed peaks
+            # placed right but 18/24 frames below the 0.3 threshold
             sal_t = heat_t.max(1, keepdim=True).values
-            l_center = center_focal_loss(out["sal_logits"].unsqueeze(1), sal_t)
+            l_center = center_focal_loss(out["sal_logits"].unsqueeze(1),
+                                         sal_t, pos_weight=pos_w)
             # 2) the smoothing quat's dedicated background term
             s4 = F.avg_pool2d(out["smooth"], 4)          # (B,3,135,240)
             bg = (F.interpolate(sal_t, scale_factor=5, mode="nearest")
@@ -201,13 +217,15 @@ def main():
             tv = (s4 - F.avg_pool2d(s4, 3, 1, 1)).abs()
             l_smooth = (tv * bg).sum() / bg.sum().clamp_min(1.0) / 3.0
             # 3) crop classification (GT + random bg + hard-negative peaks)
+            prob = torch.sigmoid(out["sal_logits"].detach())
             with torch.no_grad():
-                peaks = model.find_peaks(
-                    torch.sigmoid(out["sal_logits"]), 0.3)
+                peaks = model.find_peaks(prob, 0.3)
             batch_d["seed"] = gstep
-            crops, labels = _gather_crops(model, out["edge"], batch_d,
-                                          peaks, device)
-            l_crop = (F.cross_entropy(model.crop_cnn(crops), labels,
+            stacked = model.stack_maps(img, out)
+            crops, ctx, labels = _gather_crops(model, stacked, prob,
+                                               out["means"].detach(),
+                                               batch_d, peaks, device)
+            l_crop = (F.cross_entropy(model.crop_cnn(crops, ctx), labels,
                                       weight=cls_w)
                       if crops is not None else l_center * 0.0)
             loss = l_center + smooth_w * l_smooth + l_crop

@@ -833,3 +833,17 @@ CE cold-starts at ln 3, center focal 18→12 in 3 steps, detect contract
 emits family tensors). MI300X run pending:
 `python scripts/train_twostage.py` (knobs: ANET_LR 1.5e-3, ANET_EPOCHS
 15, ANET_BATCH 16, ANET_SMOOTH_W 0.1, ANET_CACHE=1 recommended).
+
+**v21.1 (owner-directed revision, same day):** the epoch-0 viz split the
+blame cleanly — saliency peaks were landing ON objects (frame 000008's
+single peak was the mannequin at CropCNN p 0.71) while the classifier
+starved: it saw only the 3-channel edge image, discarding color (the
+family's strongest class signal) and every other computed map. Owner:
+"the issue is the crop messing up — try something better that uses all
+of our info." CropCNN now takes the 9-channel window stack (raw RGB +
+smoothed composite + edge) plus a 4-scalar context vector into the head
+(the peak's saliency prob + the frame's mean RGB — stage 1's confidence
+and the scene stats that conditioned the kernels). 6,077 params (+444).
+Same viz also showed 18/24 frames peaking BELOW the 0.3 threshold →
+center focal now uses pos_weight=3 (ANET_POS_W), the v12-measured fix
+for exactly that slow positive climb.
