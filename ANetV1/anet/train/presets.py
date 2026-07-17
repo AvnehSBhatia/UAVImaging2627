@@ -100,8 +100,11 @@ def anet_cfg(**overrides):
         else (4.0e-3 if IS_CUDA else 3.0e-3),
         # higher peak LR needs a longer ramp or it diverges on step 1 — scale
         # warmup with LR (ANET_WARMUP overrides). At 1e-2 this gives ~600 steps.
+        # v15 gets a longer ramp: the SPD projection holds ~70% of all params
+        # in one layer, and the first v15 runs over-fired violently while
+        # still INSIDE the 300-step warmup (fp/img 572 at epoch 1).
         warmup_steps=int(os.environ["ANET_WARMUP"]) if "ANET_WARMUP" in os.environ
-        else (300 if IS_CUDA else 0),
+        else ((600 if overrides.get("arch") == "v15" else 300) if IS_CUDA else 0),
         # LR schedule after warmup: "cosine" (smooth decay to 0, default),
         # "restarts" (cosine warm restarts — periodic LR spikes to re-escape a
         # plateau; good for a stuck class), "plateau" (ReduceLROnPlateau on the
@@ -173,6 +176,13 @@ def anet_cfg(**overrides):
         center_aux_weight=float(os.environ["ANET_AUX_W"]) if "ANET_AUX_W" in os.environ
         else 1.0,
         peak_thresh=0.3,              # eval-time 3x3-local-max heatmap threshold (CenterObjectMetrics)
+        # center-mode selection sanity gate: epochs with object fp/img above
+        # this can neither become best.pt nor set the early-stop reference
+        # (the degenerate over-predictor guard, center-mode edition — see
+        # trainer.py; the v9 guard uses cell precision, which center mode
+        # lacks). Real operating points are a few fp/img; over-fire episodes
+        # measured 40-1800.
+        max_sel_fp=25.0,
         # Gaussian splat sigma (cells) for the heat target (rasterize.py). 1.5
         # (was 0.7 ~ a single cell) gives a ~3x3 soft core so cells adjacent to a
         # true center carry a near-1 target and are barely penalized as negatives

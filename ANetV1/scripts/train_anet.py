@@ -70,6 +70,8 @@ from anet.train.trainer import Trainer  # noqa: E402
 # from_state_dict for evaluation, but cannot warm-start a run here — the
 # encoder layouts differ.
 # --------------------------------------------------------------------------
+_ARCH = os.environ.get("ANET_ARCH") or "v13"
+
 cfg = anet_cfg(
     # v9 (region-classification) config — kept available, commented, so v9
     # can still be run by swapping the two blocks below:
@@ -105,7 +107,8 @@ cfg = anet_cfg(
     # ANET_ARCH=v14, ideally with ANET_INIT_FROM=<v13 ckpt> +
     # ANET_FREEZE_TRUNK=1 — the corrected adapter test is v14's remaining
     # clean shot; if it cannot beat the donor's sel, v14 is falsified.
-    arch=os.environ.get("ANET_ARCH") or "v13",
+    # ANET_ARCH=v15 runs the D65 scaling tiers.
+    arch=_ARCH,
     stem="edge_dq4",         # unused by v13/v14 (kept so v9/v12 swaps stay one-line)
     hidden=32,               # unused by v13/v14 (same reason)
     # from-scratch center-heatmap training is SLOW on the rare tiny mannequin:
@@ -119,7 +122,13 @@ cfg = anet_cfg(
     # budget so the cosine doesn't decay LR away mid-climb; soft-signal selection
     # keeps early-stop from firing before peaks cross 0.5.
     epochs=int(os.environ.get("ANET_EPOCHS", 80)),
-    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ else 1.5e-3,
+    # v15 tiers get a LOWER peak: the SPD projection concentrates ~70% of all
+    # params in one layer, so a step at v13's 1.5e-3 moves the function far
+    # more than v13's largest 4k-param layer ever did — measured on both
+    # tiers: violent recall/fp oscillation from epoch 1 (fp/img 572 -> 5 ->
+    # 632 -> 1766 on tier-S). Same bigger-model/lower-LR law as everywhere.
+    lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ
+    else (7.5e-4 if _ARCH == "v15" else 1.5e-3),
     # prior_fg 0.01 (RetinaNet §4.1 prior), NOT 0.1/0.05. On the 27x48=1296-cell
     # heatmap only ~1-2 cells per class are objects, so a HIGH init prior makes
     # the ~2590 background cells' penalty-reduced-focal gradient sink the head's

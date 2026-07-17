@@ -825,6 +825,19 @@ class Trainer:
                 if getattr(self.cfg.train, "loss_mode", "") == "center":
                     key = key + 0.5 * (stats.get("soft_mann", 0.0)
                                        + tent_w * stats.get("soft_tent", 0.0))
+                    # degenerate over-predictor guard, center-mode edition:
+                    # the v9 guard below gates on CELL precision, which does
+                    # not exist here — and a model that lights up half the
+                    # grid maxes object recall with sel unpunished (measured,
+                    # first v15-S run: sel 1.966 at fp/img 1766 promoted to
+                    # best.pt, and early stop then judged 17 epochs against
+                    # that fake bar). Gate on object fp directly: a real
+                    # operating point is a few fp/img; over-fire episodes are
+                    # 40-1800. Gated epochs can neither become best.pt nor
+                    # set the early-stop reference.
+                    if stats["fp_per_image"] > getattr(self.cfg.train,
+                                                       "max_sel_fp", 25.0):
+                        key = -1.0
                 if self.sched_per_epoch and self._warmup_left == 0:
                     self.sched.step(key)  # ReduceLROnPlateau on the selection metric
                 row = [epoch, running / max(n, 1), stats["mannequin_recall"],
