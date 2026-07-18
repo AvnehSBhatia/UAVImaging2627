@@ -146,7 +146,10 @@ class V21TwoStage(nn.Module):
     only as the crop context's scene statistic."""
 
     MAX_CHUNKS = 24  # per image, strongest-first
-    N_FEAT = 15      # per-chunk feature vector width
+    N_FEAT = 14      # per-chunk feature vector width
+    THRESH = 0.8     # fixed chunk threshold (owner call: the learned
+    #                  MLP kept the cold mask saturated — at 0.8 only
+    #                  genuinely hot cells chunk, from step 0)
 
     def __init__(self, max_peaks=12, n_lines=20):
         super().__init__()
@@ -158,16 +161,7 @@ class V21TwoStage(nn.Module):
         self.edge = nn.Parameter(e.reshape(3, 1, 7, 7).clone())
         self.sal_a = nn.Parameter(torch.tensor(4.0))
         self.sal_b = nn.Parameter(torch.tensor(-2.0))
-        # v21.5 learned threshold (owner: "3->8+silu->4->1"): frame mean
-        # RGB -> scalar threshold in (0,1); last bias init so the cold
-        # threshold sits at the family's 0.3. Gradient reaches it through
-        # the SOFT chunk-membership weights (the hard mask only selects).
-        self.thresh_mlp = nn.Sequential(
-            nn.Linear(3, 8), nn.SiLU(), nn.Linear(8, 4), nn.Linear(4, 1))
-        nn.init.zeros_(self.thresh_mlp[-1].weight)
-        with torch.no_grad():
-            self.thresh_mlp[-1].bias.fill_(math.log(0.3 / 0.7))
-        # v21.5 chunk CLS head (~340 params, replaces the 5.6k CropCNN):
+        # v21.5 chunk CLS head (~330 params, replaces the 5.6k CropCNN):
         # per-chunk features are cell-resolution ONLY — no full-res crops
         self.cls_head = nn.Sequential(
             nn.Linear(self.N_FEAT, 16), nn.SiLU(), nn.Linear(16, 3))
@@ -204,8 +198,8 @@ class V21TwoStage(nn.Module):
         return {"sal_logits": self.sal_a * pooled + self.sal_b,
                 "smooth": smooth, "edge": edge, "means": means,
                 "cell_feats": cell_feats,
-                "thresh": torch.sigmoid(
-                    self.thresh_mlp(means)).squeeze(-1)}  # (B,)
+                "thresh": torch.full((img.shape[0],), self.THRESH,
+                                     device=img.device)}
 
     def image_chunks(self, prob_b, thresh_b):
         """Hard selection (no grad needed): cells above the learned
@@ -237,8 +231,7 @@ class V21TwoStage(nn.Module):
             f = torch.cat([
                 pooled, p.max().reshape(1), p.mean().reshape(1),
                 p.new_tensor([min(len(cells), 200) / 200.0,
-                              span_w, span_h]),
-                thresh.reshape(1)])
+                              span_w, span_h])])
             feats.append(f)
         return self.cls_head(torch.stack(feats))
 
