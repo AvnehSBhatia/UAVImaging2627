@@ -1,4 +1,4 @@
-"""v21.4 trainer (D71 line, ARCHITECTURE.md 16.9). Run from ANetV1/.
+"""v21.5 trainer (D71 line, ARCHITECTURE.md 16.9). Run from ANetV1/.
 
   python scripts/train_twostage.py            # train
   python scripts/train_twostage.py --smoke    # fwd/bwd/detect sanity
@@ -9,8 +9,8 @@ Four losses:
            pos_weight=3 (ANET_POS_W)
   smooth : the smoothing quat's DEDICATED background-TV term
            (ANET_SMOOTH_W, default 0.1)
-  crop   : CE over dual-scale (50+100) crops — GT centers, 2 random bg,
-           <=4 unmatched-peak hard negatives per image
+  chunk  : CE over 8-connected saliency chunks (learned threshold);
+           labels by centroid-in-GT-box — all cell-res, no crops
   ent    : the isolated EntropyProbe (detached input; ent_auc in the
            epoch line is its entire purpose)
 
@@ -32,11 +32,9 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import numpy as np  # noqa: E402
-
 from anet.data.dataset import SUASCells  # noqa: E402
-from anet.model.twostage import (CROP_L, CROP_S, EntropyProbe,  # noqa: E402
-                                 IMG_H, IMG_W, STRIDE, V21TwoStage)
+from anet.model.twostage import (EntropyProbe, GRID_H, GRID_W,  # noqa: E402
+                                 IMG_H, IMG_W, V21TwoStage)
 from anet.train.losses import center_focal_loss  # noqa: E402
 from anet.train.metrics import CenterObjectMetrics  # noqa: E402
 from anet.train.trainer import pick_device  # noqa: E402
@@ -46,67 +44,32 @@ OUT = Path("runs/twostage")
 MAX_SEL_FP = 25.0
 
 
-def _gather_crops(model, stacked, prob, means, batch, peaks, device):
-    """Training crop set: GT centers (label = class), 2 random bg
-    (label 0), <=4 unmatched predicted peaks (label 0). Dual-scale:
-    every entry yields a 50 AND a 100 crop; ctx = [saliency prob at the
-    crop's cell, frame mean RGB], built with one fancy-index at the
-    end."""
-    cs, cl, cells, labels = [], [], [], []
+def _chunk_loss_batch(model, out, prob, batch, device, cls_w):
+    """Chunk CE over the batch: every discovered chunk is labelled by
+    whether its saliency-weighted centroid falls inside a GT box (that
+    class) or not (BG). All cell-resolution — no crops anywhere."""
     boxes_all = batch["boxes"].numpy()
-    rng = np.random.default_rng(int(batch["seed"]))
-
-    def _add(b, cx_px, cy_px, label):
-        r = min(max(int(cy_px / STRIDE), 0), prob.shape[1] - 1)
-        c = min(max(int(cx_px / STRIDE), 0), prob.shape[2] - 1)
-        cs.append(model.crop_at(stacked[b], cx_px, cy_px, CROP_S))
-        cl.append(model.crop_at(stacked[b], cx_px, cy_px, CROP_L))
-        cells.append((b, r, c))
-        labels.append(label)
-
-    for b in range(stacked.shape[0]):
+    logits, labels = [], []
+    for b in range(prob.shape[0]):
+        chunks = model.image_chunks(prob[b], out["thresh"][b])
+        if not chunks:
+            continue
+        logits.append(model.chunk_logits(b, chunks, prob, out))
         boxes = [x for x in boxes_all[b] if x[0] >= 0]
-        # cap GT crops per image: VisDrone frames carry up to hundreds
-        # of person boxes — uncapped, a couple of vd_* frames per batch
-        # meant hundreds of dual-scale crops per step (measured: 3
-        # img/s at batch 32; the crop stage, not the trunk)
-        gt = boxes if len(boxes) <= 8 else \
-            [boxes[i] for i in rng.choice(len(boxes), 8, replace=False)]
-        for cls, cx, cy, w, h in gt:
-            _add(b, cx * IMG_W, cy * IMG_H, int(cls) + 1)
-        for _ in range(2):
-            for _try in range(10):
-                cx = rng.uniform(CROP_L / 2, IMG_W - CROP_L / 2)
-                cy = rng.uniform(CROP_L / 2, IMG_H - CROP_L / 2)
-                near = any(abs(cx / IMG_W - x[1]) < (x[3] / 2 + CROP_L / IMG_W / 2)
-                           and abs(cy / IMG_H - x[2]) < (x[4] / 2 + CROP_L / IMG_H / 2)
-                           for x in boxes)
-                if not near:
-                    _add(b, cx, cy, 0)
+        for cells in chunks:
+            r, c = model.chunk_centroid(cells, prob[b])
+            cx, cy = (c + 0.5) / GRID_W, (r + 0.5) / GRID_H
+            lab = 0
+            for x in boxes:
+                if abs(cx - x[1]) <= x[3] / 2 and abs(cy - x[2]) <= x[4] / 2:
+                    lab = int(x[0]) + 1
                     break
-        hard = 0
-        for r, c, _ in peaks[b]:
-            if hard >= 2:
-                break
-            cx, cy = (c + 0.5) / 48, (r + 0.5) / 27
-            hit = any(abs(cx - x[1]) <= x[3] / 2 and abs(cy - x[2]) <= x[4] / 2
-                      for x in boxes)
-            if not hit:
-                _add(b, (c + 0.5) * STRIDE, (r + 0.5) * STRIDE, 0)
-                hard += 1
-    if not cs:
-        return None, None, None, None
-    # hard step-level ceiling so worst-case batches stay bounded
-    if len(cs) > 160:
-        keep = rng.choice(len(cs), 160, replace=False)
-        cs = [cs[i] for i in keep]
-        cl = [cl[i] for i in keep]
-        cells = [cells[i] for i in keep]
-        labels = [labels[i] for i in keep]
-    bi, ri, ci = (torch.tensor(x, device=device) for x in zip(*cells))
-    ctx = torch.cat([prob[bi, ri, ci].unsqueeze(1), means[bi]], 1)
-    return (torch.stack(cs), torch.stack(cl), ctx.detach(),
-            torch.tensor(labels, device=device))
+            labels.append(lab)
+    if not logits:
+        return None
+    return F.cross_entropy(torch.cat(logits),
+                           torch.tensor(labels, device=device),
+                           weight=cls_w)
 
 
 @torch.no_grad()
@@ -158,7 +121,7 @@ def main():
     probe = EntropyProbe().to(device)
     n_par = sum(p.numel() for p in model.parameters())
     n_probe = sum(p.numel() for p in probe.parameters())
-    print(f"V21TwoStage (v21.4): {n_par:,} params + EntropyProbe {n_probe} "
+    print(f"V21TwoStage (v21.5): {n_par:,} params + EntropyProbe {n_probe} "
           f"(side-only), device={device}")
     assert n_par < 40_000
 
@@ -167,21 +130,28 @@ def main():
         x = torch.rand(2, 3, IMG_H, IMG_W, device=device)
         out = model(x)
         assert out["sal_logits"].shape == (2, 27, 48)
+        assert out["cell_feats"].shape == (2, 9, 27, 48)
+        assert out["thresh"].shape == (2,)
         assert all(v.isfinite().all() for v in out.values())
         heat_t = torch.zeros(2, 1, 27, 48, device=device)
         heat_t[:, 0, 5, 5] = 1.0
         loss = center_focal_loss(out["sal_logits"].unsqueeze(1), heat_t,
                                  pos_weight=3.0)
-        stacked = model.stack_maps(x, out)
-        crop_s = model.crop_at(stacked[0], 30.0, 520.0, CROP_S)  # corner
-        crop_l = model.crop_at(stacked[0], 30.0, 520.0, CROP_L)
-        assert crop_s.shape == (9, CROP_S, CROP_S)
-        assert crop_l.shape == (9, CROP_L, CROP_L)
-        ctx = torch.cat([torch.tensor([0.5], device=device),
-                         out["means"][0]]).unsqueeze(0)
-        loss = loss + F.cross_entropy(
-            model.crop_cnn(crop_s.unsqueeze(0), crop_l.unsqueeze(0), ctx),
-            torch.tensor([1], device=device))
+        # chunk machinery: two separated blobs -> exactly two chunks
+        from anet.model.twostage import label_chunks
+        import numpy as np
+        m = np.zeros((27, 48), bool)
+        m[2:4, 2:4] = True
+        m[20:25, 30:40] = True
+        assert len(label_chunks(m)) == 2
+        prob = torch.sigmoid(out["sal_logits"])
+        chunks = model.image_chunks(prob[0], out["thresh"][0])
+        if chunks:
+            lg = model.chunk_logits(0, chunks, prob, out)
+            assert lg.shape == (len(chunks), 3)
+            loss = loss + F.cross_entropy(
+                lg, torch.zeros(len(chunks), dtype=torch.long,
+                                device=device))
         loss.backward()
         assert not [k for k, p in model.named_parameters() if p.grad is None]
         model.eval()
@@ -270,18 +240,12 @@ def main():
                   < 0.05).float()
             tv = (s4 - F.avg_pool2d(s4, 3, 1, 1)).abs()
             l_smooth = (tv * bg).sum() / bg.sum().clamp_min(1.0) / 3.0
-            # dual-scale crop classification
-            prob = torch.sigmoid(out["sal_logits"].detach())
-            with torch.no_grad():
-                peaks = model.find_peaks(prob, 0.3)
-            batch_d["seed"] = gstep + nb
-            stacked = model.stack_maps(img, out)
-            crops_s, crops_l, ctx, labels = _gather_crops(
-                model, stacked, prob, out["means"].detach(), batch_d,
-                peaks, device)
-            l_crop = (F.cross_entropy(
-                model.crop_cnn(crops_s, crops_l, ctx), labels, weight=cls_w)
-                if crops_s is not None else l_center * 0.0)
+            # chunk classification — prob NOT detached: the chunk CE
+            # trains the trunk and the threshold MLP end to end
+            prob = torch.sigmoid(out["sal_logits"])
+            lc = _chunk_loss_batch(model, out, prob, batch_d, device,
+                                   cls_w)
+            l_crop = lc if lc is not None else l_center * 0.0
             # side probe: DETACHED input — its gradient can only reach
             # its own params, never the main model
             l_ent = F.binary_cross_entropy_with_logits(
@@ -311,12 +275,12 @@ def main():
         if s["sel"] > best:
             best = s["sel"]
             torch.save({"model": model.state_dict(),
-                        "probe": probe.state_dict(), "arch": "v21.4",
+                        "probe": probe.state_dict(), "arch": "v21.5",
                         "epoch": ep, "val": s, "ent_auc": auc},
                        OUT / "best.pt")
             flag = "  *best*"
         torch.save({"model": model.state_dict(),
-                    "probe": probe.state_dict(), "arch": "v21.4",
+                    "probe": probe.state_dict(), "arch": "v21.5",
                     "epoch": ep, "val": s, "ent_auc": auc},
                    OUT / "last.pt")
         print(f"epoch {ep:3d}: loss={tot / max(nb, 1):.4f} "

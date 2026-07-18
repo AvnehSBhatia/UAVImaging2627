@@ -1,4 +1,21 @@
-"""v21.4 (D71 line, owner-directed): raw-front two-stage, dual-scale crops.
+"""v21.5 (D71 line, owner-directed): chunk detector — no crops at all.
+
+The 5.6k dual-scale CropCNN is gone (owner: too slow — full-res crops
+were the measured cost). Stage 2 is now entirely cell-resolution:
+
+  learned threshold (mean-RGB -> 3->8-SiLU->4->1 -> sigmoid, cold 0.3)
+  -> cells above threshold, 8-connected into CHUNKS
+  -> per-chunk features: soft-membership-pooled cell features (avg RGB,
+     avg smooth, max |edge|), saliency max/mean, chunk SIZE + spans
+     (the tent feature the family lacked: tents span ~5x5 cells,
+     mannequins 1-2), the threshold itself
+  -> ~340-param CLS head -> {BG, mannequin, tent} at the chunk's
+     saliency-weighted centroid.
+
+The hard mask only SELECTS; gradients flow through the soft membership
+weights sigmoid((p - thresh)/tau) into the threshold MLP and the trunk.
+
+--- prior rev (v21.4) ---
 
 History of this file, one experiment per rev (ARCHITECTURE.md 16.9):
 v21/v21.1 = A^chan 11x11 filter bank -> quats -> saliency -> 100x100
@@ -23,6 +40,8 @@ Deploy notes unchanged: crop gather is a CPU stage; everything else
 folds. Research track.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,8 +51,6 @@ from .blocks import quat_mul, sobel7
 GRID_H, GRID_W = 27, 48
 STRIDE = 20
 IMG_H, IMG_W = 540, 960
-CROP_S, CROP_L = 50, 100  # v21.4 dual-scale crops (owner: "50x50 and
-#                           then a 100x100" — the tent fix)
 _LUMA = (0.299, 0.587, 0.114)
 
 
@@ -91,31 +108,30 @@ class HyperDualQuaternionRGB(nn.Module):
         return F.conv2d(img, m.reshape(3, 3, 1, 1), t)
 
 
-class CropCNN(nn.Module):
-    """v21.4 dual-scale crop classifier: ONE shared conv trunk (GAP
-    makes it size-agnostic) applied to the 50x50 tight view AND the
-    100x100 wide view of each peak, embeddings concatenated with the
-    4-scalar context into the class head.
-
-    Why two scales fixes tents (measured, v21.3 viz): a ~100 px tent's
-    CENTER cell is smooth fabric — its edge evidence rings the
-    perimeter, which only the wide view contains; a ~25 px mannequin
-    drowns in a 100x100 crop but fills the tight view. GroupNorm: crop
-    batches are small and variable."""
-
-    def __init__(self, in_ch=9, n_ctx=4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 8, 3, 2, 1), nn.GroupNorm(4, 8), nn.SiLU(),
-            nn.Conv2d(8, 16, 3, 2, 1), nn.GroupNorm(4, 16), nn.SiLU(),
-            nn.Conv2d(16, 24, 3, 2, 1), nn.GroupNorm(4, 24), nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-        )
-        self.fc = nn.Linear(24 * 2 + n_ctx, 3)
-
-    def forward(self, crop_s, crop_l, ctx):
-        return self.fc(torch.cat([self.net(crop_s), self.net(crop_l),
-                                  ctx], 1))
+def label_chunks(mask):
+    """8-connected component labelling of a (27,48) bool numpy mask ->
+    list of cell lists [(r,c), ...]. Grid is tiny; plain DFS."""
+    import numpy as np
+    lbl = -1 * np.ones(mask.shape, dtype=int)
+    chunks = []
+    for r, c in zip(*np.nonzero(mask)):
+        if lbl[r, c] >= 0:
+            continue
+        k = len(chunks)
+        stack, cells = [(int(r), int(c))], []
+        lbl[r, c] = k
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    yy, xx = y + dy, x + dx
+                    if (0 <= yy < mask.shape[0] and 0 <= xx < mask.shape[1]
+                            and mask[yy, xx] and lbl[yy, xx] < 0):
+                        lbl[yy, xx] = k
+                        stack.append((yy, xx))
+        chunks.append(cells)
+    return chunks
 
 
 class V21TwoStage(nn.Module):
@@ -129,6 +145,9 @@ class V21TwoStage(nn.Module):
     dual-scale (50 + 100) per the owner's tent fix. line_means survives
     only as the crop context's scene statistic."""
 
+    MAX_CHUNKS = 24  # per image, strongest-first
+    N_FEAT = 15      # per-chunk feature vector width
+
     def __init__(self, max_peaks=12, n_lines=20):
         super().__init__()
         self.max_peaks = max_peaks
@@ -139,7 +158,19 @@ class V21TwoStage(nn.Module):
         self.edge = nn.Parameter(e.reshape(3, 1, 7, 7).clone())
         self.sal_a = nn.Parameter(torch.tensor(4.0))
         self.sal_b = nn.Parameter(torch.tensor(-2.0))
-        self.crop_cnn = CropCNN()
+        # v21.5 learned threshold (owner: "3->8+silu->4->1"): frame mean
+        # RGB -> scalar threshold in (0,1); last bias init so the cold
+        # threshold sits at the family's 0.3. Gradient reaches it through
+        # the SOFT chunk-membership weights (the hard mask only selects).
+        self.thresh_mlp = nn.Sequential(
+            nn.Linear(3, 8), nn.SiLU(), nn.Linear(8, 4), nn.Linear(4, 1))
+        nn.init.zeros_(self.thresh_mlp[-1].weight)
+        with torch.no_grad():
+            self.thresh_mlp[-1].bias.fill_(math.log(0.3 / 0.7))
+        # v21.5 chunk CLS head (~340 params, replaces the 5.6k CropCNN):
+        # per-chunk features are cell-resolution ONLY — no full-res crops
+        self.cls_head = nn.Sequential(
+            nn.Linear(self.N_FEAT, 16), nn.SiLU(), nn.Linear(16, 3))
 
     def line_means(self, img):
         """20 random rows + 20 random cols -> per-channel mean (B,3);
@@ -163,22 +194,62 @@ class V21TwoStage(nn.Module):
                         padding=3, groups=3)
         sal = edge.norm(dim=1, keepdim=True)
         pooled = F.max_pool2d(sal, STRIDE).squeeze(1)   # (B,27,48)
+        means = self.line_means(img)
+        # cell-resolution feature grid for chunk pooling: avg raw RGB,
+        # avg smoothed, max |edge| — everything the classifier sees
+        cell_feats = torch.cat([
+            F.avg_pool2d(img, STRIDE),
+            F.avg_pool2d(smooth, STRIDE),
+            F.max_pool2d(edge.abs(), STRIDE)], 1)       # (B,9,27,48)
         return {"sal_logits": self.sal_a * pooled + self.sal_b,
-                "smooth": smooth, "edge": edge,
-                "means": self.line_means(img)}
+                "smooth": smooth, "edge": edge, "means": means,
+                "cell_feats": cell_feats,
+                "thresh": torch.sigmoid(
+                    self.thresh_mlp(means)).squeeze(-1)}  # (B,)
+
+    def image_chunks(self, prob_b, thresh_b):
+        """Hard selection (no grad needed): cells above the learned
+        threshold, 8-connected into chunks, strongest-first, capped."""
+        mask = (prob_b > thresh_b).detach().cpu().numpy()
+        chunks = label_chunks(mask)
+        if len(chunks) > self.MAX_CHUNKS:
+            peak = [max(float(prob_b[r, c]) for r, c in cells)
+                    for cells in chunks]
+            order = sorted(range(len(chunks)), key=lambda i: -peak[i])
+            chunks = [chunks[i] for i in order[: self.MAX_CHUNKS]]
+        return chunks
+
+    def chunk_logits(self, b, chunks, prob, out, tau=0.1):
+        """Per-chunk feature vector -> CLS logits (K,3). Soft membership
+        w = sigmoid((p - thresh)/tau) carries gradient into the
+        threshold MLP and (through p) the whole trunk."""
+        feats = []
+        thresh = out["thresh"][b]
+        cf = out["cell_feats"][b]                        # (9,27,48)
+        for cells in chunks:
+            idx = torch.tensor(cells, device=prob.device)
+            rs, cs_ = idx[:, 0], idx[:, 1]
+            p = prob[b, rs, cs_]
+            w = torch.sigmoid((p - thresh) / tau)
+            pooled = (cf[:, rs, cs_] * w).sum(1) / w.sum().clamp_min(1e-6)
+            span_w = float(cs_.max() - cs_.min() + 1) / GRID_W
+            span_h = float(rs.max() - rs.min() + 1) / GRID_H
+            f = torch.cat([
+                pooled, p.max().reshape(1), p.mean().reshape(1),
+                p.new_tensor([min(len(cells), 200) / 200.0,
+                              span_w, span_h]),
+                thresh.reshape(1)])
+            feats.append(f)
+        return self.cls_head(torch.stack(feats))
 
     @staticmethod
-    def stack_maps(img, out):
-        """The 9-channel crop source: raw RGB + smooth + edge."""
-        return torch.cat([img, out["smooth"], out["edge"]], 1)
-
-    @staticmethod
-    def crop_at(maps, cx_px, cy_px, size):
-        """size x size crop around a full-res center, clamped inside
-        the frame."""
-        ox = int(min(max(round(cx_px - size / 2), 0), IMG_W - size))
-        oy = int(min(max(round(cy_px - size / 2), 0), IMG_H - size))
-        return maps[:, oy:oy + size, ox:ox + size]
+    def chunk_centroid(cells, prob_b):
+        """Saliency-weighted centroid cell of a chunk."""
+        idx = torch.tensor(cells, device=prob_b.device)
+        p = prob_b[idx[:, 0], idx[:, 1]].clamp_min(1e-6)
+        r = int(round(float((idx[:, 0].float() * p).sum() / p.sum())))
+        c = int(round(float((idx[:, 1].float() * p).sum() / p.sum())))
+        return min(max(r, 0), GRID_H - 1), min(max(c, 0), GRID_W - 1)
 
     @torch.no_grad()
     def find_peaks(self, prob, thresh=0.3):
@@ -200,32 +271,28 @@ class V21TwoStage(nn.Module):
 
     @torch.no_grad()
     def detect(self, img, peak_thresh=0.3):
-        """Full inference: saliency peaks -> dual-scale crops ->
-        CropCNN. Emits the family (heat, offset) tensors — each
-        detection writes its class prob at its peak cell — so
-        CenterObjectMetrics and the ladder stay apples-to-apples."""
+        """Full inference: learned threshold -> 8-connected chunks ->
+        chunk CLS head. Each non-BG chunk writes its class prob at its
+        saliency-weighted centroid cell, so CenterObjectMetrics and the
+        ladder stay apples-to-apples. peak_thresh is accepted for
+        interface compatibility; v21.5's threshold is LEARNED."""
         out = self.forward(img)
         prob = torch.sigmoid(out["sal_logits"])
-        peaks = self.find_peaks(prob, peak_thresh)
-        stacked = self.stack_maps(img, out)
         B = img.shape[0]
         heat = torch.zeros(B, 2, GRID_H, GRID_W)
         offset = torch.full((B, 2, GRID_H, GRID_W), 0.5)
         for b in range(B):
-            if not peaks[b]:
+            chunks = self.image_chunks(prob[b], out["thresh"][b])
+            if not chunks:
                 continue
-            cs, cl, ctx = [], [], []
-            for r, c, v in peaks[b]:
-                cx, cy = (c + 0.5) * STRIDE, (r + 0.5) * STRIDE
-                cs.append(self.crop_at(stacked[b], cx, cy, CROP_S))
-                cl.append(self.crop_at(stacked[b], cx, cy, CROP_L))
-                ctx.append(torch.cat([
-                    torch.tensor([v], device=img.device), out["means"][b]]))
-            cls_p = torch.softmax(self.crop_cnn(
-                torch.stack(cs), torch.stack(cl), torch.stack(ctx)), 1)
-            for (r, c, _), p in zip(peaks[b], cls_p):
+            cls_p = torch.softmax(
+                self.chunk_logits(b, chunks, prob, out), 1)
+            for cells, p in zip(chunks, cls_p):
                 if int(p.argmax()) > 0:
-                    heat[b, int(p.argmax()) - 1, r, c] = float(p.max())
+                    r, c = self.chunk_centroid(cells, prob[b])
+                    k = int(p.argmax()) - 1
+                    heat[b, k, r, c] = max(float(heat[b, k, r, c]),
+                                           float(p.max()))
         return heat, offset
 
 

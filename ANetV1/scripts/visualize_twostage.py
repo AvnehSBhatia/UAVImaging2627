@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.data.rasterize import CANVAS_H, CANVAS_W  # noqa: E402
 from anet.model.twostage import (  # noqa: E402
-    CROP_L, CROP_S, GRID_H, GRID_W, IMG_H, IMG_W, STRIDE, V21TwoStage,
+    GRID_H, GRID_W, IMG_H, IMG_W, STRIDE, V21TwoStage,
 )
 from anet.train.presets import anet_cfg  # noqa: E402
 from anet.train.trainer import pick_device  # noqa: E402
@@ -132,54 +132,36 @@ def dump_one(model, sample, img, out_dir: Path, peak_thresh=0.3):
     chw_to_rgb(out["edge"][0].cpu()).save(out_dir / "02_edge.png")
 
     sal_prob = torch.sigmoid(out["sal_logits"])          # (1,27,48)
-    peaks = model.find_peaks(sal_prob, peak_thresh)[0]
+    thresh = float(out["thresh"][0])
     sal_img = heat(sal_prob[0].cpu(), size=(CANVAS_W, CANVAS_H))
-    dr = ImageDraw.Draw(sal_img)
-    for r, c, v in peaks:
-        x, y = (c + 0.5) * STRIDE, (r + 0.5) * STRIDE
-        dr.ellipse([x - 12, y - 12, x + 12, y + 12],
-                   outline=(255, 255, 255), width=3)
+    ImageDraw.Draw(sal_img).text(
+        (4, 4), f"learned thresh={thresh:.3f}", fill=(255, 255, 255))
     sal_img.save(out_dir / "03_saliency.png")
 
+    chunks = model.image_chunks(sal_prob[0], out["thresh"][0])
     peaks_cls = []                                       # (cls1or2,cx,cy,p)
-    tiles = []
-    if peaks:
-        stacked = model.stack_maps(img, out)
-        cs = torch.stack([model.crop_at(stacked[0], (c + .5) * STRIDE,
-                                        (r + .5) * STRIDE, CROP_S)
-                          for r, c, _ in peaks])
-        cl = torch.stack([model.crop_at(stacked[0], (c + .5) * STRIDE,
-                                        (r + .5) * STRIDE, CROP_L)
-                          for r, c, _ in peaks])
-        ctx = torch.stack([torch.cat([torch.tensor([v], device=img.device),
-                                      out["means"][0]])
-                           for _, _, v in peaks])
-        cls_p = torch.softmax(model.crop_cnn(cs, cl, ctx), 1).cpu()
-        for k, ((r, c, sp), p) in enumerate(zip(peaks, cls_p)):
+    chunk_img = Image.new("RGB", (CANVAS_W, CANVAS_H), (10,) * 3)
+    dch = ImageDraw.Draw(chunk_img)
+    palette = [(240, 90, 90), (90, 140, 240), (110, 220, 110),
+               (230, 200, 80), (200, 110, 220), (90, 210, 210),
+               (240, 150, 60), (160, 160, 240)]
+    if chunks:
+        cls_p = torch.softmax(
+            model.chunk_logits(0, chunks, sal_prob, out), 1).cpu()
+        for k, (cells, p) in enumerate(zip(chunks, cls_p)):
+            col = palette[k % len(palette)]
+            for r, c in cells:
+                dch.rectangle([c * STRIDE, r * STRIDE,
+                               (c + 1) * STRIDE - 1, (r + 1) * STRIDE - 1],
+                              fill=col)
             pred = int(p.argmax())
-            tile = Image.new("RGB", (CROP_L + CROP_S + 4, CROP_L), (20,) * 3)
-            tile.paste(to_rgb_clip(cl[k, :3].cpu()), (0, 0))
-            tile.paste(to_rgb_clip(cs[k, :3].cpu()), (CROP_L + 4, 0))
-            dtile = ImageDraw.Draw(tile)
-            color = BOX_COLOR.get(pred, (200, 200, 200))
-            dtile.rectangle([0, 0, tile.width - 1, 13], fill=(0, 0, 0))
-            dtile.text((2, 1), f"{CLS[pred]} {float(p.max()):.2f} sal={sp:.2f}",
-                       fill=color)
-            dtile.rectangle([0, 0, tile.width - 1, tile.height - 1],
-                            outline=color, width=3)
-            tiles.append(tile)
+            r0, c0 = model.chunk_centroid(cells, sal_prob[0])
+            dch.text((c0 * STRIDE + 2, r0 * STRIDE + 2),
+                     f"{CLS[pred][0]}{float(p.max()):.2f}", fill=(0, 0, 0))
             if pred > 0:
-                peaks_cls.append((pred, (c + 0.5) / GRID_W,
-                                  (r + 0.5) / GRID_H, float(p.max())))
-    if tiles:
-        sheet = Image.new("RGB", (tiles[0].width,
-                                  len(tiles) * (CROP_L + 4)), (20,) * 3)
-        for i, t in enumerate(tiles):
-            sheet.paste(t, (0, i * (CROP_L + 4)))
-        sheet.save(out_dir / "04_crops.png")
-    else:
-        Image.new("RGB", (CROP_L, CROP_L), (40,) * 3).save(
-            out_dir / "04_crops.png")
+                peaks_cls.append((pred, (c0 + 0.5) / GRID_W,
+                                  (r0 + 0.5) / GRID_H, float(p.max())))
+    chunk_img.save(out_dir / "04_chunks.png")
 
     ov = overlay_detect(base, sample["boxes"].numpy(), peaks_cls)
     ov.save(out_dir / "05_overlay.png")
@@ -187,7 +169,8 @@ def dump_one(model, sample, img, out_dir: Path, peak_thresh=0.3):
     gt = [b for b in sample["boxes"].numpy() if b[0] >= 0]
     lines = [
         f"image {sample['stem']}",
-        f"sal max={float(sal_prob.max()):.3f} n_sal_peaks={len(peaks)}",
+        f"sal max={float(sal_prob.max()):.3f} thresh={thresh:.3f} "
+        f"n_chunks={len(chunks)}",
         f"n_fg_cls={len(peaks_cls)}",
     ]
     for c, name in ((1, "mannequin"), (2, "tent")):
