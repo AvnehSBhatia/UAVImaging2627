@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from anet.data.dataset import SUASCells  # noqa: E402
-from anet.model.twostage import IMG_H, IMG_W, V21TwoStage  # noqa: E402
+from anet.model.twostage import (EntropyProbe, IMG_H, IMG_W,  # noqa: E402
+                                 V21TwoStage)
 from anet.train.losses import center_focal_loss  # noqa: E402
 from anet.train.metrics import CenterObjectMetrics  # noqa: E402
 from anet.train.trainer import pick_device  # noqa: E402
@@ -37,6 +38,25 @@ from anet.train.trainer import pick_device  # noqa: E402
 ROOT = os.environ.get("DATA_ROOT", "../datasets/suas-synth-50k")
 OUT = Path("runs/twostage")
 MAX_SEL_FP = 25.0
+
+
+@torch.no_grad()
+def eval_entropy(probe, loader, device):
+    """Rank AUC of the entropy probe's slice logits vs object-in-slice
+    targets — the single number answering "is entropy useful". ~0.5 =
+    carries nothing; >>0.5 = worth wiring into a future model."""
+    probe.eval()
+    lg, tg = [], []
+    for batch in loader:
+        lg.append(probe(batch["image"].to(device)).cpu())
+        tg.append(probe.targets(batch["boxes"]))
+    lg, tg = torch.cat(lg).flatten(), torch.cat(tg).flatten()
+    pos, neg = lg[tg > 0.5], lg[tg <= 0.5]
+    if not len(pos) or not len(neg):
+        return float("nan")
+    gt = (pos.unsqueeze(1) > neg.unsqueeze(0)).float().mean()
+    eq = (pos.unsqueeze(1) == neg.unsqueeze(0)).float().mean()
+    return float(gt + 0.5 * eq)
 
 
 @torch.no_grad()
@@ -66,8 +86,11 @@ def main():
 
     device = pick_device()
     model = V21TwoStage().to(device)
+    probe = EntropyProbe().to(device)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"V21TwoStage (v21.2 ablation): {n_par} params, device={device}")
+    n_probe = sum(p.numel() for p in probe.parameters())
+    print(f"V21TwoStage (v21.3): {n_par} params + EntropyProbe {n_probe} "
+          f"(side-only), device={device}")
     assert n_par < 40_000
 
     if args.smoke:
@@ -84,7 +107,17 @@ def main():
         model.eval()
         heat, offset = model.detect(x)
         assert heat.shape == (2, 2, 27, 48) and offset.shape == (2, 2, 27, 48)
-        print("PASS — fwd/bwd all-live grads, detect contract")
+        # probe: correct shapes, own grads live, main model UNTOUCHED
+        model.zero_grad(set_to_none=True)
+        lg = probe(x.detach())
+        assert lg.shape == (2, probe.n_slices)
+        F.binary_cross_entropy_with_logits(
+            lg, torch.zeros_like(lg)).backward()
+        assert not [k for k, p in probe.named_parameters() if p.grad is None]
+        assert all(p.grad is None for p in model.parameters()), \
+            "entropy probe leaked gradient into the main model"
+        print("PASS — fwd/bwd all-live grads, detect contract, "
+              "probe isolated")
         return
 
     if args.eval:
@@ -119,7 +152,10 @@ def main():
     val_loader = DataLoader(va_ds, batch_size=8, num_workers=workers,
                             persistent_workers=workers > 0)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(
+        list(model.parameters()) + list(probe.parameters()),
+        lr=lr, weight_decay=1e-4)
+    ent_pos_w = torch.tensor(4.0, device=device)  # ~2-3 object slices of 19
     steps = max(len(train_loader) * epochs, 1)
     warm = min(300, steps // 10)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -134,9 +170,10 @@ def main():
     best = -1.0
     for ep in range(epochs):
         model.train()
+        probe.train()
         t0, nb = time.time(), 0
         tot = torch.zeros((), device=device)
-        parts = torch.zeros(2, device=device)
+        parts = torch.zeros(3, device=device)
         for batch_d in train_loader:
             img = batch_d["image"].to(device)
             heat_t = batch_d["heat"].to(device)          # (B,2,27,48)
@@ -149,35 +186,49 @@ def main():
                   < 0.05).float()
             tv = (s4 - F.avg_pool2d(s4, 3, 1, 1)).abs()
             l_smooth = (tv * bg).sum() / bg.sum().clamp_min(1.0) / 3.0
-            loss = l_center + smooth_w * l_smooth
+            # side probe: DETACHED input — its gradient can only reach
+            # its own 60 params, never the main model
+            l_ent = F.binary_cross_entropy_with_logits(
+                probe(img.detach()),
+                probe.targets(batch_d["boxes"]).to(device),
+                pos_weight=ent_pos_w)
+            loss = l_center + smooth_w * l_smooth + l_ent
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             sched.step()
             nb += 1
             tot += loss.detach()
-            parts += torch.stack([l_center.detach(), l_smooth.detach()])
+            parts += torch.stack([l_center.detach(), l_smooth.detach(),
+                                  l_ent.detach()])
             if nb % log_every == 0:
                 r = nb * batch / (time.time() - t0)
-                pc, ps = (parts / nb).tolist()
+                pc, ps, pe = (parts / nb).tolist()
                 print(f"  ep {ep} step {nb}/{n_steps}: "
                       f"loss={float(tot) / nb:.4f} (center {pc:.3f} "
-                      f"smooth {ps:.3f}, {r:.0f} img/s)", flush=True)
+                      f"smooth {ps:.3f} ent {pe:.3f}, {r:.0f} img/s)",
+                      flush=True)
         tot = float(tot)
         s = evaluate(model, val_loader, device, args.peak_thresh)
+        auc = eval_entropy(probe, val_loader, device)
         flag = ""
         if s["sel"] > best:
             best = s["sel"]
-            torch.save({"model": model.state_dict(), "arch": "v21.2",
-                        "epoch": ep, "val": s}, OUT / "best.pt")
+            torch.save({"model": model.state_dict(),
+                        "probe": probe.state_dict(), "arch": "v21.3",
+                        "epoch": ep, "val": s, "ent_auc": auc},
+                       OUT / "best.pt")
             flag = "  *best*"
-        torch.save({"model": model.state_dict(), "arch": "v21.2",
-                    "epoch": ep, "val": s}, OUT / "last.pt")
+        torch.save({"model": model.state_dict(),
+                    "probe": probe.state_dict(), "arch": "v21.3",
+                    "epoch": ep, "val": s, "ent_auc": auc},
+                   OUT / "last.pt")
         print(f"epoch {ep:3d}: loss={tot / max(nb, 1):.4f} "
               f"mann_r={s.get('mannequin_recall', 0):.3f} "
               f"tent_r={s.get('tent_recall', 0):.3f} "
               f"fp={s.get('fp_per_image', 0):.3f} sel={s['sel']:.3f} "
-              f"({time.time() - t0:.0f}s){flag}", flush=True)
+              f"ent_auc={auc:.3f} ({time.time() - t0:.0f}s){flag}",
+              flush=True)
     print(f"done — best sel {best:.3f} -> {OUT / 'best.pt'}")
 
 
