@@ -66,7 +66,13 @@ def _gather_crops(model, stacked, prob, means, batch, peaks, device):
 
     for b in range(stacked.shape[0]):
         boxes = [x for x in boxes_all[b] if x[0] >= 0]
-        for cls, cx, cy, w, h in boxes:
+        # cap GT crops per image: VisDrone frames carry up to hundreds
+        # of person boxes — uncapped, a couple of vd_* frames per batch
+        # meant hundreds of dual-scale crops per step (measured: 3
+        # img/s at batch 32; the crop stage, not the trunk)
+        gt = boxes if len(boxes) <= 8 else \
+            [boxes[i] for i in rng.choice(len(boxes), 8, replace=False)]
+        for cls, cx, cy, w, h in gt:
             _add(b, cx * IMG_W, cy * IMG_H, int(cls) + 1)
         for _ in range(2):
             for _try in range(10):
@@ -80,7 +86,7 @@ def _gather_crops(model, stacked, prob, means, batch, peaks, device):
                     break
         hard = 0
         for r, c, _ in peaks[b]:
-            if hard >= 4:
+            if hard >= 2:
                 break
             cx, cy = (c + 0.5) / 48, (r + 0.5) / 27
             hit = any(abs(cx - x[1]) <= x[3] / 2 and abs(cy - x[2]) <= x[4] / 2
@@ -90,6 +96,13 @@ def _gather_crops(model, stacked, prob, means, batch, peaks, device):
                 hard += 1
     if not cs:
         return None, None, None, None
+    # hard step-level ceiling so worst-case batches stay bounded
+    if len(cs) > 160:
+        keep = rng.choice(len(cs), 160, replace=False)
+        cs = [cs[i] for i in keep]
+        cl = [cl[i] for i in keep]
+        cells = [cells[i] for i in keep]
+        labels = [labels[i] for i in keep]
     bi, ri, ci = (torch.tensor(x, device=device) for x in zip(*cells))
     ctx = torch.cat([prob[bi, ri, ci].unsqueeze(1), means[bi]], 1)
     return (torch.stack(cs), torch.stack(cl), ctx.detach(),
