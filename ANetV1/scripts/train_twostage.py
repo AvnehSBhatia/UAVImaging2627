@@ -51,7 +51,10 @@ def _gather_crops(model, stacked, prob, means, batch, peaks, device):
     random bg (label 0), unmatched predicted peaks (label 0). Each crop
     is the 9-channel stack; its context = [saliency prob at the crop's
     cell, frame mean RGB] (v21.1: the classifier sees all of stage 1)."""
-    crops, ctxs, labels = [], [], []
+    # bookkeeping stays in python scalars; every tensor op happens ONCE
+    # at the end (the per-crop torch.cat version launched ~40 tiny
+    # kernels per step — measured in the v21 profile)
+    crops, cells, labels = [], [], []
     boxes_all = batch["boxes"].numpy()
     rng = np.random.default_rng(int(batch["seed"]))
 
@@ -59,7 +62,7 @@ def _gather_crops(model, stacked, prob, means, batch, peaks, device):
         r = min(max(int(cy_px / STRIDE), 0), prob.shape[1] - 1)
         c = min(max(int(cx_px / STRIDE), 0), prob.shape[2] - 1)
         crops.append(model.crop_at(stacked[b], cx_px, cy_px))
-        ctxs.append(torch.cat([prob[b, r, c].reshape(1), means[b]]))
+        cells.append((b, r, c))
         labels.append(label)
 
     for b in range(stacked.shape[0]):
@@ -88,7 +91,10 @@ def _gather_crops(model, stacked, prob, means, batch, peaks, device):
                 hard += 1
     if not crops:
         return None, None, None
-    return (torch.stack(crops), torch.stack(ctxs).detach(),
+    bi, ri, ci = (torch.tensor(x, device=device)
+                  for x in zip(*cells))
+    ctx = torch.cat([prob[bi, ri, ci].unsqueeze(1), means[bi]], 1)
+    return (torch.stack(crops), ctx.detach(),
             torch.tensor(labels, device=device))
 
 
@@ -168,7 +174,9 @@ def main():
     limit = int(os.environ.get("ANET_SAMPLES", "0"))
     smooth_w = float(os.environ.get("ANET_SMOOTH_W", "0.1"))
     pos_w = float(os.environ.get("ANET_POS_W", "3.0"))
-    workers = 0 if torch.version.hip else 2
+    # 4 persistent workers: single-process decode is 31.5 ms/img
+    # (profiled) — 2 workers cap at ~63 img/s, too close to the target
+    workers = 0 if torch.version.hip else 4
     cache = os.environ.get("ANET_CACHE") == "1"
 
     tr = SUASCells(ROOT, "train", center=True, cache=cache)
@@ -178,8 +186,10 @@ def main():
     tr_ds = Subset(tr, list(tr_idx)) if limit else tr
     va_ds = Subset(va, range(min(800, len(va))))
     train_loader = DataLoader(tr_ds, batch_size=batch, shuffle=True,
-                              num_workers=workers, drop_last=True)
-    val_loader = DataLoader(va_ds, batch_size=4, num_workers=workers)
+                              num_workers=workers, drop_last=True,
+                              persistent_workers=workers > 0)
+    val_loader = DataLoader(va_ds, batch_size=8, num_workers=workers,
+                            persistent_workers=workers > 0)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     steps = max(len(train_loader) * epochs, 1)
@@ -198,7 +208,12 @@ def main():
     gstep = 0
     for ep in range(epochs):
         model.train()
-        t0, tot, nb = time.time(), 0.0, 0
+        # loss accumulates ON-DEVICE; float() conversion (a full MPS
+        # pipeline stall, ~70 ms/step in the v21 profile) happens only
+        # at the log lines
+        t0, nb = time.time(), 0
+        tot = torch.zeros((), device=device)
+        parts = torch.zeros(3, device=device)
         for batch_d in train_loader:
             img = batch_d["image"].to(device)
             heat_t = batch_d["heat"].to(device)          # (B,2,27,48)
@@ -234,14 +249,18 @@ def main():
             opt.step()
             sched.step()
             gstep += 1
-            tot, nb = tot + float(loss.detach()), nb + 1
+            nb += 1
+            tot += loss.detach()
+            parts += torch.stack([l_center.detach(), l_smooth.detach(),
+                                  l_crop.detach()])
             if nb % log_every == 0:
                 r = nb * batch / (time.time() - t0)
-                print(f"  ep {ep} step {nb}/{n_steps}: loss={tot / nb:.4f} "
-                      f"(center {float(l_center.detach()):.3f} smooth "
-                      f"{float(l_smooth.detach()):.3f} crop "
-                      f"{float(l_crop.detach()):.3f}, {r:.0f} img/s)",
+                pc, ps, pk = (parts / nb).tolist()
+                print(f"  ep {ep} step {nb}/{n_steps}: "
+                      f"loss={float(tot) / nb:.4f} (center {pc:.3f} "
+                      f"smooth {ps:.3f} crop {pk:.3f}, {r:.0f} img/s)",
                       flush=True)
+        tot = float(tot)
         s = evaluate(model, val_loader, device, args.peak_thresh)
         flag = ""
         if s["sel"] > best:
