@@ -147,9 +147,13 @@ class V21TwoStage(nn.Module):
 
     MAX_CHUNKS = 24  # per image, strongest-first
     N_FEAT = 14      # per-chunk feature vector width
-    THRESH = 0.8     # fixed chunk threshold (owner call: the learned
-    #                  MLP kept the cold mask saturated — at 0.8 only
-    #                  genuinely hot cells chunk, from step 0)
+    THRESH = 0.35    # fixed chunk threshold (owner call). Measured on
+    #                  the epoch-0 checkpoint: max saliency anywhere on
+    #                  100 val frames was 0.446, GT centers median
+    #                  0.182 — 0.8 passed literally nothing and starved
+    #                  the CLS head; 0.35 sits just above the q90
+    #                  frame-max so chunks exist from early epochs and
+    #                  tighten as pos_weight lifts true peaks.
 
     def __init__(self, max_peaks=12, n_lines=20):
         super().__init__()
