@@ -1,29 +1,26 @@
-"""v21.2 (D71 ablation, owner-directed): the minimal quat-Sobel detector.
+"""v21.4 (D71 line, owner-directed): raw-front two-stage, dual-scale crops.
 
-The v21/v21.1 front end (line-sampled means -> A^chan 11x11 kernels ->
-blend MLP) and the ENTIRE crop stage are removed (owner: ablate 00-03,
-"pass the raw image into 04"; cropping "ruins everything — remove").
-What remains is the smallest detector in the family, ~170 params:
+History of this file, one experiment per rev (ARCHITECTURE.md 16.9):
+v21/v21.1 = A^chan 11x11 filter bank -> quats -> saliency -> 100x100
+crops (9ch + ctx). v21.2 = ablate everything but the quats+Sobel.
+v21.3 = hyper-dual quats + the EntropyProbe. v21.4 = the owner's
+synthesis of what the measurements said:
 
-  raw image -> quaternion #1 (D5, dedicated background-smoothness loss)
-            -> quaternion #2 + Sobel-init 7x7 depthwise (the D5/D33
-               EdgeDQStem pattern: the quat picks WHICH colour axis the
-               edge operator sees)
-            -> per-channel |edge| energy, max-pooled 20x20 to the family
-               27x48 grid
-            -> 1x1 conv (3 -> 2): the minimal class readout. With crops
-               gone the classes must come from SOMEWHERE — this is 8
-               params of per-class mixing over three oriented edge-energy
-               channels, not a conv trunk.
+  - the 11x11 bank is REMOVED for good: the eval-time bypass on the
+    trained v21.1 measured it as an ATTENUATOR (blur-init kernels ahead
+    of the Sobel; bypassing them took mann 0.072 -> 0.185)
+  - the crop stage is BACK: the same bypass showed the classifier
+    turning sharper saliency into 2.6x recall, and v21.3's cropless
+    energy readout was structurally tent-blind
+  - crops are now DUAL-SCALE (50 tight + 100 wide, shared trunk): the
+    tent fix — a tent's edges ring its perimeter (wide view), a
+    mannequin fills the tight view
+  - quats stay hyper-dual (strict superset of D5, folds to 1x1 conv)
+  - EntropyProbe continues on the side (isolated; ent_auc is its
+    entire output)
 
-Trains with the standard 2-class center focal (D57) directly on the heat
-logits — no more class-agnostic proxy — plus the smoothing quat's
-dedicated term. detect() emits the family (heat, offset) contract, so
-CenterObjectMetrics and the v13..v20 ladder stay apples-to-apples.
-
-What this ablation measures: whether v21.1's epoch-0 signal (sel 0.098)
-came from the conditioned filter bank + crop classifier at all, or
-whether two colour quaternions and a Sobel were carrying everything.
+Deploy notes unchanged: crop gather is a CPU stage; everything else
+folds. Research track.
 """
 
 import torch
@@ -35,6 +32,8 @@ from .blocks import quat_mul, sobel7
 GRID_H, GRID_W = 27, 48
 STRIDE = 20
 IMG_H, IMG_W = 540, 960
+CROP_S, CROP_L = 50, 100  # v21.4 dual-scale crops (owner: "50x50 and
+#                           then a 100x100" — the tent fix)
 _LUMA = (0.299, 0.587, 0.114)
 
 
@@ -92,32 +91,94 @@ class HyperDualQuaternionRGB(nn.Module):
         return F.conv2d(img, m.reshape(3, 3, 1, 1), t)
 
 
-class V21TwoStage(nn.Module):
-    """Name kept from v21/v21.1 so the trainer/viz plumbing is stable;
-    since v21.2 there is no second stage — checkpoints tag arch v21.2."""
+class CropCNN(nn.Module):
+    """v21.4 dual-scale crop classifier: ONE shared conv trunk (GAP
+    makes it size-agnostic) applied to the 50x50 tight view AND the
+    100x100 wide view of each peak, embeddings concatenated with the
+    4-scalar context into the class head.
 
-    def __init__(self, max_peaks=12):
+    Why two scales fixes tents (measured, v21.3 viz): a ~100 px tent's
+    CENTER cell is smooth fabric — its edge evidence rings the
+    perimeter, which only the wide view contains; a ~25 px mannequin
+    drowns in a 100x100 crop but fills the tight view. GroupNorm: crop
+    batches are small and variable."""
+
+    def __init__(self, in_ch=9, n_ctx=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 8, 3, 2, 1), nn.GroupNorm(4, 8), nn.SiLU(),
+            nn.Conv2d(8, 16, 3, 2, 1), nn.GroupNorm(4, 16), nn.SiLU(),
+            nn.Conv2d(16, 24, 3, 2, 1), nn.GroupNorm(4, 24), nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+        )
+        self.fc = nn.Linear(24 * 2 + n_ctx, 3)
+
+    def forward(self, crop_s, crop_l, ctx):
+        return self.fc(torch.cat([self.net(crop_s), self.net(crop_l),
+                                  ctx], 1))
+
+
+class V21TwoStage(nn.Module):
+    """v21.4: the prev-best two-stage (v21.1) with the 11x11 filter
+    bank REMOVED (owner: "we borked the model... remove the 11x11 conv"
+    — and the eval-time bypass measured why: the blur-init bank
+    attenuated small-object edges before the Sobel; bypassing it took
+    the trained v21.1 from mann 0.072 to 0.185). Raw image feeds the
+    smoothing quat directly; quats stay hyper-dual (v21.3, strict
+    superset of D5). Stage 2 is the crop pipeline back from v21.1, now
+    dual-scale (50 + 100) per the owner's tent fix. line_means survives
+    only as the crop context's scene statistic."""
+
+    def __init__(self, max_peaks=12, n_lines=20):
         super().__init__()
         self.max_peaks = max_peaks
-        self.quat_smooth = HyperDualQuaternionRGB()   # v21.3 swap
+        self.n_lines = n_lines
+        self.quat_smooth = HyperDualQuaternionRGB()
         self.quat_edge = HyperDualQuaternionRGB()
         e = torch.stack([sobel7("v"), sobel7("h"), sobel7("d1")])
         self.edge = nn.Parameter(e.reshape(3, 1, 7, 7).clone())
-        # minimal class readout on pooled per-channel edge energy; init
-        # mirrors the old saliency calibration (a=4 spread over 3 ch,
-        # b=-2) so cold-start probs sit in the same range v21.1 trained
-        # through
-        self.head = nn.Conv2d(3, 2, 1)
-        nn.init.constant_(self.head.weight, 4.0 / 3.0)
-        nn.init.constant_(self.head.bias, -2.0)
+        self.sal_a = nn.Parameter(torch.tensor(4.0))
+        self.sal_b = nn.Parameter(torch.tensor(-2.0))
+        self.crop_cnn = CropCNN()
+
+    def line_means(self, img):
+        """20 random rows + 20 random cols -> per-channel mean (B,3);
+        strided (deterministic) at eval. Crop-context only in v21.4."""
+        B, _, H, W = img.shape
+        if self.training:
+            rows = torch.randint(0, H, (self.n_lines,), device=img.device)
+            cols = torch.randint(0, W, (self.n_lines,), device=img.device)
+        else:
+            rows = torch.linspace(0, H - 1, self.n_lines,
+                                  device=img.device).long()
+            cols = torch.linspace(0, W - 1, self.n_lines,
+                                  device=img.device).long()
+        r = img[:, :, rows, :].mean((2, 3))
+        c = img[:, :, :, cols].mean((2, 3))
+        return (r + c) / 2.0
 
     def forward(self, img):  # (B,3,540,960) in [0,1]
         smooth = self.quat_smooth(img)
         edge = F.conv2d(self.quat_edge(smooth), self.edge,
                         padding=3, groups=3)
-        energy = F.max_pool2d(edge.abs(), STRIDE)     # (B,3,27,48)
-        return {"heat_logits": self.head(energy), "smooth": smooth,
-                "edge": edge, "energy": energy}
+        sal = edge.norm(dim=1, keepdim=True)
+        pooled = F.max_pool2d(sal, STRIDE).squeeze(1)   # (B,27,48)
+        return {"sal_logits": self.sal_a * pooled + self.sal_b,
+                "smooth": smooth, "edge": edge,
+                "means": self.line_means(img)}
+
+    @staticmethod
+    def stack_maps(img, out):
+        """The 9-channel crop source: raw RGB + smooth + edge."""
+        return torch.cat([img, out["smooth"], out["edge"]], 1)
+
+    @staticmethod
+    def crop_at(maps, cx_px, cy_px, size):
+        """size x size crop around a full-res center, clamped inside
+        the frame."""
+        ox = int(min(max(round(cx_px - size / 2), 0), IMG_W - size))
+        oy = int(min(max(round(cy_px - size / 2), 0), IMG_H - size))
+        return maps[:, oy:oy + size, ox:ox + size]
 
     @torch.no_grad()
     def find_peaks(self, prob, thresh=0.3):
@@ -139,12 +200,32 @@ class V21TwoStage(nn.Module):
 
     @torch.no_grad()
     def detect(self, img, peak_thresh=0.3):
-        """Family contract: per-class sigmoid heat + offset (constant
-        cell-center 0.5 — v21.2 has no offset head). CenterObjectMetrics
-        does its own peak finding on these maps, same as v13..v20."""
+        """Full inference: saliency peaks -> dual-scale crops ->
+        CropCNN. Emits the family (heat, offset) tensors — each
+        detection writes its class prob at its peak cell — so
+        CenterObjectMetrics and the ladder stay apples-to-apples."""
         out = self.forward(img)
-        heat = torch.sigmoid(out["heat_logits"]).cpu()
-        offset = torch.full_like(heat, 0.5)
+        prob = torch.sigmoid(out["sal_logits"])
+        peaks = self.find_peaks(prob, peak_thresh)
+        stacked = self.stack_maps(img, out)
+        B = img.shape[0]
+        heat = torch.zeros(B, 2, GRID_H, GRID_W)
+        offset = torch.full((B, 2, GRID_H, GRID_W), 0.5)
+        for b in range(B):
+            if not peaks[b]:
+                continue
+            cs, cl, ctx = [], [], []
+            for r, c, v in peaks[b]:
+                cx, cy = (c + 0.5) * STRIDE, (r + 0.5) * STRIDE
+                cs.append(self.crop_at(stacked[b], cx, cy, CROP_S))
+                cl.append(self.crop_at(stacked[b], cx, cy, CROP_L))
+                ctx.append(torch.cat([
+                    torch.tensor([v], device=img.device), out["means"][b]]))
+            cls_p = torch.softmax(self.crop_cnn(
+                torch.stack(cs), torch.stack(cl), torch.stack(ctx)), 1)
+            for (r, c, _), p in zip(peaks[b], cls_p):
+                if int(p.argmax()) > 0:
+                    heat[b, int(p.argmax()) - 1, r, c] = float(p.max())
         return heat, offset
 
 
