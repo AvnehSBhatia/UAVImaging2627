@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from anet.data.dataset import SUASCells  # noqa: E402
 from anet.data.rasterize import CANVAS_H, CANVAS_W  # noqa: E402
 from anet.model.twostage import (  # noqa: E402
-    CROP, GRID_H, GRID_W, IMG_H, IMG_W, STRIDE, V21TwoStage,
+    GRID_H, GRID_W, IMG_H, IMG_W, STRIDE, V21TwoStage,
 )
 from anet.train.presets import anet_cfg  # noqa: E402
 from anet.train.trainer import pick_device  # noqa: E402
@@ -119,97 +119,38 @@ def overlay_detect(base_rgb, gt_boxes, peaks_cls):
 
 @torch.no_grad()
 def dump_one(model, sample, img, out_dir: Path, peak_thresh=0.3):
-    """Full pipeline dump for one image. Returns overlay PIL."""
+    """v21.2 pipeline dump for one image. Returns overlay PIL.
+    Panels: 00 input, 01 smooth quat, 02 edge stack, 03 per-channel
+    pooled energy, 04 per-class heat, 05 overlay. (The kernel/filter-
+    bank/composite/crop panels died with the v21.2 ablation.)"""
     out_dir.mkdir(parents=True, exist_ok=True)
     base = to_rgb_clip(sample["image"])
     base.save(out_dir / "00_input.png")
 
-    # --- stage 1 intermediates (mirror V21TwoStage.forward) ---
-    means = model.line_means(img)
-    kern = model.kernels(means)                 # (1,3,k,k)
-    bank = model.filter_bank(img, kern)         # (1,3,3,H,W)
-    w = model.mix(means)                        # (1,3)
-    composite = (bank * w.reshape(-1, 3, 1, 1, 1)).sum(1)
-    smooth = model.quat_smooth(composite)
-    edge = F.conv2d(model.quat_edge(smooth), model.edge, padding=3, groups=3)
-    sal = edge.norm(dim=1, keepdim=True)
-    pooled = F.max_pool2d(sal, STRIDE).squeeze(1)
-    sal_logits = model.sal_a * pooled + model.sal_b
-    sal_prob = torch.sigmoid(sal_logits)
+    out = model(img)
+    to_rgb_clip(out["smooth"][0].cpu()).save(out_dir / "01_smooth.png")
+    chw_to_rgb(out["edge"][0].cpu()).save(out_dir / "02_edge.png")
+    montage_row([heat(out["energy"][0, i].cpu(),
+                      size=(CANVAS_W // 2, CANVAS_H // 2))
+                 for i in range(3)]).save(out_dir / "03_energy.png")
 
-    # kernels
-    k_imgs = [ker_img(kern[0, i]) for i in range(3)]
-    montage_row(k_imgs).save(out_dir / "01_kernels.png")
-    # filter bank (3 filtered full-res images)
-    filt = [to_rgb_clip(bank[0, i]).resize((CANVAS_W // 2, CANVAS_H // 2))
-            for i in range(3)]
-    montage_row(filt).save(out_dir / "02_filter_bank.png")
-    to_rgb_clip(composite[0]).save(out_dir / "03_composite.png")
-    to_rgb_clip(smooth[0]).save(out_dir / "04_smooth.png")
-    chw_to_rgb(edge[0]).save(out_dir / "05_edge.png")
-    heat(sal[0, 0], size=(CANVAS_W, CANVAS_H)).save(out_dir / "06_saliency_mag.png")
-    heat(sal_prob[0], size=(CANVAS_W, CANVAS_H)).save(out_dir / "06_saliency_prob.png")
-
-    # --- stage 2: peaks -> crops -> classify ---
-    peaks = model.find_peaks(sal_prob, peak_thresh)[0]
-    peaks_cls = []  # (cls1or2, cx, cy, p)
-    crop_tiles = []
-    if peaks:
-        stacked = model.stack_maps(img, {"smooth": smooth, "edge": edge})
-        crops = torch.stack([
-            model.crop_at(stacked[0], (c + 0.5) * STRIDE, (r + 0.5) * STRIDE)
-            for r, c, _ in peaks
-        ])
-        ctx = torch.stack([
-            torch.cat([torch.tensor([v], device=img.device), means[0]])
-            for _, _, v in peaks
-        ])
-        cls_p = torch.softmax(
-            model.crop_cnn(crops.to(img.device), ctx), 1).cpu()
-        for (r, c, sp), p in zip(peaks, cls_p):
-            pred = int(p.argmax())
-            # tile shows the RGB slice of the 9-channel crop
-            tile = to_rgb_clip(crops[len(crop_tiles), :3].cpu())
-            dr = ImageDraw.Draw(tile)
-            label = f"{CLS[pred]} {float(p.max()):.2f}  sal={sp:.2f}"
-            color = BOX_COLOR.get(pred, (200, 200, 200))
-            dr.rectangle([0, 0, CROP - 1, 14], fill=(0, 0, 0))
-            dr.text((2, 1), label, fill=color)
-            # draw crop border color by class
-            dr.rectangle([0, 0, CROP - 1, CROP - 1], outline=color, width=3)
-            crop_tiles.append(tile)
-            if pred > 0:
-                peaks_cls.append((pred, (c + 0.5) / GRID_W, (r + 0.5) / GRID_H,
-                                  float(p.max())))
-    if crop_tiles:
-        # tile up to 4 columns
-        cols = min(4, len(crop_tiles))
-        rows = (len(crop_tiles) + cols - 1) // cols
-        sheet = Image.new("RGB", (cols * CROP, rows * CROP), (20, 20, 20))
-        for i, t in enumerate(crop_tiles):
-            sheet.paste(t, ((i % cols) * CROP, (i // cols) * CROP))
-        sheet.save(out_dir / "07_crops.png")
-    else:
-        Image.new("RGB", (CROP, CROP), (40, 40, 40)).save(out_dir / "07_crops.png")
-
-    # also family detect() heat for comparison
-    heat_t, off_t = model.detect(img, peak_thresh)
-    heat_p = heat_t[0].numpy()
-    for c, name in ((0, "mannequin"), (1, "tent")):
-        heat(heat_p[c], size=(CANVAS_W, CANVAS_H)).save(
-            out_dir / f"08_detect_heat_{name}.png")
-
+    prob = torch.sigmoid(out["heat_logits"]).cpu()      # (1,2,27,48)
+    peaks_cls = []                                      # (cls1or2,cx,cy,p)
+    for ci, name in ((0, "mannequin"), (1, "tent")):
+        heat(prob[0, ci], size=(CANVAS_W, CANVAS_H)).save(
+            out_dir / f"04_heat_{name}.png")
+        for r, c, p in model.find_peaks(prob[:, ci], peak_thresh)[0]:
+            peaks_cls.append((ci + 1, (c + 0.5) / GRID_W,
+                              (r + 0.5) / GRID_H, p))
     ov = overlay_detect(base, sample["boxes"].numpy(), peaks_cls)
-    ov.save(out_dir / "08_overlay.png")
+    ov.save(out_dir / "05_overlay.png")
 
-    # stats
     gt = [b for b in sample["boxes"].numpy() if b[0] >= 0]
     lines = [
         f"image {sample['stem']}",
-        f"line_means RGB={means[0].tolist()}",
-        f"mix_weights={w[0].tolist()}",
-        f"sal_prob max={float(sal_prob.max()):.3f}  n_peaks={len(peaks)}  "
-        f"n_fg_cls={len(peaks_cls)}",
+        f"heat max: mann={float(prob[0, 0].max()):.3f} "
+        f"tent={float(prob[0, 1].max()):.3f}",
+        f"n_peaks={len(peaks_cls)}",
     ]
     for c, name in ((1, "mannequin"), (2, "tent")):
         boxes_c = [b for b in gt if int(b[0]) + 1 == c]
@@ -223,6 +164,7 @@ def dump_one(model, sample, img, out_dir: Path, peak_thresh=0.3):
             f"max_p={max((p[3] for p in pk_c), default=0.0):.3f}")
     (out_dir / "stats.txt").write_text("\n".join(lines) + "\n")
     return ov, lines
+
 
 
 def main():
