@@ -164,17 +164,21 @@ class CenterObjectMetrics:
         return np.where(mask)
 
     def update(self, heat_prob, offset_prob, boxes, is_vd):
-        """heat_prob/offset_prob (2,27,48) sigmoid probs; boxes (N,5)
-        canvas-normalized [cls,cx,cy,w,h], -1 padded."""
+        """heat_prob/offset_prob (2,H,W) sigmoid probs; boxes (N,5)
+        canvas-normalized [cls,cx,cy,w,h], -1 padded. Grid dims are derived
+        from the tensors (27x48 for the v12-v21 stride-20 family; 54x96 for a
+        stride-10 readout) — peak matching is point-in-box containment on the
+        canvas, so recall/fp stay apples-to-apples across grid resolutions."""
         heat_prob = self._to_numpy(heat_prob)
         offset_prob = self._to_numpy(offset_prob)
+        grid_h, grid_w = heat_prob.shape[-2:]
         self.images += 1
         for c in range(2):  # 0=mannequin, 1=tent
             rows, cols = self._find_peaks(heat_prob[c], self.peak_thresh)
             dx = offset_prob[0, rows, cols]
             dy = offset_prob[1, rows, cols]
-            cx = (cols + dx) / V12_W
-            cy = (rows + dy) / V12_H
+            cx = (cols + dx) / grid_w
+            cy = (rows + dy) / grid_h
             matched = np.zeros(len(rows), dtype=bool)
             for box in boxes:
                 if box[0] < 0 or int(box[0]) != c:

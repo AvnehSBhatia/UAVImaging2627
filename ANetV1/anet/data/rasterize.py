@@ -133,31 +133,39 @@ def boxes_to_soft_grid(boxes_conf, coverage_thresh=0.0):
     return p
 
 
-def boxes_to_heatmap(boxes, sigma=1.5):
-    """v12 object-center targets on the 27x48 stride-20 grid (CenterNet-style).
+def boxes_to_heatmap(boxes, sigma=1.5, grid_hw=(V12_H, V12_W), classes=(0, 1)):
+    """Object-center targets on a stride grid (CenterNet-style). Default grid
+    is the v12 27x48 stride-20 grid; grid_hw generalizes it (v22 reads the
+    mannequin at stride 10 -> (54, 96)) — same splat/offset conventions at any
+    resolution, sigma stays in CELLS of the given grid.
 
     Same class convention as boxes_to_grid: box[0]==0 -> mannequin (heat
     channel 0), box[0]==1 -> tent (heat channel 1) — i.e. channel == class,
-    where boxes_to_grid's hard label would be class+1.
+    where boxes_to_grid's hard label would be class+1. `classes` selects which
+    box classes are rasterized (per-class grids build one single-channel
+    target per call, e.g. classes=(0,) for a mannequin-only fine grid);
+    channel order follows the `classes` tuple.
 
     Returns
     -------
-    heat     : (2, V12_H, V12_W) float32 — per-class Gaussian center splat,
+    heat     : (len(classes), H, W) float32 — per-class Gaussian center splat,
                MAX-merged across every object of that class. Peak 1.0 at each
                object's own center cell; neighbors filled by
                exp(-((dr**2+dc**2)/(2*sigma**2))).
-    offset   : (2, V12_H, V12_W) float32 — [dx,dy] sub-cell offset written at
+    offset   : (2, H, W) float32 — [dx,dy] sub-cell offset written at
                each object's center cell only, class-agnostic (channel
                0=dx, 1=dy). Zero everywhere else.
-    reg_mask : (1, V12_H, V12_W) float32 — 1.0 at object-center cells, else 0.
+    reg_mask : (1, H, W) float32 — 1.0 at object-center cells, else 0.
 
-    Coordinate convention: fx=cx*V12_W, fy=cy*V12_H; col=floor(fx),
-    row=floor(fy) (clamped into the grid); dx=fx-col, dy=fy-row in [0,1).
-    Recover: cx=(col+dx)/V12_W, cy=(row+dy)/V12_H.
+    Coordinate convention: fx=cx*W, fy=cy*H; col=floor(fx), row=floor(fy)
+    (clamped into the grid); dx=fx-col, dy=fy-row in [0,1).
+    Recover: cx=(col+dx)/W, cy=(row+dy)/H.
     """
-    heat = np.zeros((N_CLASSES, V12_H, V12_W), np.float32)
-    offset = np.zeros((2, V12_H, V12_W), np.float32)
-    reg_mask = np.zeros((1, V12_H, V12_W), np.float32)
+    grid_h, grid_w = grid_hw
+    chan = {k: i for i, k in enumerate(classes)}
+    heat = np.zeros((len(classes), grid_h, grid_w), np.float32)
+    offset = np.zeros((2, grid_h, grid_w), np.float32)
+    reg_mask = np.zeros((1, grid_h, grid_w), np.float32)
     # splat window scaled to sigma (radius ~3*sigma captures the Gaussian down to
     # ~1% before it's clipped); radius 2 clipped the sigma>=1 splat into a hard
     # square, defeating the point of widening it.
@@ -165,19 +173,20 @@ def boxes_to_heatmap(boxes, sigma=1.5):
     for box in boxes:
         k = int(box[0])
         _, cx, cy, w, h = box
-        if k not in (0, 1) or w <= 0 or h <= 0:
-            continue  # skip -1-padded rows and degenerate boxes
-        fx, fy = cx * V12_W, cy * V12_H
-        col = min(max(int(np.floor(fx)), 0), V12_W - 1)
-        row = min(max(int(np.floor(fy)), 0), V12_H - 1)
+        if k not in chan or w <= 0 or h <= 0:
+            continue  # skip -1-padded rows, degenerate boxes, unselected classes
+        fx, fy = cx * grid_w, cy * grid_h
+        col = min(max(int(np.floor(fx)), 0), grid_w - 1)
+        row = min(max(int(np.floor(fy)), 0), grid_h - 1)
         dx = min(max(fx - col, 0.0), 1.0 - 1e-6)
         dy = min(max(fy - row, 0.0), 1.0 - 1e-6)
 
-        r0, r1 = max(row - radius, 0), min(row + radius + 1, V12_H)
-        c0, c1 = max(col - radius, 0), min(col + radius + 1, V12_W)
+        r0, r1 = max(row - radius, 0), min(row + radius + 1, grid_h)
+        c0, c1 = max(col - radius, 0), min(col + radius + 1, grid_w)
         rr, cc = np.mgrid[r0:r1, c0:c1]
         g = np.exp(-((rr - row) ** 2 + (cc - col) ** 2) / (2.0 * sigma ** 2)).astype(np.float32)
-        heat[k, r0:r1, c0:c1] = np.maximum(heat[k, r0:r1, c0:c1], g)
+        kc = chan[k]
+        heat[kc, r0:r1, c0:c1] = np.maximum(heat[kc, r0:r1, c0:c1], g)
 
         offset[0, row, col] = dx
         offset[1, row, col] = dy

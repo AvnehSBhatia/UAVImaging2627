@@ -75,8 +75,13 @@ class ClassStats:
 
 
 def eval_whitebox(ckpt, ds, device):
-    model = WhiteboxDQ(stages=int(os.environ.get("ANET_STAGES", "4"))).to(device)
-    sd = torch.load(ckpt, map_location=device)
+    sd = torch.load(ckpt, map_location=device, weights_only=False)
+    arch = sd.get("arch", {}) if isinstance(sd, dict) else {}
+    model = WhiteboxDQ(
+        stages=int(arch.get("stages", os.environ.get("ANET_STAGES", "16"))),
+        width=int(arch.get("width", os.environ.get("ANET_CH", "32"))),
+        kernels=arch.get("kernels", os.environ.get("ANET_K", "7,11,15")),
+    ).to(device)
     model.load_state_dict(sd["model"] if "model" in sd else sd)
     model.eval()
     ms = MaskStats()

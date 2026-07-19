@@ -7,7 +7,7 @@ import torch.utils.checkpoint
 
 from .backbone import (V13Backbone, V14Backbone, V15Backbone, V20Backbone,
                        V16Backbone, V17Backbone, V18Backbone,
-                       V19Backbone)
+                       V19Backbone, V22Backbone)
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
@@ -40,7 +40,8 @@ class ANetV1(nn.Module):
                  channels=None, n_blocks=None):
         super().__init__()
         self.prior_fg = prior_fg
-        if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20"):
+        if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+                    "v22"):
             # v13 (D58): plain multi-scale conv backbone — the window-token
             # encoder, neck, Path A, context and token-stream head are all
             # replaced by backbone.py's conv pyramid ending in the same
@@ -72,7 +73,8 @@ class ANetV1(nn.Module):
                 # channel — the single-variable texture-hypothesis test.
                 cls_bb = {"v15": V15Backbone, "v16": V16Backbone,
           "v17": V17Backbone, "v18": V18Backbone,
-          "v19": V19Backbone, "v20": V20Backbone}.get(arch, V13Backbone)
+          "v19": V19Backbone, "v20": V20Backbone,
+          "v22": V22Backbone}.get(arch, V13Backbone)
                 kw = dict(head_width=head_width, prior_fg=prior_fg)
                 if channels is not None:
                     kw["channels"] = tuple(channels)
@@ -248,7 +250,16 @@ class ANetV1(nn.Module):
             # v15's D64 SPD projection and v14's D59 noise filter are their
             # unique keys; a bare backbone. prefix is v13. Channel plan and
             # depth are inferred from shapes so D65-scaled checkpoints load.
-            if "backbone.unembed1.weight" in sd:
+            if "backbone.spd_gain" in sd:
+                # v22's unique key — MUST be sniffed before v15 (v22 reuses
+                # the spd_proj NAME on purpose, to inherit the slow-LR
+                # group, but its funnel is the fused Conv2d(ch_mid, ch_top,
+                # 5, stride=5), so in_channels IS ch_mid directly).
+                arch = "v22"
+                w = sd["backbone.spd_proj.weight"]
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            w.shape[1], w.shape[0])
+            elif "backbone.unembed1.weight" in sd:
                 # v20's unique key — MUST be sniffed before v15: both archs
                 # carry a spd_proj (v20 reuses the name to inherit the
                 # slow-LR group), but only v20 has the embed/unembed pairs.
@@ -520,8 +531,8 @@ class ANetV1(nn.Module):
 
     def forward(self, img):
         if self.arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19",
-                         "v20"):
-            out = self.backbone(img)  # (B, 4, 27, 48); v18 train: (out, bg)
+                         "v20", "v22"):
+            out = self.backbone(img)  # (B, 4, 27, 48); v18/v19/v22 train: (out, bg)
             aux_bg = None
             if isinstance(out, tuple):
                 out, aux_bg = out
@@ -544,7 +555,7 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
-        if self.arch in ("v18", "v19"):
+        if self.arch in ("v18", "v19", "v22"):
             z = next(self.parameters()).sum() * 0.0
             return z, z  # gains/valves are tanh- or sigmoid-bounded; nothing to regularize
         if self.arch in ("v16", "v17"):

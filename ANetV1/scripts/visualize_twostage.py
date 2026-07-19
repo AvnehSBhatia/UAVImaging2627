@@ -1,10 +1,10 @@
-"""Per-image stage dump for the v21 two-stage detector (D71).
+"""Per-image stage dump for the v21.5 chunk detector (D71).
 
   cd ANetV1
-  python scripts/visualize_twostage.py --ckpt runs/twostage/best.pt --n 24
+  python scripts/visualize_twostage.py --ckpt runs/twostage/best.pt --n 8
 
-Writes runs/viz_twostage/<stem>/{00_input … 08_overlay}.png + stats.txt
-and runs/viz_twostage/_contact_sheet.png.
+Writes runs/viz_twostage/<stem>/{00_input, 01_smooth, 02_edge, 03_saliency,
+04_chunks, 05_overlay}.png + stats.txt and _contact_sheet.png.
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ def dump_one(model, sample, img, out_dir: Path, peak_thresh=0.3):
     thresh = float(out["thresh"][0])
     sal_img = heat(sal_prob[0].cpu(), size=(CANVAS_W, CANVAS_H))
     ImageDraw.Draw(sal_img).text(
-        (4, 4), f"learned thresh={thresh:.3f}", fill=(255, 255, 255))
+        (4, 4), f"chunk thresh={thresh:.3f}", fill=(255, 255, 255))
     sal_img.save(out_dir / "03_saliency.png")
 
     chunks = model.image_chunks(sal_prob[0], out["thresh"][0])

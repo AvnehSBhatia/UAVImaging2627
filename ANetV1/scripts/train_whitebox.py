@@ -1,4 +1,4 @@
-"""P1 probe trainer: WhiteboxDQ — colour algebra paints GT boxes white.
+"""P1 probe trainer: WhiteboxDQ — deep large-kernel box painter.
 
 Run from inside ANetV1/. Follows the family train protocol: ANET_* env
 knobs, device pick, per-epoch val, best.pt on the selection score. Results
@@ -7,6 +7,9 @@ ledger: OBSERVATIONS.md P1.
   python scripts/train_whitebox.py            # train
   python scripts/train_whitebox.py --smoke    # fwd/bwd + dataset sanity
   python scripts/train_whitebox.py --eval runs/whitebox/best.pt [--split test]
+
+Env: ANET_STAGES (depth, default 16), ANET_CH (width, default 32),
+ANET_K (comma kernels, default 7,11,15), ANET_LR/EPOCHS/BATCH/POS_W.
 
 Selection: mean IoU@0.5 over object crops MINUS the white-pixel fraction on
 background crops (a probe that paints everything white scores ~0, matching
@@ -74,9 +77,13 @@ def main():
     args = ap.parse_args()
 
     device = pick_device()
-    model = WhiteboxDQ(stages=int(os.environ.get("ANET_STAGES", "4"))).to(device)
+    stages = int(os.environ.get("ANET_STAGES", "16"))
+    width = int(os.environ.get("ANET_CH", "32"))
+    kernels = os.environ.get("ANET_K", "7,11,15")
+    model = WhiteboxDQ(stages=stages, width=width, kernels=kernels).to(device)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"WhiteboxDQ: {n_par} params, device={device}")
+    print(f"WhiteboxDQ: {n_par:,} params, device={device}  "
+          f"depth={stages} width={width} k={kernels}")
 
     if args.smoke:
         for size in (40, 100):
@@ -101,9 +108,9 @@ def main():
               f"sel={m['sel']:.3f} (n_obj={m['n_obj']})")
         return
 
-    lr = float(os.environ.get("ANET_LR", "5e-3"))
-    epochs = int(os.environ.get("ANET_EPOCHS", "15"))
-    batch = int(os.environ.get("ANET_BATCH", "12"))  # images per batch
+    lr = float(os.environ.get("ANET_LR", "1e-3"))
+    epochs = int(os.environ.get("ANET_EPOCHS", "20"))
+    batch = int(os.environ.get("ANET_BATCH", "8"))  # images per batch
     limit = int(os.environ.get("ANET_SAMPLES", "0"))
     pos_w = float(os.environ.get("ANET_POS_W", "2.0"))
     train_loader, val_loader = _loaders(
@@ -149,9 +156,13 @@ def main():
         if m["sel"] > best:
             best = m["sel"]
             torch.save({"model": model.state_dict(), "probe": "whitebox",
+                        "arch": {"stages": stages, "width": width,
+                                 "kernels": kernels},
                         "epoch": ep, "val": m}, OUT / "best.pt")
             flag = "  *best*"
         torch.save({"model": model.state_dict(), "probe": "whitebox",
+                    "arch": {"stages": stages, "width": width,
+                             "kernels": kernels},
                     "epoch": ep, "val": m}, OUT / "last.pt")
         print(f"epoch {ep:3d}: loss={tot / max(nb, 1):.4f} "
               f"iou={m['iou']:.3f} bg_white={m['bg_white']:.4f} "

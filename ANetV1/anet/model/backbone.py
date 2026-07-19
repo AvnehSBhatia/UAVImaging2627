@@ -900,6 +900,139 @@ class V19Backbone(nn.Module):
         return out
 
 
+class V22Backbone(nn.Module):
+    """v22 (D72-D75): "grown, not retrained" — peak-augmented full-rank funnel
+    growth of v13_best. Three measured facts pin the design:
+
+      1. §16.2: v13 UNDERFITS its own training data (train ≈ test at
+         0.83/0.59-decile) — capacity, correctly placed, is the only open
+         lever (data/distill/training are measured-closed).
+      2. §16.3: the indicted site is down20 — every fine feature funnels
+         through a depthwise-5x5 average + one 2,048-param 1x1, a rank
+         constraint YOLO26n never commits. The D64 full-rank fix was
+         pre-registered but never successfully trained: from-scratch-at-
+         scale is 0-for-6 in this project.
+      3. D62: worst-decile misses peak at heat 0.2-0.3 — evidence DILUTED
+         by strided averaging, not absent. A full-rank LINEAR projection
+         restores rank but provably cannot reconstruct a MAX statistic;
+         peak evidence needs its own path.
+
+    So v22 GROWS the trained v13 instead of retraining at scale: the
+    full-rank funnel is a zero-gamma-valved PARALLEL branch beside the
+    donor's intact down20 —
+
+        x20 = down20(x_s4)                                   [donor path]
+            + 2*tanh(spd_gain) * SiLU(DN(  spd_proj(x_s4)    [new, valved]
+                                 + peak_proj(max_pool2d(x_s4, 5, 5))))
+
+    where spd_proj is a full-rank Conv2d(ch_mid, ch_top, 5, stride=5) —
+    mathematically IDENTICAL to pixel_unshuffle(5) + 1x1 over 25*ch_mid
+    channels (the D64 honesty note, used as an optimization this time:
+    the fused conv skips materializing the 800-channel unshuffle tensor
+    and the 832-channel concat, measured -0.5ms/frame batch-1 MPS, and
+    removes pixel_unshuffle from the graph entirely, so v22 is NOT in
+    the ROCm inductor miscompile family and compile stays ON). peak_proj
+    (1x1 on the max-pooled map) is the same linear map as the 32 extra
+    concat columns — split out so the peak mechanism has its own named
+    weight tensor for the post-training column autopsy.
+
+    plus v18's train-only bg-aux head (the family fp-record earner; run-1
+    trains with ANET_BG_W=0 so the capacity/peak verdict is unconfounded —
+    the D69 interference law — and run-2 turns it on against v17_best/
+    v18_best as the pre-existing ablation baselines). Two red-team-removed
+    pieces, recorded so they are not re-proposed: a down4-level peak blend
+    (unlicensed — D62/D64 indicted down20, not down4 — and measured as the
+    LARGEST latency cost: elementwise passes over the 2M-element s2 map beat
+    the whole 69M-MAC funnel on eager wall-clock) and four standalone bias-
+    recalibration tensors (v17's bias win is an ADAPTER-regime result; in a
+    full fine-tune every DeployNorm bias is already trainable, so separate
+    bias params are redundant dof at real dispatch cost — the D74 protocol
+    is a post-training bias-only adapter phase, not architecture).
+
+    At step 0 a warm-started v22 IS v13_best bit-exactly — ALL donor
+    tensors land, including every DeployNorm running-stat buffer (legal
+    because no donor module's input distribution changes until a valve
+    opens). This is the family's first capacity increase under the full
+    D63 identity contract: it answers the 0-for-6 from-scratch record and
+    the capacity ceiling with the same move. spd_norm is fresh and
+    observes real branch activations from the first forward (the valve
+    sits AFTER the norm — the D63 zero-gamma idiom, not a zeroed conv).
+    spd_gain is tanh-BOUNDED (x2, range (-2,2)): the third-time law says
+    every scalar that reshapes the trunk is bounded by construction, and
+    unlike the historical zero-gamma valves this one gates 68% of the
+    model's new capacity — an 80-epoch drift has to be unrepresentable,
+    not merely unlikely (red-team blocker, resolved here).
+
+    Pre-registered controls (ARCHITECTURE.md §17): a plain-SPD sibling
+    (no maxpool concat) isolates peak-vs-rank; per-channel gain/column
+    autopsies attribute each mechanism; peak-thresh sweep for fp claims.
+    Deploy: conv/pool/space-to-depth/DN/SiLU only — single-shot NPU
+    graph, ~0.05% of Hailo-8 int8 peak at 216.7M MACs (1.47x v13).
+    78,844 deploy params (+65 train-only bg head) at spec width — on the
+    pre-registered D65 curve near tier-S. Full fine-tune only: freezing
+    the trunk would strand the fresh funnel between frozen stages (the
+    measured 16.1 adapter failure mode). spd_proj keeps that NAME so the
+    trainer's 0.2x slow-LR group (the v15 funnel-stability fix) matches.
+    ROCm: pixel_unshuffle shape family -> compile defaults OFF (v15/v20
+    precedent)."""
+
+    def __init__(self, head_width=24, prior_fg=None, n_blocks=3,
+                 channels=(16, 32, 64)):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        self.head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 4, 1),
+        )
+        # D72: full-rank peak-augmented funnel branch. spd_proj IS
+        # pixel_unshuffle(5)+1x1 fused into one conv (identical linear map,
+        # D64 honesty note); peak_proj is the maxpool side-channel's own
+        # matrix. spd_proj keeps its NAME for the trainer's 0.2x slow-LR
+        # group (fan-in 800-equivalent); peak_proj (fan-in ch_mid) trains
+        # at full LR — the tiny new mechanism should not be slowed.
+        self.spd_proj = nn.Conv2d(ch_mid, ch_top, 5, stride=5, bias=False)
+        self.peak_proj = nn.Conv2d(ch_mid, ch_top, 1, bias=False)
+        self.spd_norm = DeployNorm(ch_top)
+        # tanh-bounded valve (x2): zero-init identity, range (-2, 2) — the
+        # bounded-by-construction law applied to the one gain that gates
+        # ~68% of all new capacity.
+        self.spd_gain = nn.Parameter(torch.zeros(1, ch_top, 1, 1))
+        # D74: v18's bg-mask aux head (train-only, dropped at eval/export).
+        self.bg_head = nn.Conv2d(ch_top, 1, 1)
+        for mod in self.modules():  # Kaiming everywhere (D58, load-bearing)
+            if isinstance(mod, nn.Conv2d):
+                nn.init.kaiming_normal_(mod.weight, nonlinearity="relu")
+                if mod.bias is not None:
+                    nn.init.zeros_(mod.bias)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.head[-1].bias.zero_()
+                self.head[-1].bias[0:2] = b
+
+    def forward(self, img):  # (B, 3, 540, 960) -> (B, 4, 27, 48)
+        x = self.act(self.stem_norm(self.stem(img)))
+        x_s4 = self.block4(self.down4(x))
+        z = self.spd_proj(x_s4) + self.peak_proj(F.max_pool2d(x_s4, 5, 5))
+        branch = self.act(self.spd_norm(z))
+        x = self.down20(x_s4) + 2.0 * torch.tanh(self.spd_gain) * branch
+        y = self.blocks(x)
+        out = self.head(y)
+        if self.training:
+            return out, self.bg_head(y)
+        return out
+
+
 class V20Backbone(nn.Module):
     """v20 (D70): the RE-RENDER CYCLE trunk (owner direction) — both of
     v13's strided transitions become an explicit embed -> unembed pair:

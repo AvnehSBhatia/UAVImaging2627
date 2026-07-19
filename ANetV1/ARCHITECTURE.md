@@ -1,6 +1,6 @@
 # ANetV1 — Full Architecture Specification & Design Record
 
-**Status:** v13 final · 2026-07-17 — **the §10 decision is executed: YOLO26n flies at SUAS 2026; ANetV1 is the research track** (§16.2: train-split eval proved the 25k-param model *underfits its own training data* — a capacity ceiling, not a data/loss/training problem). v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9–v11 (D39–D56) rebuilt the training path and losses; v12 (D57) replaced per-cell classification with an object center-heatmap readout; v13 (D58) replaced the window-token encoder with a plain multi-scale conv backbone — the best model of the family (test mannequin 0.835 / tent 0.967 at 25,212 params, 1,132 img/s); v14 (D59–D63) structured priors were falsified against the capacity ceiling. §15 is the v12/v13 model; §16 is the v14 record and the closing verdict.
+**Status:** v13 final · 2026-07-17 — **the §10 decision is executed: YOLO26n flies at SUAS 2026; ANetV1 is the research track** (§16.2: train-split eval proved the 25k-param model *underfits its own training data* — a capacity ceiling, not a data/loss/training problem). v6 was the locked baseline spec; v7/v8 (D31–D38) fixed the recall collapse and MI300X throughput; v9–v11 (D39–D56) rebuilt the training path and losses; v12 (D57) replaced per-cell classification with an object center-heatmap readout; v13 (D58) replaced the window-token encoder with a plain multi-scale conv backbone — the best model of the family (test mannequin 0.835 / tent 0.967 at 25,212 params, 1,132 img/s); v14 (D59–D63) structured priors were falsified against the capacity ceiling. §15 is the v12/v13 model; §16 is the v14 record and the closing verdict. **§17 is the v22 redesign (2026-07-19, D72–D75): peak-augmented full-rank funnel growth of v13_best** — the full-record redesign (evidence audit → design panel → red team), built and locally validated (identity 0.0, both gates PASS, 1.051× v13 latency at 3.1× params); MI300X run pending.
 **Task:** object center detection of {mannequin, tent} in UAV survey frames (SUAS-style search area; per-cell region classification through v11, center heatmaps since v12)
 **Deployment target:** Raspberry Pi 5 + AI HAT+ (Hailo-8, 26 TOPS int8) at ≥30 FPS
 **Training target:** Apple Silicon (MPS), PyTorch
@@ -26,6 +26,7 @@
 14. [v9 — training-stack rebuild](#14-v9--training-stack-rebuild-d39d48)
 15. [v12/v13 — center-heatmap detector and the conv backbone](#15-v12v13--object-center-heatmap-detector-and-the-conv-backbone-d57d58)
 16. [v14 — structured priors as a monotone extension](#16-v14--structured-priors-as-a-monotone-extension-d59d63)
+17. [v22 — grown, not retrained: peak-augmented full-rank funnel growth](#17-v22--grown-not-retrained-peak-augmented-full-rank-funnel-growth-d72d75)
 
 ---
 
@@ -693,7 +694,6 @@ The owner's op, from the broadcasting identity `A^v` (row i of a learned 3×3 ma
 3. **Site attribution (per-site gain ablation): pb1 (post-stem) carries half the FP suppression** (−0.011 of −0.022), pb2 a quarter, pb3/pb4 nearly nothing — despite pb3 having the largest raw injection norm. The earliest, highest-resolution site is where recalibration bites.
 
 **Pre-registered control this demands:** a bias-only adapter (per-channel learned biases at the same four sites, no PowerBlend — ~176 params) trained in the identical harness. If it matches fp ≈ 1.95, the mechanism is "multi-depth recalibration of a frozen trunk" and the A^v machinery is ballast; if it falls short, the residual chromaticity linearity earns the credit. Either answer sharpens D67 into an attributable claim.
-git -C /Users/avneh/Code/UAVImaging2627 status --short | head -3
 ### 16.6 v18 — exposure-mask + background-mask auxiliary heads (D68, user-directed)
 
 Two owner-directed auxiliary heads on the untouched v13 trunk (+603 params, 25,815 total), after two from-scratch big-tier runs failed to converge at any LR (0-for-6 for from-scratch-at-scale across this project; function-preserving widening remains the parked capacity path):
@@ -847,3 +847,87 @@ and the scene stats that conditioned the kernels). 6,077 params (+444).
 Same viz also showed 18/24 frames peaking BELOW the 0.3 threshold →
 center focal now uses pos_weight=3 (ANET_POS_W), the v12-measured fix
 for exactly that slow positive climb.
+
+---
+
+## 17. v22 — grown, not retrained: peak-augmented full-rank funnel growth (D72–D75)
+
+**Status: built, smoke-passed (full-identity contract 0.0), both overfit gates PASS, throughput falsifier fired-and-fixed pre-training (measured 1.051× v13) — MI300X run pending.** Produced 2026-07-19 by a full-record redesign campaign: a 200-finding evidence audit over D1–D71 + the probe/two-stage/runs/git record, a five-design panel (fine-grid FPN, unified two-stage, function-preserving growth, speed-first reflow, novel-signature peak descent) scored by four independent judges, and a six-lane adversarial red team (param math, MACs/latency, Hailo legality, falsified-collision, trainability, novelty-vs-literature) on the merged draft before a line of model code was finalized. One red-team blocker and four majors were found and resolved below — two of them by *measurement*, before any training was spent.
+
+### 17.1 The thesis, from the record
+
+Three measured facts compose v22, and none is new — the design is their intersection:
+
+1. **§16.2**: v13 underfits its own training data (train 0.828/0.586-decile ≈ test 0.835/0.595). Data, distillation, and more training are measured-closed; *representational capacity, correctly placed*, is the only open lever.
+2. **§16.3**: the indicted site is `down20` — all fine-scale evidence funnels through a depthwise-5×5 average + one 2,048-param 1×1, a rank constraint YOLO26n (worst-decile 0.881) never commits. The D64/D65 full-rank fix was pre-registered but **never successfully trained**: from-scratch-at-scale is 0-for-6 in this project, and no tier run ever completed.
+3. **D62**: worst-decile misses peak at heat 0.2–0.3 — evidence *diluted by strided averaging*, not absent. A full-rank **linear** projection restores rank but cannot represent a **max** statistic, so the D64 fix is incomplete by construction; peak evidence needs its own nonlinear path.
+
+v22 therefore **grows v13_best function-preservingly** instead of retraining at scale:
+
+```
+x20 = down20(x_s4)                                        [donor, bit-exact]
+    + 2·tanh(spd_gain) ⊙ SiLU(DN( spd_proj(x_s4)          [D72: full-rank capacity]
+                                + peak_proj(maxpool5×5s5(x_s4)) ))   [D73: peak path]
+```
+
+`spd_proj` = Conv2d(32→64, k5, s5) — by the D64 honesty note this **is** pixel_unshuffle(5)+1×1 over 800 channels, implemented as the fused conv so no 800-channel intermediate is ever materialized (a measured −0.5 ms/frame, and it removes v22 from the ROCm pixel_unshuffle inductor-miscompile family entirely: compile stays ON, unlike v15/v20). `peak_proj` (1×1 on the max-pooled s4 map) is algebraically the 32 extra concat columns, split out as its own tensor so the peak mechanism's post-training column autopsy is a single weight-norm readout. The valve is tanh-bounded ×2 — the third-time law (D61 gate → D69 activation → here), applied because this one gain gates 68% of all new capacity and an 80-epoch drift must be *unrepresentable*, not unlikely (red-team blocker, resolved). Plus v18's train-only `bg_head` (65 params, dropped at export; run-1 trains with `ANET_BG_W=0` — see 17.4).
+
+**78,717 params (78,652 deployed)** = donor 25,212 + spd_proj 51,200 + peak_proj 2,048 + spd_norm 128 + spd_gain 64 (+ bg_head 65 train-only) — on the pre-registered D65 curve at the tier-S point. **216.7M MACs** (1.47× v13's 147.7M; ~0.05% of Hailo-8 int8 peak — [§1.3] compute headroom is not the constraint). Every op is from the sanctioned set: conv/dw-conv, max-pool, affine-foldable DeployNorm, single-LUT SiLU/tanh, residual add. Single-shot NPU graph; host-side peak-finding unchanged from v13.
+
+### 17.2 D72 — capacity as valved growth (the warm-start law)
+
+The 0-for-6 from-scratch record and the v14 full-tune failure bracket the training problem: capacity added from scratch never converges here, and capacity bolted on as small priors overfits. The untested corner is *function-preserving growth of the proven checkpoint*. Because the branch is parallel and zero-valved, `ANET_INIT_FROM=v13_best` lands **all 82 donor tensors bit-exact — weights AND every DeployNorm running-stat buffer** (legal precisely because no donor module's input distribution changes at step 0; contrast v20's partial 58/82 start, where copied stats downstream of a fresh funnel would have been stale). Step-0 output delta vs donor: **0.00e+00, smoke-asserted**. `spd_norm` is fresh and observes real branch activations from the first forward (valve after the norm — the D63 zero-gamma idiom, never a zeroed conv). Gains/valve get gradient at the identity point; branch weights wake one optimizer step later (smoke-asserted live).
+
+Training contract: **full fine-tune only** — `ANET_FREEZE_TRUNK` is *refused* in `train_anet.py` for v22 (a frozen trunk around a fresh funnel is the measured 16.1 collapse). lr 7.5e-4 peak (funnel-dominant law, v15-measured), warmup 600 even on warm start, `spd_proj` auto-matches the 0.2× slow-LR group by name; `peak_proj` (fan-in 32) deliberately trains at full LR — the tiny new mechanism should not be slowed. From-scratch is legal-but-**discouraged**: the 800-step gate passes (below), but nothing licenses a from-scratch run at 79k params against the 0-for-6 record; it exists for the gate and for emergencies, not as a plan.
+
+### 17.3 D73 — the peak side-channel, and what the red team removed
+
+The draft carried the same peak idea at `down4` (tanh-gated maxpool blend) and four standalone bias-recalibration tensors (v17's D67 carry). Both were **removed by audit**, for independent reasons worth recording:
+
+- **down4-peak was unlicensed**: D62/D64 indicted the s4→s20 funnel specifically; `down4` strides 2× — already YOLO-anatomy-compliant — and no finding flags it. Placement without a measured failure mode is how v14–v19 died.
+- **"~0 MACs" ≠ free**: the red team *measured* the draft's elementwise adds over the s2/s4 maps (2.07M/1.04M elements) at **+19.7% wall-clock — more than the entire 69M-MAC funnel branch (+10.7%)** on the eager batch-1 protocol the throughput falsifier is judged on. Zero-MAC ops on big maps are the dominant hidden cost on a launch-bound model. (This generalizes D38: dispatches and memory passes, not MACs, are the budget.)
+- **Bias sites are adapter-regime machinery**: v17's bias win was earned *on a frozen trunk*, where biases were the only degrees of freedom. In a full fine-tune every DeployNorm bias is already trainable — standalone bias tensors are redundant dof at real dispatch cost. **D74 protocol, not architecture**: the bias-recal experiment remains available post-training as a bias-only adapter phase (train only DN biases on the frozen result — zero new params), directly comparable to v17_best.
+
+What remains of D73 is the funnel peak channel itself, with its pre-registered attribution: nearest prior art is **YOLOv9's ADown** (parallel avg/max downsampling branches, concat-fused) and the UAV small-object dual-pooling line (DFAS-YOLO/DPNet), with mixed/gated pooling (Lee et al. 2016) the older ancestor and SPD-Conv (Sunkara & Luo 2022) already in-family via D64. The architectural primitive is **not** novel and the record should never claim otherwise. The novel content is methodological: (a) *peak-vs-rank as separately falsifiable variables at a measured failure site* — a plain-SPD sibling (drop `peak_proj`) isolates whether max statistics buy anything beyond rank, the attribution every v14–v19 module lacked until post-hoc autopsy; (b) *capacity growth executed under the full D63 identity contract* — nearest prior art Progressive Networks (Rusu et al. 2016) / adapter-style PEFT (Houlsby et al. 2019), here inverted: the new capacity is grown to be *ablatable and bounded* inside a 79k-param deploy model.
+
+### 17.4 D74 — proven-mechanism carry, isolation-first
+
+Run-1 answers ONE question — does grown capacity + peak evidence move the immovable decile band? — so it runs `ANET_BG_W=0` (bg-aux off) and no bias adapters: the D69 interference law says proven single-variable wins do not compose additively, and the D65 tier design goal was "isolate the projection alone." The proven mechanisms then layer back in with their own controls: run-2 = +bg-aux 0.3 (judged against **v18_best** fp 1.722/recall-dip precedent), run-3 (optional) = post-training bias-only adapter (judged against **v17_best** 1.955). Both baselines already exist as checkpoints — attribution needs no extra runs.
+
+### 17.5 The measured record (2026-07-19, local)
+
+- **Smoke** (`scripts/smoke_test.py v22_checks`): 78,717 params; identity-at-init vs donor **0.00e+00**; donor-tensor accounting exact (82 land, 9 new tensors); valve-alive at identity; funnel+peak live after valve crack; ±1e6 valve collapse-safety; sniff roundtrip (v22 before v15 — both carry `spd_proj`; v22's unique key is `spd_gain`).
+- **12-frame overfit gate** (from-scratch, 800 steps, lr 7.5e-4): 0/21 → 21/21 centers past 0.5 by step 700, max bg prob 0.262 at step 800 — PASS in the valved-arch class (v15-S 21/21@400, v16 pass@800; the ~2× wake-up lag is the documented valve pattern). Gate training throughput ~150 img/s MPS batch-12.
+- **Warm gate** (v13_best growth, 300 steps): donor scores 12/21 on the gate set with max bg 0.866; v22 reaches **21/21 by step 100** and max bg **0.120** by step 300 — v18-record-class background suppression *with* recall rising, on 24 seconds of MPS fine-tuning. (Step-0 gate readout differs from the donor only because the harness's 8 seeding passes nudge donor DN stats toward the 12-frame distribution; the smoke test asserts exact identity without seeding.)
+- **Throughput falsifier: fired, fixed, passed.** Draft architecture measured **1.30×** v13 batch-1 latency (both by this campaign's bench and the red team's independent reconstruction) — 3× over the pre-registered ~10% bound, before any training was spent. Cause (measured, not guessed): the 800-ch unshuffle+concat materializations and the big-map elementwise ops, not the 69M MACs. Fix: the fused-conv identity + the 17.3 removals. Final paired/interleaved bench (the protocol the falsifier is now defined by — naive sequential timing swings 2× thermally): **batch-1 v13 2.40 ms (412 img/s) vs v22 2.52 ms (393 img/s) = 1.051× [1.043–1.056]; batch-8 1.050×**. For scale: v22 remains **6.7× faster than YOLO26n** (16.88 ms) at 30× fewer params.
+
+### 17.6 D75 — pre-registered falsifiers and the escalation ladder
+
+1. **Capacity**: train-split worst-decile mannequin recall must clear the 0.586–0.643 band meaningfully (the §16.2 methodology: train split first). Stuck-in-band at fitted train loss → escalate to v22.1, per the honest §16.3 trigger.
+2. **Peak-vs-rank control**: identical-tier sibling minus `peak_proj`. Indistinguishable → the peak channel is ballast; credit rank/capacity and say so.
+3. **FP curve dominance**: any fp claim requires the 0.30–0.50 peak-thresh sweep vs donor — closing the open v16–v19 methodological gap; single-point comparisons don't count.
+4. **Mechanism autopsy** (v17 method, designed-in): report |2·tanh(spd_gain)| per channel and ‖peak_proj‖/‖spd_proj‖ column norms at convergence; near-zero self-reports unused.
+5. **Throughput**: paired/interleaved batch-1 bench within ~10% of v13 — **already measured PASS at 1.051×**; re-verify on the trained checkpoint (weights don't change latency, but the export path must stay clean).
+6. **Generalization watch** (v14 run-2 lesson): val degrading while train falls = capacity landing wrong — stop and report, don't tune around it.
+
+**Escalation ladder** (each staged, each with landed plumbing or named precedent): **v22.1** — per-class anisotropic readout: mannequin at stride-10 (54×96) via a raw pixel_unshuffle(10) tap + 2× **nearest** upsample (mode pinned now — DFC supports nearest only) of deep features, tent stays s20; the grid-parameterized `boxes_to_heatmap`/`SUASCells(center_grid=)`/shape-derived `CenterObjectMetrics` landed this session, so v22.1 is a model-only delta; triggered by falsifier 1 firing at fitted train loss. **v22.2** — cascade re-scoring on strip-pooled span/density features of the first-pass heat (the dense v21.5 chunk-shape lesson, from the panel's runner-up design); triggered by fp > 1.0 at matched recall after v22. **v22.3** — D65 tier-M growth of the same valved-branch form.
+
+### 17.7 Findings disposition (the full-record audit, compressed)
+
+| findings | disposition in v22 |
+|---|---|
+| §1/D22 input+grid physics; D10/D11/D15/D19/D24/D26 Hailo op law; §6 PCIe/DRAM | respected verbatim: 960×540 input, conv/pool/LUT/affine-fold graph, no attention/softmax/dynamic weights, raw-frame-only PCIe |
+| D5/D33 bake idiom; D6/D24 bounded-argument law | carried: tanh-bounded valve folds to constants; no periodic args added |
+| D23/D47/D49/D54/D57 loss lineage | untouched: center_focal + offset_l1, independent sigmoids, per-class n_pos normalization, pos_weight 3 |
+| D31/D52/D58 context-dilution + no-global-context/no-coords | respected: no global path, no coord channels, branch is local conv/pool |
+| D39/D48/D53 DeployNorm/EMA/infra contracts; 16.1 frozen-stats law | carried; freeze refused for v22; buffers transfer legally (17.2) |
+| D46/D51 aux-probe falsification | respected: no linear-probe supervision; bg_head is the D68 training-signal class, not a probe |
+| D58 conv base + Kaiming; D63 identity/valve contract | v22's foundation; full identity achieved (0.0) |
+| D59–D63 v14 priors; D66 weave; D68 exposure; D69 stacking | all falsified machinery excluded; interference law → run-1 isolation |
+| D64/D65 anatomy, SPD honesty, tiers, slow-LR, sel-gate | the capacity mechanism itself; honesty note *used* as the fused-conv optimization; tier-S sizing; slow-LR + max_sel_fp inherited |
+| D67 bias autopsy; D68 bg-aux | demoted to protocol (adapter-regime insight) / staged to run-2 — with v17_best/v18_best as standing baselines |
+| D70 v20, D71 v21.x (both untested), P1/P2 (abandoned) | not built upon; v22 is a third, independently-falsifiable line — v20/v21 remain the owner's open experiments (v21.2–21.5 history lives in `twostage.py`'s docstring, not yet in this file) |
+| v21.4 attenuator; v21.4/21.5 crop cost; v21.5 threshold lessons | respected: no learned pre-filters ahead of evidence, no crops/gathers, no naive thresholds; max-pool cannot attenuate (parameter-free, parallel) |
+| 16.2 capacity verdict; 0-for-6; paper_bench numbers | the design's premise, its training law, and its report protocol (synthetic-only slices, worst-decile with CI, curve sweeps) |
+
+Run: `ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v13_best.pt ANET_BG_W=0 python scripts/train_anet.py` (80 epochs, cosine; selection/early-stop unchanged). Artifacts note: `runs/comparison.json` is a mislabeled v17 result and `runs/anet/log.csv` is from an abbreviated local run — judge v22 against `runs/paper_bench/` (the authoritative v13/YOLO26n record) and fresh evals only.

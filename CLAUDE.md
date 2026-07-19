@@ -8,9 +8,11 @@ SUAS 2026 UAV target detection: find mannequins and tents in nadir aerial frames
 
 Git: repo `main` → https://github.com/AvnehSBhatia/UAVImaging2627.git. Commit convention since 2026-07-07: `ANetV1: <imperative summary>` with a symptom → root cause → fix body. Training runs happen on a remote MI300X box that pulls from this remote — code must be committed/pushed to reach it.
 
+**Project status (2026-07-17, §10 decision executed): the SUAS 2026 flight model is YOLO26n** (`scripts/train_export_yolo26n.py` → ONNX → Hailo DFC). ANetV1 continues as the research track: the §16.2 capacity verdict measured zero train/test generalization gap — the 25k model *underfits its own training data*, so more data/distillation/training cannot close the worst-decile gap.
+
 Three sibling projects:
 
-- **`ANetV1/`** — the custom ~21k-parameter per-cell detector (v9), a YOLO baseline, and a distillation pipeline. `ARCHITECTURE.md` is the authoritative design record: design decisions **D1–D48**, §3–§5 describe the v6–v8 model, **§14 is the current v9 delta** (`V9_CHANGES.md` is the quick summary). Read it before touching model code; changes to model semantics must stay consistent with it or update it.
+- **`ANetV1/`** — the custom tiny-detector family (best proven: v13, 25,212 params, test mannequin 0.835 / tent 0.967, 1,132 img/s), a YOLO baseline, and a distillation pipeline. `ARCHITECTURE.md` is the authoritative design record: decisions **D1–D71**; §3–§5 the legacy v6–v8 model, §14 the v9 training-stack rebuild, **§15 the v12/v13 model (current best)**, **§16 the v14–v21 experiment record** including the capacity verdict (§16.2) and the active v20/v21 lines. `OBSERVATIONS.md` records the standalone side probes (P1/P2 — owner-abandoned, code stays runnable). Read the relevant sections before touching model code; changes to model semantics must stay consistent with the record or update it.
 - **`datasetgen-2026/gen2/`** — the current synthetic dataset generator (CLIP-gated OpenAerialMap backgrounds, Blender-rendered assets, sun-consistent shadows, Reinhard harmonization, sensor sim). Deterministic per-index seeds, resume-safe. Its living documentation is `datasets/suas-synth-50k/README.md` (the `datasetgen-2026/README.md` describes only the legacy gen1 tool — don't extend gen1).
 - **`datasets/`** — generated data (gitignored blobs, ~17 GB; only yaml/README in git). `suas-synth-50k/` is the active YOLO-format dataset; `gen-assets/` holds generator inputs; `VisDrone/` the raw source for the `vd_*` subset.
 
@@ -23,26 +25,33 @@ There is **no pytest/ruff/pre-commit/CI anywhere** — `ANetV1/scripts/smoke_tes
 cd ANetV1        # ALWAYS run scripts from inside ANetV1/ — running from the
                  # repo root silently writes a stray runs/ tree at the root
 
-python scripts/smoke_test.py      # param budgets, fwd/bwd, v9 path parity, dataset
+python scripts/smoke_test.py      # param budgets, fwd/bwd, path parity, dataset
 
-# training pipeline, in order
-python scripts/train_yolo.py                                          # 1. YOLO baseline + teacher
-python scripts/train_anet.py                                          # 2. ANetV1 v9 from scratch
+# main pipeline
+python scripts/train_yolo.py                                          # YOLO baseline + teacher
+python scripts/train_anet.py                                          # ANetV1 (default arch v13; ANET_ARCH=v14..v20 opts in)
 python scripts/cache_teacher.py --weights runs/yolo/baseline/weights/best.pt
-python scripts/train_anet_distill.py                                  # 3. distilled ANetV1
+python scripts/train_anet_distill.py                                  # distilled ANetV1
 
-# three-way comparison on the test split (identical cell metrics)
-python scripts/evaluate_all.py \
-  --yolo runs/yolo/baseline/weights/best.pt \
-  --anet runs/anet/best.pt \
-  --anet-distill runs/anet_distill/best.pt
+# active research line: v21.x two-stage chunk detector (standalone model + trainer)
+python scripts/train_twostage.py              # train (runs/twostage/)
+python scripts/train_twostage.py --smoke      # fwd/bwd/detect sanity
+python scripts/train_twostage.py --eval runs/twostage/best.pt [--split test]
 
-# MI300X (remote box): ./run_mi300x.sh (YOLO), ./run_anet_mi300x.sh (ANet v9)
-# fast local inference: anet.metal.MetalANet.from_checkpoint (v8 ckpts, ~7.4 ms/img)
-python scripts/export_onnx.py --ckpt runs/anet/best.pt --bench   # portable ONNX (~21 ms/img)
+# evaluation
+python scripts/evaluate_all.py --yolo runs/yolo/baseline/weights/best.pt \
+  --anet runs/anet/best.pt [--anet-distill ...] [--split train]   # --split train = capacity check
+python scripts/benchmark_paper.py --anet runs/anet/best.pt \
+  --yolo runs/yolo/yolo26n/weights/best.pt --out runs/paper_bench  # paper-grade: bootstrap CIs, decile curves, latency
+
+# flight model export
+python scripts/train_export_yolo26n.py        # YOLO26n → ONNX (Hailo DFC compile is downstream)
+
+# MI300X (remote box): ./run_mi300x.sh (YOLO), ./run_anet_mi300x.sh (ANet)
+python scripts/export_onnx.py --ckpt runs/anet/best.pt --bench   # portable ONNX
 ```
 
-**There is no yaml config.** Hyperparameter defaults live in `ANetV1/anet/train/presets.py` (`anet_cfg()`, device-aware: MI300X vs Mac) and are overridden inline in each train script's cfg block. Env knobs: `ANET_BATCH/ACCUM/LR/EPOCHS/COMPILE/FUSED/FUSED_BWD/CACHE/CONF/INIT_FROM/LOSS_MODE`, `DATA_ROOT`.
+**There is no yaml config.** Hyperparameter defaults live in `ANetV1/anet/train/presets.py` (`anet_cfg()`, device-aware: MI300X vs Mac) and are overridden inline in each train script's cfg block. Everything is env-knob driven (`ANET_*` — ~40 knobs defined in presets.py and the trainers; the load-bearing ones: `ANET_ARCH/BATCH/LR/EPOCHS/COMPILE/INIT_FROM/FREEZE_TRUNK/POS_W/VD`, `DATA_ROOT`). The side probes and the two-stage trainer follow the same "family protocol": `ANET_*` knobs, `pick_device`, gated selection score, `best.pt`/`last.pt` under `runs/<name>/`.
 
 Training runs on MPS locally (`PYTORCH_ENABLE_MPS_FALLBACK=1` if an op is unsupported) and on ROCm remotely. ROCm quirks are load-bearing: dataloader workers must be 0 (spawn deadlocks on fork'd MIOpen mutexes — a background prefetch thread hides the loader cost instead), `TORCHINDUCTOR_COMPILE_THREADS=1` (host-OOM guard), `MIOPEN_FIND_MODE=FAST`, and inductor MISCOMPILES some v15 (pixel_unshuffle) tier shapes to step-0 NaN — v15 defaults `compile=False` (presets), `ANET_COMPILE=1` opts a known-good tier back in. The run scripts set all of this.
 
@@ -57,21 +66,19 @@ Generator config: `datasetgen-2026/gen2/config.yaml` — also the ground truth f
 
 ## Architecture big picture
 
-**ANetV1 v9** (`ANetV1/anet/`): a pipeline classifying every 10×10 cell of a 960×540 frame as {nothing, mannequin, tent} — region marking, not boxes.
+**ANetV1 v13** (`ANetV1/anet/`, D57/D58) — the proven best of the family, and `train_anet.py`'s default:
 
-1. **Stem** (`model/blocks.py` `EdgeDQStem4`): raw colour + 4 oriented Sobel-init 7×7 edge branches behind dual-quaternion colour rotations → 15 channels.
-2. **Stage 1** (`model/tile_encoder.py`): one shared 20×20-window encoder (stride 10 → 53×95 windows) — 3 cosine-gated mixing rounds, fc1+gated pool per token, fc2 per window → 32-d embeddings. ~96% of FLOPs. Three equivalent implementations, parity-asserted: windowed tokens (reference), dense 4-phase (PyTorch, any device), and **fused Triton kernels** for training on ROCm/CUDA (`train/fused.py` — startup parity checks demote automatically: triton bwd → chunked-autograd bwd → dense).
-3. **Neck/context** (`model/neck.py`, `model/pyramid.py`, `model/context.py`): residual depthwise conv neck on the embedding grid, Path A k3/7/11 per-channel maps, SlimContext (gated global pools → multi-cosine weave → one context vector).
-4. **Head** (`model/head.py` `RegionHeadV9`): split local/context streams → Linear(68→24)→SiLU→Tanh→Linear(24→3), overlap-averaged into 54×96 cells. A train-only aux probe (1×1 conv on the embedding map) gives the encoder a direct gradient path.
+- **Backbone** (`model/backbone.py` `V13Backbone`): a plain multi-scale conv pyramid — stem s2 → dw-sep s4 stage → dw-sep s20 stage with 3 residual blocks → 1×1 head. It replaced the v6–v12 window-token encoder after the pooling-before-features ceiling was measured (~0.05 embedding separation, two full-scale runs pinned at soft-p ≈ 0.09). **Kaiming init is a functional requirement**, not a nicety — DeployNorm seeds from running stats, and default init puts the cascade ~300× off its fixed point (measured: 1e23 logits). Deliberately absent, each for a measured reason: coordinate channels, global-context vector, aux probe.
+- **Readout** (D57, since v12): CenterNet-style **center heatmaps** on the 27×48 stride-20 grid — two independent per-class sigmoid heatmaps (no softmax competition), class-agnostic sub-cell (dx,dy) offset, Gaussian targets from `data/rasterize.py`, RetinaNet prior 0.01 init. This replaced per-cell {nothing, mannequin, tent} classification (v6–v11).
+- **Loss** (`train/losses.py` `center_focal_loss`): penalty-reduced pixel focal, `pos_weight` 3, ONE smooth term. The older per-cell losses (`focal_norm_loss` D47, the Focal-Tversky/anchor stack) remain for the v8/v9 lineage — the multi-term class-balance stacks are documented oscillation machines; don't reintroduce them.
+- **Normalization is DeployNorm** (`model/norm.py`, D39): running-stat affines with detached-EMA updates — the training forward IS the deploy forward. Do not "fix" it back to BatchNorm; batch-stat coupling made training unfusable and OOM-prone. Corollary from the v14 adapter collapse (§16.1): **frozen weights require frozen stats** whenever anything trainable sits upstream (`DeployNorm.frozen`; `ANET_FREEZE_TRUNK=1` handles both).
 
-**Normalization is DeployNorm** (`model/norm.py`, D39): running-stat affines with detached-EMA updates — the training forward IS the deploy forward. Do not "fix" it back to BatchNorm; batch-stat coupling is what made training unfusable and OOM-prone (MIOpen int32 overflow at batch ≥ 44).
+**Version map** (all in `model/anet.py`; `ANetV1.from_state_dict` shape-sniffs the arch from checkpoint keys, v8→v22): v8/v9 = legacy window-token pipeline (stem `EdgeDQStem4`, `tile_encoder.py`, fused Triton path in `train/fused.py` — ROCm-only, does not apply to v13+ which is pure convs). v14–v19 = valved extensions over v13, mostly falsified (verdicts in §16 — read them before re-proposing similar mechanisms). Active lines: **v20** re-render cycles (owner-directed, §16.8, run pending), **v21.x two-stage** (owner-directed, `model/twostage.py` + `scripts/train_twostage.py`, §16.9 — a separate standalone model whose docstring carries the v21.2–21.5 per-rev history), and **v22** peak-augmented full-rank funnel growth (§17, D72–D75): v13_best grown via a tanh-valved parallel funnel branch (fused `Conv2d(32,64,5,s5)` + max-pool peak path) with a bit-exact full-identity warm start — built, gated, MI300X run pending (`ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v13_best.pt ANET_BG_W=0`, run-1 isolation per §17.4).
 
-**Loss** (`train/losses.py` `focal_norm_loss`, D47): per-class positive-normalized focal — ONE smooth term. The Focal-Tversky/anchor stack (kept for v8 ablation) is a documented oscillation machine; don't reintroduce multi-term class-balance tugs-of-war.
+**Hardware constraints shape everything.** The Hailo-8 compiler is conv-centric: no QK attention, no data-dependent normalization at deploy, cosine arguments bounded to one period for int8 LUTs, sigmoid gates instead of softmax, affine-foldable norms only. Deployment-safe forms are used during training from step 0. v13 needs no workarounds (single-shot NPU graph, host-side peak-finding only); the v8/v9 mechanisms (DQ rotations, cosine gates, gated pooling) were Hailo-legality workarounds for attention-like compute.
 
-**Hardware constraints shape everything.** The Hailo-8 compiler is conv-centric: no QK attention, no data-dependent normalization at deploy, all cosine arguments bounded to one period for int8 LUTs; sigmoid-gated pooling instead of softmax, affine-foldable norms only. Deployment-safe forms are used during training from step 0 — do not simplify gates to softmax or add attention. The v8 code paths remain behind `arch="v8"`; `ANetV1.from_state_dict` shape-sniffs v8 vs v9 checkpoints.
+**Known-good checkpoint:** `ANetV1/runs/anet/good.pt` (v8, mannequin recall 0.573) is force-added into git as the v8-lineage fine-tune base; later archs load it only for evaluation. History lesson encoded in it: a "loss problem" that was actually silent architecture drift — always diff a loaded state_dict against expectations before blaming the loss.
 
-**Known-good checkpoint:** `ANetV1/runs/anet/good.pt` (v8, mannequin recall 0.573) is force-added into git as the fine-tune base for the v8 lineage. v9 cannot warm-start from it (different encoder); it still loads for evaluation. History lesson encoded in it: a "loss problem" that was actually silent architecture drift — always diff a loaded state_dict against expectations before blaming the loss.
-
-**Evaluation**: accuracy is never reported (99.9% of cells are background). The decision metric is worst-decile mannequin object-level recall; per-class cell P/R/F1, object recall, and object FP/image are the reported numbers. The go/no-go bar vs YOLO26n is in ARCHITECTURE.md §10. `best.pt` selects on `mannequin_synth + 0.5·tent` and stores the weight-EMA model (D48).
+**Evaluation**: accuracy is never reported (99.9% of cells are background). The decision metric is **worst-decile mannequin object-level recall** (GT-area decile as the proxy); reported numbers are per-class object recall and FP/image, sliced synthetic vs VisDrone (`train/metrics.py` `CenterObjectMetrics`; `CellConfusion`/`ObjectMetrics` for the per-cell lineage). `best.pt` selects on `mannequin_synth + 0.5·tent` (weight-EMA, D48); the two-stage trainer gates that score to −1 above 25 FP/img. The one open v13-family question is the capacity scaling curve (§16.2): where does *train-split* decile recall lift off as the param budget grows?
 
 **Dataset caveats** (`datasets/suas-synth-50k/README.md`): test split is VisDrone-heavy (1,267 vd vs 449 synthetic) — filter `vd_*` filenames for synthetic-only eval. VisDrone frames keep native mixed resolutions (everything is letterboxed to 960×540 by `anet/data/`); synthetic frames are uniformly 1920×1080. VisDrone boxes dominate mannequin counts (both raw classes 0 and 1 remap to mannequin), so the trainer downweights `vd_*` images (`vd_weight`). Instances <25% visible are unlabeled; ~9.5% of synthetic frames are deliberately background-only. Underscore-prefixed dirs in `gen-assets/` (`_rejected/`, `_removed/`, `_oblique/`) are excluded staging pools, not usable assets.

@@ -557,6 +557,95 @@ def v20_checks():
     print("  v20 checks passed")
 
 
+def v22_checks():
+    """v22 (D72-D75): peak-augmented full-rank funnel growth — budget, the
+    FULL identity contract (every donor tensor lands, step 0 == v13_best
+    exactly), valve wake-up, bounded-gate safety, sniff order vs v15/v20,
+    slow-LR name, train/eval bg-aux contract."""
+    import torch.nn.functional as F
+    from anet.train.losses import center_focal_loss, offset_l1
+
+    m13 = ANetV1(arch="v13", use_checkpoint=False, prior_fg=0.01)
+    m = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
+    n = sum(p.numel() for p in m.parameters())
+    n_bg = m.backbone.bg_head.weight.numel() + m.backbone.bg_head.bias.numel()
+    print(f"ANetV1 v22 params: {n:,} ({n - n_bg:,} deployed + {n_bg} train-only bg)")
+    assert n < 100_000, "v22 param budget exceeded (pre-registered 100k)"
+    # slow-LR contract: the funnel must carry the spd_proj name (v15 fix)
+    assert any("spd_proj" in k for k, _ in m.named_parameters())
+
+    # THE D72 contract: full-identity growth. Every donor tensor lands
+    # (weights AND DeployNorm buffers — no donor module's input changes at
+    # step 0), and the warm-started v22 IS the donor, exactly.
+    missing, unexpected = m.load_state_dict(m13.state_dict(), strict=False)
+    assert not unexpected, f"donor tensors with nowhere to go: {unexpected}"
+    new_ok = ("backbone.spd_proj.", "backbone.peak_proj.",
+              "backbone.spd_norm.", "backbone.spd_gain", "backbone.bg_head.")
+    assert all(k.startswith(new_ok) for k in missing), missing
+    m13.eval(); m.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        o13, o22 = m13(x), m(x)
+    d = max((o13["heat"] - o22["heat"]).abs().max().item(),
+            (o13["offset"] - o22["offset"]).abs().max().item())
+    print(f"  v22 identity-at-init vs donor v13: max delta {d:.2e}")
+    assert d < 1e-6, "D72 identity contract broken — growth is not a no-op at init"
+    assert "aux_bg" not in m(x), "bg head must be train-only"
+
+    # bounded funnel valve: 2*tanh saturates at |2| — the third-time law
+    # applied to the gain that gates ~68% of all new capacity. Extreme
+    # values must stay finite and cannot shut the donor path down (the
+    # branch is ADDITIVE; down20's contribution is untouched).
+    with torch.no_grad():
+        m.backbone.spd_gain.fill_(-1e6)
+        assert m(x)["heat"].isfinite().all(), "spd valve not collapse-safe"
+        m.backbone.spd_gain.fill_(1e6)
+        assert m(x)["heat"].isfinite().all(), "spd valve not collapse-safe"
+        m.backbone.spd_gain.zero_()
+
+    # valves alive at the exact identity point (product/add rule); the
+    # branch weights behind spd_gain wake one optimizer step later — crack
+    # the gain open (v17 idiom) and assert everything is live.
+    m.train()
+    out, bg = m.backbone(x)
+    heat_t = torch.zeros(2, 2, 27, 48); heat_t[:, 0, 5, 5] = 1.0
+    reg_mask = torch.zeros(2, 1, 27, 48); reg_mask[:, 0, 5, 5] = 1.0
+    loss = center_focal_loss(out[:, 0:2], heat_t) + \
+        offset_l1(out[:, 2:4], torch.zeros(2, 2, 27, 48), reg_mask) + 0.3 * \
+        F.binary_cross_entropy_with_logits(
+            bg.float(), 1.0 - heat_t.max(1, keepdim=True).values)
+    loss.backward()
+    p = dict(m.named_parameters())
+    for k in ("backbone.spd_gain", "backbone.bg_head.weight"):
+        assert p[k].grad is not None and p[k].grad.abs().max() > 0, f"dead valve: {k}"
+    m.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        m.backbone.spd_gain.fill_(0.01)
+    out2 = m(x)
+    l2, l1 = m.reg_losses()
+    (center_focal_loss(out2["heat"], heat_t) + 0.3 *
+     F.binary_cross_entropy_with_logits(
+         out2["aux_bg"].float(),
+         1.0 - heat_t.max(1, keepdim=True).values) + 1e-4 * (l2 + l1)).backward()
+    assert not [k for k, q in m.named_parameters() if q.grad is None], \
+        "v22 params without grad after valve crack"
+    assert p["backbone.spd_proj.weight"].grad.abs().max() > 0, "funnel not live"
+    assert p["backbone.peak_proj.weight"].grad.abs().max() > 0, "peak path not live"
+    m.zero_grad(set_to_none=True)
+
+    # from-scratch cold start stays finite/near-prior (Kaiming + DN seeding)
+    ms = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
+    ms.train()
+    o, _ = ms.backbone(x)
+    assert o.abs().max() < 50, "v22 cold-start activations blew up"
+
+    # roundtrip must sniff v22 (not v15 — both carry a spd_proj tensor)
+    r = ANetV1.from_state_dict(m.state_dict())
+    assert r.arch == "v22" and r.backbone.channels == (16, 32, 64)
+    assert sum(q.numel() for q in r.parameters()) == n
+    print("  v22 checks passed")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -576,6 +665,7 @@ def main():
     v18_checks()
     v19_checks()
     v20_checks()
+    v22_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

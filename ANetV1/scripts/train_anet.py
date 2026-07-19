@@ -127,8 +127,11 @@ cfg = anet_cfg(
     # more than v13's largest 4k-param layer ever did — measured on both
     # tiers: violent recall/fp oscillation from epoch 1 (fp/img 572 -> 5 ->
     # 632 -> 1766 on tier-S). Same bigger-model/lower-LR law as everywhere.
+    # v22 shares the funnel-dominant LR law: spd_proj holds ~68% of its
+    # params, so the v15-measured 7.5e-4 peak + 600 warmup + 0.2x slow
+    # group apply (same oscillation class if run at v13's 1.5e-3).
     lr=float(os.environ["ANET_LR"]) if "ANET_LR" in os.environ
-    else (7.5e-4 if _ARCH == "v15" else 1.5e-3),
+    else (7.5e-4 if _ARCH in ("v15", "v22") else 1.5e-3),
     # prior_fg 0.01 (RetinaNet §4.1 prior), NOT 0.1/0.05. On the 27x48=1296-cell
     # heatmap only ~1-2 cells per class are objects, so a HIGH init prior makes
     # the ~2590 background cells' penalty-reduced-focal gradient sink the head's
@@ -198,6 +201,39 @@ def main():
                   f"{len(unexpected)} donor transition tensors dropped, "
                   f"{len(missing)} new tensors at Kaiming init")
             model = m20
+        elif model.arch == "v13" and cfg.train.arch == "v22":
+            # v22 (D72): the family's first FULL-identity capacity growth —
+            # every donor tensor (weights AND DeployNorm stat buffers) lands
+            # bit-exact; the new funnel branch, peak gates, bias sites and
+            # bg head start at Kaiming/zero behind zero valves, so step 0
+            # IS v13_best (smoke-asserted). Full fine-tune only: freezing
+            # the trunk would strand the fresh funnel between frozen stages
+            # (the measured 16.1 adapter failure mode) — ANET_FREEZE_TRUNK
+            # is refused below.
+            m22 = ANetV1(arch="v22",
+                         use_checkpoint=cfg.train.use_checkpoint,
+                         head_width=cfg.train.head_width,
+                         prior_fg=getattr(cfg.train, "prior_fg", None),
+                         channels=model.backbone.channels,
+                         n_blocks=len(model.backbone.blocks))
+            donor_sd = model.state_dict()
+            missing, unexpected = m22.load_state_dict(donor_sd, strict=False)
+            assert not unexpected, \
+                f"v13->v22 transfer: donor tensors with nowhere to go: {unexpected}"
+            new_ok = ("backbone.spd_proj.", "backbone.peak_proj.",
+                      "backbone.spd_norm.", "backbone.spd_gain",
+                      "backbone.bg_head.")
+            stray = [k for k in missing if not k.startswith(new_ok)]
+            assert not stray, f"v13->v22 transfer: unexpected new tensors: {stray}"
+            if os.environ.get("ANET_FREEZE_TRUNK") == "1":
+                raise SystemExit(
+                    "ANET_FREEZE_TRUNK is not supported for v22: the fresh "
+                    "funnel branch feeds frozen stages whose stats would "
+                    "chase it (the 16.1 failure mode). Full fine-tune only.")
+            print(f"v13 -> v22 full-identity growth: {len(donor_sd)} donor "
+                  f"tensors land bit-exact, {len(missing)} new tensors at "
+                  "Kaiming/zero (step 0 == donor; asserted in smoke_test)")
+            model = m22
         elif model.arch == "v13" and cfg.train.arch in ("v14", "v16", "v17", "v18", "v19"):
             # v14/v16 are supersets of v13 by construction (same module names
             # for the shared trunk; every new module identity-init, D63): copy
@@ -261,9 +297,11 @@ def main():
                 "warm-start from a different-arch encoder. Remove init_from "
                 "to train from scratch, or evaluate it with "
                 "scripts/evaluate_all.py instead.")
-        # gentle warm start unless the caller explicitly asked for more
+        # gentle warm start unless the caller explicitly asked for more.
+        # v22 keeps the funnel-family 600-step ramp even on warm start: the
+        # branch is fresh and holds ~68% of all params (the v15 lesson).
         if "ANET_WARMUP" not in os.environ:
-            cfg.train.warmup_steps = 100
+            cfg.train.warmup_steps = 600 if cfg.train.arch == "v22" else 100
         if "ANET_LR" not in os.environ:
             cfg.train.lr = min(cfg.train.lr, 1.5e-3)
         print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, "
@@ -331,8 +369,11 @@ def main():
     # the historic <40k budget stands for the deploy-track archs; v15 is the
     # pre-registered budget relaxation for the D65 capacity curve (section
     # 16.3, sanctioned by 16.2's measured underfit). ANET_PARAM_BUDGET pins it.
+    # v22's 100k is the pre-registered D65-curve relaxation (§16.2 sanctions
+    # capacity; v22 sits at the tier-S point + peak/bias additions).
     budget = int(os.environ.get("ANET_PARAM_BUDGET",
-                                300_000 if cfg.train.arch == "v15" else 40_000))
+                                {"v15": 300_000, "v22": 100_000}.get(
+                                    cfg.train.arch, 40_000)))
     assert n_params < budget, \
         f"param budget exceeded: {n_params:,} >= {budget:,} (ANET_PARAM_BUDGET overrides)"
     Trainer(model, train_ds, val_ds, cfg).train()
