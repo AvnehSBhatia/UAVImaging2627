@@ -50,7 +50,7 @@ class _Heartbeat:
         if self._th is not None:
             self._th.join(timeout=0.2)
 
-from ..model.norm import apply_norm_updates
+from ..model.norm import DeployNorm, apply_norm_updates
 from .losses import (balanced_tversky_loss, center_focal_loss, distill_kl,
                      focal_loss, focal_norm_loss, focal_tversky_loss,
                      offset_l1, proto_metric_loss, tversky_loss,
@@ -59,23 +59,49 @@ from .metrics import CellConfusion, CenterObjectMetrics, ObjectMetrics, confiden
 
 
 class ModelEMA:
-    """EMA of the PARAMETERS, evaluated and checkpointed instead of the raw
-    weights (v9, D48): the object-recall selection metric is noisy epoch to
-    epoch, and averaging removes the last-steps jitter from what gets flown.
+    """EMA of the parameters AND the DeployNorm running stats, evaluated and
+    checkpointed instead of the raw weights (v9 D48, amended §17.5).
 
-    Parameters only, deliberately: DeployNorm's running buffers are already
-    EMAs of data statistics — shadowing them from before stat-seeding and
-    re-smoothing at decay 0.998 (~100x slower) would make every early-epoch
-    eval normalize against stale garbage. The live buffers are used as-is.
+    D48 originally shadowed parameters only: "DeployNorm's running buffers
+    are already EMAs of data statistics" and re-smoothing them looked both
+    redundant and cold-start-hazardous. That reasoning holds ONLY when the
+    activation distribution is stationary. The v22 runs falsified it for
+    growth regimes (§17.5, 2026-07-19): the live buffers track the RAW
+    weights' current distribution at momentum 0.05 (fast), while the eval'd
+    weights lag ~1/(1-decay)=500 opt steps (~3.6 epochs) behind — so every
+    eval/checkpoint paired old weights with new-distribution stats, an
+    internally inconsistent hybrid that drifts further apart the faster the
+    function moves (measured: smooth both-class val erosion while train loss
+    fell, at two LRs, while no-EMA local gates improved cleanly). Shadowing
+    running_mean/running_var at the SAME decay+debias ramp puts weights and
+    stats in the same effective time window. The cold-start objection is
+    answered by the ramp itself (shadow ~= live for the first ~10 updates)
+    plus reset_buffers() after the trainer's stat seeding. Stationary
+    regimes are first-order unaffected (shadow converges to the live EMA).
+    ANET_EMA_BUFFERS=0 / cfg ema_norm_buffers=False restores the pre-v22
+    parameters-only behavior.
+
     A warmup ramp (timm-style) debiases the cold start so epoch-0 eval isn't
     ~20-50% random-init weights."""
 
-    def __init__(self, model, decay=0.998):
+    def __init__(self, model, decay=0.998, norm_buffers=True):
         self.decay = decay
         self.updates = 0
         self.shadow = {k: p.detach().clone()
                        for k, p in model.named_parameters()}
+        # D48 amendment: shadow DeployNorm running stats at the same horizon
+        # as the parameters ('steps' counters and constant buffers excluded).
+        self._buf_names = [
+            f"{name}.{b}" if name else b
+            for name, mod in model.named_modules()
+            if isinstance(mod, DeployNorm)
+            for b in ("running_mean", "running_var")
+        ] if norm_buffers else []
+        bufs = dict(model.named_buffers())
+        self.shadow_bufs = {k: bufs[k].detach().clone()
+                            for k in self._buf_names}
         self._backup = None
+        self._backup_bufs = None
 
     def _decay_now(self):
         # ramp: ~n/(n+10) early (tracks the live weights), -> decay later
@@ -87,15 +113,25 @@ class ModelEMA:
         d = self._decay_now()
         for k, p in model.named_parameters():
             self.shadow[k].lerp_(p.detach(), 1.0 - d)
+        if self.shadow_bufs:
+            bufs = dict(model.named_buffers())
+            for k in self._buf_names:
+                self.shadow_bufs[k].lerp_(bufs[k].detach(), 1.0 - d)
 
     @torch.no_grad()
     def swap_in(self, model):
-        """Load EMA weights into the model in place (optimizer/compile refs
-        stay valid); swap_out restores."""
+        """Load EMA weights (and shadowed norm stats) into the model in
+        place (optimizer/compile refs stay valid); swap_out restores."""
         self._backup = {}
         for k, p in model.named_parameters():
             self._backup[k] = p.detach().clone()
             p.copy_(self.shadow[k])
+        if self.shadow_bufs:
+            bufs = dict(model.named_buffers())
+            self._backup_bufs = {k: bufs[k].detach().clone()
+                                 for k in self._buf_names}
+            for k in self._buf_names:
+                bufs[k].copy_(self.shadow_bufs[k])
 
     @torch.no_grad()
     def swap_out(self, model):
@@ -103,7 +139,25 @@ class ModelEMA:
             return
         for k, p in model.named_parameters():
             p.copy_(self._backup[k])
+        if self._backup_bufs is not None:
+            bufs = dict(model.named_buffers())
+            for k in self._buf_names:
+                bufs[k].copy_(self._backup_bufs[k])
         self._backup = None
+        self._backup_bufs = None
+
+    @torch.no_grad()
+    def reset_buffers(self, model):
+        """Re-snapshot the buffer shadows from the live model. The trainer
+        calls this after _seed_norm_stats: the EMA is constructed before
+        seeding runs, so its initial buffer shadow predates the seeded
+        values — without the refresh the ramp would spend its first updates
+        walking off pre-seed garbage."""
+        if not self.shadow_bufs:
+            return
+        bufs = dict(model.named_buffers())
+        for k in self._buf_names:
+            self.shadow_bufs[k].copy_(bufs[k].detach())
 
 
 class CudaPrefetcher:
@@ -380,7 +434,10 @@ class Trainer:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.best = -1.0
         decay = getattr(cfg.train, "ema_decay", 0.0) or 0.0
-        self.ema = ModelEMA(self.model, decay) if decay else None
+        self.ema = ModelEMA(
+            self.model, decay,
+            norm_buffers=getattr(cfg.train, "ema_norm_buffers", True),
+        ) if decay else None
 
     # ------------------------------------------------------------- v9 setup
     @torch.no_grad()
@@ -403,6 +460,10 @@ class Trainer:
                 self.model(self._prep_img(
                     batch["image"].to(self.device, non_blocking=True)))
             apply_norm_updates(self.model)  # sequential seeding (pending -> buffers)
+        if self.ema is not None:
+            # the EMA was constructed before seeding — refresh its buffer
+            # shadows so they start from the seeded stats, not init garbage
+            self.ema.reset_buffers(self.model)
 
     def _setup_fused(self):
         """Install the fused Triton Stage-1 with startup parity verification

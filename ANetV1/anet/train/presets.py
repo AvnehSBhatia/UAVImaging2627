@@ -230,6 +230,18 @@ def anet_cfg(**overrides):
         aux_head=(os.environ.get("ANET_AUX", "0").strip().lower() in ("1", "true", "yes")),
         aux_weight=float(os.environ.get("ANET_AUX_W", 0.3)),
         ema_decay=0.998,              # weight EMA for eval/checkpoints (D48); 0=off
+        # D48 amendment (v22 §17.5): shadow DeployNorm running stats in the
+        # EMA at the same decay+debias ramp, so eval/checkpoints pair weights
+        # and stats from the SAME effective time window. Under a non-
+        # stationary function (v22's opening funnel valve) the old params-
+        # only EMA evaluated ~3.6-epoch-lagged weights against live stats
+        # chasing the current distribution — an inconsistent hybrid measured
+        # as smooth both-class val erosion at two LRs while no-EMA gates
+        # improved. Stationary regimes are first-order unaffected.
+        # ANET_EMA_BUFFERS=0 restores the pre-v22 behavior.
+        ema_norm_buffers=(os.environ["ANET_EMA_BUFFERS"].strip().lower()
+                          in ("1", "true", "yes"))
+        if "ANET_EMA_BUFFERS" in os.environ else True,
         # focal_norm (v10) class weights (bg, mannequin, tent). Per-class MEAN
         # normalization now, so weights are pure class-importance (no size-bias
         # compensation needed): mannequin 2x the rare hard class.
