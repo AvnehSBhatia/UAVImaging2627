@@ -27,6 +27,11 @@ datasets/suas-synth-50k/images/
 datasets/suas-synth-50k/labels/
 datasets/suas-synth-50k/previews/
 datasets/suas-synth-50k/**/*.cache
+datasets/suas-hyper-*/images/
+datasets/suas-hyper-*/labels/
+datasets/suas-hyper-*/previews/
+datasets/suas-hyper-*/_run_config.yaml
+datasets/suas-hyper-*/gen_stats.json
 datasets/**/*.zip
 datasets/VisDrone/
 datasets/gen-assets/

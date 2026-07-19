@@ -1,0 +1,91 @@
+# gen_hyper — hyper-accurate single-object + background-only SUAS set
+# Matches the viz_web_scenes stress cases: runway/dry grass, tent in a
+# tree clearing (not covered), mannequin partially occluded by brush.
+#
+# Run from datasetgen-2026/:
+#   ../.venv/bin/python -m gen_hyper.run
+#   ../.venv/bin/python -m gen_hyper.run --smoke
+#   ../.venv/bin/python -m gen_hyper.run --workers 8
+#
+# Then train ANet with:
+#   DATA_ROOT=../datasets/suas-hyper-6k python scripts/train_anet.py
+
+project:
+  seed: 20260719
+  out_dir: /Users/avneh/Code/UAVImaging2627/datasets/suas-hyper-6k
+  asset_root: /Users/avneh/Code/UAVImaging2627/datasets/gen-assets
+  # optional extra nadir JPG/PNG folder (web downloads). Indexed as bucket "web".
+  web_bg_dir: /Users/avneh/Code/UAVImaging2627/datasets/gen-assets/backgrounds/web
+  workers: 8
+
+dataset:
+  n_background: 3000          # empty frames (no labels)
+  n_single: 3000              # exactly one object (mannequin XOR tent)
+  mannequin_fraction: 0.50    # of the single-object half
+  splits: { train: 0.90, val: 0.07, test: 0.03 }
+  image_width: 1920
+  image_height: 1080
+  preview_count: 24
+
+classes: [mannequin, tent]
+
+# Scenario mix for SINGLE-OBJECT frames (bg-only ignores this).
+scenarios:
+  # dry grass / runway / dirt — open placement, light brush on mannequin
+  open_field: 0.35
+  # runway-adjacent dry grass (prefer runway+grass buckets)
+  runway_drygrass: 0.25
+  # tent (or mannequin) in a clearing: vegetation ring around, center clear
+  tree_clearing: 0.20
+  # mannequin forced brush occlusion (tents get light perimeter veg)
+  brush_occlusion: 0.20
+
+scene:
+  background_bucket_weights: { runway: 0.28, grass: 0.36, dirt: 0.18, forest: 0.12, web: 0.06 }
+  sun_elevations: [20, 35, 50, 65]
+  overcast_prob: 0.18
+  shadow_opacity: [0.30, 0.55]
+  altitude_jitter: [0.92, 1.10]
+
+objects:
+  tent_scale_jitter: [0.92, 1.10]
+  min_visibility: 0.35          # stricter than gen2 — hyper-accurate labels
+  min_bbox_px: 12
+  # brush occlusion target coverage of the object alpha (mannequin)
+  brush_cover: [0.25, 0.50]
+  # vegetation ring distance for tree_clearing (meters)
+  clearing_ring_m: [2.5, 6.0]
+  clearing_n_veg: [3, 6]
+
+harmonize:
+  reinhard_strength: [0.55, 0.80]
+  local_context_scale: 2.5
+  blend_weights: { feather: 0.80, feather_wide: 0.15, none: 0.05 }
+  feather_px: [0.8, 2.0]
+  feather_wide_px: [2.5, 4.0]
+
+sensor:
+  tier_weights: { hifi: 0.55, grainy: 0.45 }
+  hifi:
+    jpeg_q: [88, 96]
+    noise_lum_sigma: [0.0, 0.005]
+    motion_blur_px: [0, 1]
+    defocus_px: [0, 0.5]
+    vignette: [0.0, 0.10]
+  grainy:
+    jpeg_q: [55, 88]
+    noise_lum_sigma: [0.006, 0.030]
+    motion_blur_px: [0, 3]
+    defocus_px: [0, 1.2]
+    vignette: [0.04, 0.22]
+    bayer_roundtrip_prob: 0.4
+    chroma_aberration_px: [0.0, 1.2]
+  wb_shift: [0.95, 1.05]
+  exposure_ev: [-0.4, 0.4]
+  unsharp_amount: [0.0, 0.6]
+
+augment:
+  rot90: true
+  hflip_prob: 0.5
+  vflip_prob: 0.0
+  crop_zoom: [1.0, 1.35]

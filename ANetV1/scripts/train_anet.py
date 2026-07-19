@@ -42,7 +42,9 @@ What v9 changes vs v8 (summary; full rationale in the docs):
 Env overrides (all optional): ANET_BATCH, ANET_ACCUM, ANET_LR, ANET_WARMUP,
 ANET_EPOCHS, ANET_COMPILE, ANET_FUSED, ANET_FUSED_BWD, ANET_CACHE,
 ANET_NUM_WORKERS, ANET_PRIOR_FG, ANET_CONF, ANET_INIT_FROM, ANET_PATIENCE,
-ANET_MIN_EP, ANET_LOSS_MODE, DATA_ROOT. ANET_FREEZE_TRUNK=1 (with a v13
+ANET_MIN_EP, ANET_LOSS_MODE, DATA_ROOT. Point DATA_ROOT at
+../datasets/suas-hyper-6k after `python -m gen_hyper.run` for the
+hyper-accurate single-object / bg-only set. ANET_FREEZE_TRUNK=1 (with a v13
 ANET_INIT_FROM): adapter mode — freeze the transferred v13 trunk, train only
 the identity-init v14 modules. ANET_ARCH picks the arch (default v13);
 ANET_CH="stem,mid,top" + ANET_BLOCKS size a v13/v15 capacity tier;
