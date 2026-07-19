@@ -12,10 +12,13 @@
 
 project:
   seed: 20260719
-  out_dir: /Users/avneh/Code/UAVImaging2627/datasets/suas-hyper-6k
-  asset_root: /Users/avneh/Code/UAVImaging2627/datasets/gen-assets
+  # Paths are resolved against the repo root (parent of datasetgen-2026/),
+  # then ASSET_ROOT / GEN_HYPER_OUT env overrides. Absolute Mac paths are
+  # NOT required — Docker/MI300X use /UAVImaging2627/... automatically.
+  out_dir: datasets/suas-hyper-6k
+  asset_root: datasets/gen-assets
   # optional extra nadir JPG/PNG folder (web downloads). Indexed as bucket "web".
-  web_bg_dir: /Users/avneh/Code/UAVImaging2627/datasets/gen-assets/backgrounds/web
+  web_bg_dir: datasets/gen-assets/backgrounds/web
   workers: 8
 
 dataset:

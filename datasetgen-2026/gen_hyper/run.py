@@ -36,13 +36,58 @@ from .compose import attach_web_backgrounds, compose_hyper
 _G: dict = {}
 
 
+def _repo_root() -> Path:
+    """datasetgen-2026/gen_hyper/run.py → repo root (…/UAVImaging2627)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_path(p: str | Path, repo: Path) -> Path:
+    """Absolute paths kept if they exist; else treat as repo-relative."""
+    path = Path(p).expanduser()
+    if path.is_absolute():
+        if path.exists():
+            return path
+        # stale host absolute path (e.g. /Users/… on a Linux box) → remap
+        # onto the same relative suffix under this repo if present
+        parts = path.parts
+        for key in ("datasets", "ANetV1", "datasetgen-2026"):
+            if key in parts:
+                i = parts.index(key)
+                cand = repo.joinpath(*parts[i:])
+                if cand.exists():
+                    return cand
+        return path  # let caller error with a clear message
+    return (repo / path).resolve()
+
+
+def _resolve_project_paths(cfg) -> None:
+    """Mutate cfg._d['project'] paths in-place to host-local absolutes."""
+    import os
+    repo = _repo_root()
+    proj = cfg._d["project"]
+    asset = os.environ.get("ASSET_ROOT", proj.get("asset_root", "datasets/gen-assets"))
+    out = os.environ.get("GEN_HYPER_OUT", proj.get("out_dir", "datasets/suas-hyper-6k"))
+    web = os.environ.get("WEB_BG_DIR", proj.get("web_bg_dir",
+                         "datasets/gen-assets/backgrounds/web"))
+    proj["asset_root"] = str(_resolve_path(asset, repo))
+    proj["out_dir"] = str(_resolve_path(out, repo))
+    # web dir may not exist yet — still resolve so attach is a no-op, not a crash
+    wp = _resolve_path(web, repo)
+    proj["web_bg_dir"] = str(wp)
+
+
 def _init_worker(cfg_path: str):
     cv2.setNumThreads(1)
     cfg = load_config(cfg_path)
+    # worker yaml already has resolved absolute paths from main()
     lib = AssetLibrary(cfg.project.asset_root)
     web = getattr(cfg.project, "web_bg_dir", None)
     if web:
         attach_web_backgrounds(lib, web)
+    if not lib.backgrounds:
+        raise RuntimeError(
+            f"no backgrounds indexed under asset_root={cfg.project.asset_root!r} "
+            f"— set ASSET_ROOT or fix project.asset_root")
     _G["cfg"] = cfg
     _G["lib"] = lib
 
@@ -176,7 +221,10 @@ def main():
 
     cfg_path = str(Path(args.config).resolve())
     cfg = load_config(cfg_path)
-    out_dir = Path(args.out or cfg.project.out_dir)
+    _resolve_project_paths(cfg)
+    out_dir = Path(args.out).resolve() if args.out else Path(cfg.project.out_dir)
+    # keep cfg in sync if --out overrides
+    cfg._d["project"]["out_dir"] = str(out_dir)
     workers = int(args.workers or cfg.project.workers)
 
     if args.smoke:
@@ -185,25 +233,47 @@ def main():
         cfg._d["dataset"]["n_single"] = 4
         cfg._d["dataset"]["mannequin_fraction"] = 0.5
         out_dir = out_dir.parent / (out_dir.name + "-smoke")
+        cfg._d["project"]["out_dir"] = str(out_dir)
         workers = min(workers, 2)
 
+    asset_root = Path(cfg.project.asset_root)
+    if not asset_root.is_dir():
+        raise SystemExit(
+            f"asset_root does not exist: {asset_root}\n"
+            f"  repo_root={_repo_root()}\n"
+            f"  set ASSET_ROOT=/path/to/gen-assets or mount datasets/gen-assets")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # dump resolved paths early so preview / workers never see host-specific YAML
+    worker_cfg = out_dir / "_run_config.yaml"
+    import yaml
+    yaml.safe_dump(cfg._d, worker_cfg.open("w"))
+
     if args.preview_only:
-        render_previews(cfg_path, out_dir, int(cfg.dataset.preview_count))
+        render_previews(str(worker_cfg), out_dir, int(cfg.dataset.preview_count))
         print(f"previews → {out_dir / 'previews'}")
         return
 
     plan = _plan(cfg)
     print(f"gen_hyper → {out_dir}")
+    print(f"  asset_root={asset_root}")
+    print(f"  web_bg_dir={cfg.project.web_bg_dir}")
     print(f"  plan: {sum(1 for _, m, _ in plan if m == 'bg')} bg + "
           f"{sum(1 for _, m, _ in plan if m == 'single')} single "
           f"(workers={workers})")
-    lib = AssetLibrary(cfg.project.asset_root)
-    attach_web_backgrounds(lib, getattr(cfg.project, "web_bg_dir", ""))
+    lib = AssetLibrary(str(asset_root))
+    attach_web_backgrounds(lib, cfg.project.web_bg_dir)
     print(lib.summary())
+    usable = {k: v for k, v in lib.backgrounds.items() if not k.startswith("_")}
+    n_bg = sum(len(v) for v in usable.values())
+    print(f"  usable background buckets: {list(usable)} ({n_bg} files)")
     if "web" in lib.backgrounds:
         print(f"  web backgrounds: {len(lib.backgrounds['web'])}")
+    if n_bg == 0:
+        raise SystemExit(
+            "no usable backgrounds indexed — check ASSET_ROOT "
+            "(need backgrounds/{runway,grass,forest,dirt}/*.jpg)")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     write_data_yaml(out_dir, list(cfg._d["classes"]))
     write_readme(out_dir, cfg)
 
@@ -211,12 +281,6 @@ def main():
     t0 = time.time()
     done = skipped = demoted = 0
     stats = {"scenario": {}, "cls": {}, "bucket": {}}
-
-    # re-dump cfg to a resolved path workers can read; for smoke we need the
-    # mutated counts — write a sidecar yaml
-    worker_cfg = out_dir / "_run_config.yaml"
-    import yaml
-    yaml.safe_dump(cfg._d, worker_cfg.open("w"))
 
     with ProcessPoolExecutor(max_workers=workers,
                              initializer=_init_worker,

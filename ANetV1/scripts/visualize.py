@@ -152,6 +152,32 @@ def stages_v13(model, img):
     return x_stem, x_s4, x_blocks, {"heat": out[:, 0:2], "offset": out[:, 2:4]}
 
 
+@torch.no_grad()
+def stages_v22(model, img):
+    """V22Backbone stages including the peak-augmented SPD funnel branch."""
+    import torch.nn.functional as F
+    bb = model.backbone
+    x_stem = bb.act(bb.stem_norm(bb.stem(img)))
+    x_s4 = bb.block4(bb.down4(x_stem))
+    spd = bb.spd_proj(x_s4)
+    peak = bb.peak_proj(F.max_pool2d(x_s4, 5, 5))
+    branch = bb.act(bb.spd_norm(spd + peak))
+    gain = 2.0 * torch.tanh(bb.spd_gain)
+    donor = bb.down20(x_s4)
+    x = donor + gain * branch
+    x_blocks = []
+    for blk in bb.blocks:
+        x = blk(x)
+        x_blocks.append(x)
+    out = bb.head(x)
+    return {
+        "stem": x_stem, "s4": x_s4, "spd": spd, "peak": peak,
+        "branch": branch, "gain": gain, "donor": donor,
+        "blocks": x_blocks,
+        "out": {"heat": out[:, 0:2], "offset": out[:, 2:4]},
+    }
+
+
 def peaks_of(heat_prob, off_prob, thresh=0.3):
     """Per-class peak list [(cls, cx, cy, p)] in canvas-normalized coords —
     the exact CenterObjectMetrics pipeline (3x3 local max + offset dequant)."""
@@ -196,6 +222,41 @@ def overlay_center(base_rgb, gt_boxes, peaks):
     return im
 
 
+def _dump_center_heats(d, base, out, s, extra_lines=None):
+    """Shared heat/offset/overlay dump for center-heatmap archs."""
+    heat_l = out["heat"][0].float().cpu()
+    off_p = torch.sigmoid(out["offset"][0].float()).cpu().numpy()
+    heat_p = torch.sigmoid(heat_l).numpy()
+    for c, name in ((0, "mannequin"), (1, "tent")):
+        heat(heat_l[c], signed=True, size=(CANVAS_W, CANVAS_H)).save(
+            d / f"04_heat_logit_{name}.png")
+        heat(heat_p[c], size=(CANVAS_W, CANVAS_H)).save(
+            d / f"05_heat_prob_{name}.png")
+        prob_overlay(base, heat_p[c], BOX_COLOR[c + 1]).save(
+            d / f"05_heat_prob_{name}_overlay.png")
+    heat(off_p[0], size=(CANVAS_W, CANVAS_H)).save(d / "04_offset_dx.png")
+    heat(off_p[1], size=(CANVAS_W, CANVAS_H)).save(d / "04_offset_dy.png")
+    pks = peaks_of(heat_p, off_p)
+    ov = overlay_center(base, s["boxes"].numpy(), pks)
+    ov.save(d / "06_overlay.png")
+    gt = [b for b in s["boxes"].numpy() if b[0] >= 0]
+    lines = [f"image {s['stem']}"]
+    if extra_lines:
+        lines.extend(extra_lines)
+    for c, name in ((1, "mannequin"), (2, "tent")):
+        boxes_c = [b for b in gt if int(b[0]) + 1 == c]
+        pk_c = [p for p in pks if p[0] == c]
+        found = sum(any(p[0] == c and abs(p[1] - b[1]) <= b[3] / 2
+                        and abs(p[2] - b[2]) <= b[4] / 2 for p in pks)
+                    for b in boxes_c)
+        lines.append(
+            f"{name}: gt={len(boxes_c)} found={found} peaks={len(pk_c)} "
+            f"max_p={max((p[3] for p in pk_c), default=0.0):.3f} "
+            f"max_heat={float(heat_p[c - 1].max()):.3f}")
+    (d / "stats.txt").write_text("\n".join(lines) + "\n")
+    return ov, lines[1:]
+
+
 def dump_v13(model, s, img, d, base):
     """Full per-image stage dump for the conv backbone. Returns (overlay, stats)."""
     x_stem, x_s4, x_blocks, out = stages_v13(model, img)
@@ -204,32 +265,35 @@ def dump_v13(model, s, img, d, base):
     montage(x_s4[0].cpu().numpy(), cols=8, scale=1).save(d / "02_s4_montage.png")
     heat(x_s4[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "02_s4_mag.png")
     for bi, xb in enumerate(x_blocks):
-        heat(xb[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / f"03_s20_block{bi}_mag.png")
+        heat(xb[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(
+            d / f"03_s20_block{bi}_mag.png")
     montage(x_blocks[-1][0].cpu().numpy(), cols=8).save(d / "03_s20_final_montage.png")
-    heat_l = out["heat"][0].float().cpu()
-    off_p = torch.sigmoid(out["offset"][0].float()).cpu().numpy()
-    heat_p = torch.sigmoid(heat_l).numpy()
-    for c, name in ((0, "mannequin"), (1, "tent")):
-        heat(heat_l[c], signed=True, size=(CANVAS_W, CANVAS_H)).save(d / f"04_heat_logit_{name}.png")
-        heat(heat_p[c], size=(CANVAS_W, CANVAS_H)).save(d / f"05_heat_prob_{name}.png")
-        prob_overlay(base, heat_p[c], BOX_COLOR[c + 1]).save(d / f"05_heat_prob_{name}_overlay.png")
-    heat(off_p[0], size=(CANVAS_W, CANVAS_H)).save(d / "04_offset_dx.png")
-    heat(off_p[1], size=(CANVAS_W, CANVAS_H)).save(d / "04_offset_dy.png")
-    pks = peaks_of(heat_p, off_p)
-    ov = overlay_center(base, s["boxes"].numpy(), pks)
-    ov.save(d / "06_overlay.png")
-    gt = [b for b in s["boxes"].numpy() if b[0] >= 0]
-    lines = [f"image {s['stem']}"]
-    for c, name in ((1, "mannequin"), (2, "tent")):
-        boxes_c = [b for b in gt if int(b[0]) + 1 == c]
-        pk_c = [p for p in pks if p[0] == c]
-        found = sum(any(p[0] == c and abs(p[1] - b[1]) <= b[3] / 2
-                        and abs(p[2] - b[2]) <= b[4] / 2 for p in pks) for b in boxes_c)
-        lines.append(f"{name}: gt={len(boxes_c)} found={found} peaks={len(pk_c)} "
-                     f"max_p={max((p[3] for p in pk_c), default=0.0):.3f} "
-                     f"max_heat={float(heat_p[c - 1].max()):.3f}")
-    (d / "stats.txt").write_text("\n".join(lines) + "\n")
-    return ov, lines[1:]
+    return _dump_center_heats(d, base, out, s)
+
+
+def dump_v22(model, s, img, d, base):
+    """v22 stage dump: donor down20 + SPD/peak branch + gain + heats."""
+    st = stages_v22(model, img)
+    montage(st["stem"][0].cpu().numpy(), cols=4, scale=1).save(d / "01_stem_montage.png")
+    heat(st["stem"][0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "01_stem_mag.png")
+    montage(st["s4"][0].cpu().numpy(), cols=8, scale=1).save(d / "02_s4_montage.png")
+    heat(st["s4"][0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "02_s4_mag.png")
+    heat(st["donor"][0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "03_donor_down20_mag.png")
+    heat(st["spd"][0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "03_spd_proj_mag.png")
+    heat(st["peak"][0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "03_peak_proj_mag.png")
+    heat(st["branch"][0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(d / "03_spd_branch_mag.png")
+    g = st["gain"][0, :, 0, 0].detach().cpu().float().numpy()
+    for bi, xb in enumerate(st["blocks"]):
+        heat(xb[0].norm(dim=0), size=(CANVAS_W, CANVAS_H)).save(
+            d / f"03_s20_block{bi}_mag.png")
+    montage(st["blocks"][-1][0].cpu().numpy(), cols=8).save(d / "03_s20_final_montage.png")
+    extra = [
+        f"spd_gain: mean={float(g.mean()):.4f} |g|_mean={float(np.abs(g).mean()):.4f} "
+        f"max|g|={float(np.abs(g).max()):.4f}",
+        f"branch/donor mag ratio="
+        f"{float(st['branch'][0].norm(dim=0).mean() / (st['donor'][0].norm(dim=0).mean() + 1e-6)):.3f}",
+    ]
+    return _dump_center_heats(d, base, st["out"], s, extra_lines=extra)
 
 
 # ---- staged forward (v8/v9) -------------------------------------------------
@@ -281,12 +345,13 @@ def main():
     for rank, i in enumerate(idx):
         s = ds[i]
         img = s["image"].unsqueeze(0).to(device)
-        if model.arch == "v13":
+        if model.arch in ("v13", "v14", "v16", "v17", "v18", "v19", "v22"):
             d = out_root / s["stem"]
             d.mkdir(exist_ok=True)
             base = chw_to_rgb(s["image"])
             base.save(d / "00_input.png")
-            ov, stat_lines = dump_v13(model, s, img, d, base)
+            dump = dump_v22 if model.arch == "v22" else dump_v13
+            ov, stat_lines = dump(model, s, img, d, base)
             overlays.append(ov)
             print(f"[{rank + 1}/{len(idx)}] {s['stem']}  " + " | ".join(stat_lines))
             continue

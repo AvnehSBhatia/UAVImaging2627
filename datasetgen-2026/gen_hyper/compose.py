@@ -177,7 +177,10 @@ def compose_hyper(cfg, lib: AssetLibrary, idx: int, mode: str, cls: str | None):
     raw_w = {k: v for k, v in raw_w.items()
              if k in lib.backgrounds and not k.startswith("_")}
     if not raw_w:
-        raise RuntimeError("no backgrounds indexed — check asset_root")
+        have = sorted(lib.backgrounds)
+        raise RuntimeError(
+            f"no backgrounds indexed — check asset_root={lib.root!r} "
+            f"(have buckets={have}; need runway/grass/dirt/forest and/or web)")
     # scenario bias
     if scenario == "runway_drygrass":
         for k in list(raw_w):
