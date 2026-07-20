@@ -1227,10 +1227,11 @@ Test split, `peak_thresh` 0.3, all keys from the fixed `_decile_keys()`:
 | `v16_adapter_best` | v16 | 27,012 | 0.040 | 0.832 | 0.028 | 0.000 | 0.571 | 12.09 |
 | `v17_best` | v17 | 26,140 | 0.040 | 0.835 | 0.027 | 0.000 | 0.571 | 11.54 |
 | `v18_best` | v17 | 26,140 | 0.040 | 0.835 | 0.027 | 0.000 | 0.571 | 11.54 |
+| `v19_best` | v19 | 27,111 | 0.036 | 0.809 | 0.024 | 0.000 | 0.524 | 12.97 |
 
 The synthetic column reproduces the record exactly (0.837 / 0.643 for v13,
 0.571 for v16 and v17 — §16.6's "third consecutive checkpoint at exactly
-0.571"). **So the ladder verdicts were already being made on the right
+0.571"; 0.809/0.524 for v19, matching §16.7 verbatim). **So the ladder verdicts were already being made on the right
 numbers**: D82 blinded the per-epoch monitoring loop, it did not overturn any
 falsification. v16 and v17 really are worse than v13 at mission geometry, and
 no shelved revision gets rehabilitated. Recorded because the opposite was the
