@@ -15,6 +15,38 @@ from ..data.rasterize import GRID_H, GRID_W, box_footprint_cells
 CLASS_NAMES = ("background", "mannequin", "tent")
 
 
+def _decile_keys(recs):
+    """Worst-GT-area-decile mannequin recall, POOLED and SYNTHETIC-ONLY (D82).
+
+    The pooled key is retained so historical numbers stay comparable, but it
+    must not be read as a mission metric. Measured on the test split:
+
+        mannequin boxes            27,562   of which 98.5% are VisDrone
+        pooled smallest decile      2,756   of which  100% are VisDrone
+        decile area cutoff           13.1 px^2   (a ~3.6x3.6 px blob)
+        median GT area   synthetic 1365.0 px^2 | VisDrone 59.1 px^2
+
+    VisDrone frames are oblique urban street scenes whose person boxes are
+    ~23x smaller than the SUAS mission geometry (mannequins/tents at 150 ft
+    AGL nadir), and both raw VisDrone person classes remap to mannequin, so
+    they outnumber synthetic mannequins ~64:1. The pooled decile therefore
+    selects 3-4 px blobs from the wrong task, and every mechanism from D59 to
+    D81 was tuned against it while being DESIGNED from synthetic failures.
+
+    `..._synthetic` slices the decile within the synthetic distribution
+    (cutoff ~574 px^2, i.e. genuinely small mission objects) and is the key
+    to read for flight decisions.
+    """
+    out = {}
+    for suffix, keep in (("", lambda r: True), ("_synthetic", lambda r: not r[3])):
+        m = sorted((r for r in recs if r[0] == 1 and keep(r)), key=lambda r: r[1])
+        d = m[: max(len(m) // 10, 1)]
+        out[f"mannequin_recall_smallest_decile{suffix}"] = (
+            sum(r[2] for r in d) / len(d) if d else float("nan")
+        )
+    return out
+
+
 def confident_pred(logits, thresh=0.0):
     """argmax, but demote a foreground win to background if its softmax prob
     doesn't clear `thresh` — the eval/deploy false-positive gate. logits (B,3,H,W).
@@ -113,11 +145,7 @@ class ObjectMetrics:
             out[f"mannequin_recall_{name}"] = (
                 sum(r[2] for r in sub) / len(sub) if sub else float("nan")
             )
-        m = sorted((r for r in recs if r[0] == 1), key=lambda r: r[1])
-        decile = m[: max(len(m) // 10, 1)]
-        out["mannequin_recall_smallest_decile"] = (
-            sum(r[2] for r in decile) / len(decile) if decile else float("nan")
-        )
+        out.update(_decile_keys(recs))
         return out
 
 
@@ -241,11 +269,7 @@ class CenterObjectMetrics:
             out[f"mannequin_recall_{name}"] = (
                 sum(r[2] for r in sub) / len(sub) if sub else float("nan")
             )
-        m = sorted((r for r in recs if r[0] == 1), key=lambda r: r[1])
-        decile = m[: max(len(m) // 10, 1)]
-        out["mannequin_recall_smallest_decile"] = (
-            sum(r[2] for r in decile) / len(decile) if decile else float("nan")
-        )
+        out.update(_decile_keys(recs))
         # v23/D76: the margin the cases exposed (see __init__). Negative =
         # background outscores the objects themselves — the measured v13/v22
         # disease, invisible to every other key in this dict.

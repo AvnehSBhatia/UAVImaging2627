@@ -198,6 +198,9 @@ def main():
 
     keys = ["mannequin_recall", "tent_recall", "fp_per_image",
             "mannequin_recall_synthetic", "mannequin_recall_visdrone",
+            # D82: the pooled decile is 100% VisDrone at <=13.1 px^2 — read the
+            # _synthetic one for anything mission-related.
+            "mannequin_recall_smallest_decile_synthetic",
             "mannequin_recall_smallest_decile",
             "mannequin_cell_precision", "mannequin_cell_recall", "mannequin_cell_f1",
             "tent_cell_precision", "tent_cell_recall", "tent_cell_f1"]

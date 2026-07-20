@@ -1033,3 +1033,163 @@ Three candidate fixes were measured locally against the D80 tail metric (fractio
 **Chroma (D81).** A person's clothing/skin being chromatically unlike terrain is intuitive and was never measured — D67's autopsy found the colour machinery "unused," but that was a gate on a frozen trunk. Measured as raw separability, chroma deviation is **1.9× worse** than luminance structure on the tail. D67's autopsy result is thus confirmed at the source: colour genuinely carries less mannequin signal than luminance structure here, and its earlier disuse was not an artifact of the gate.
 
 **Standing verdict.** The tail sits at ~0.20 (~1,000 background cells per frame out-score a typical mannequin) and needs ~1e-5 for ~1 fp/frame — four orders of magnitude, unmoved by any of structure, spatial aggregation, or colour, i.e. by the three things an appearance-based detector at this capacity can do. Combined with §16.2 (underfit at 25k), §17.5 (capacity growth eroded), and §18.3–18.4 (the feature premise is directionally right at AUC 0.80 yet buys no margin), the honest conclusion is that **a 49×13px mannequin in cluttered terrain does not, at ≤40k single-frame appearance capacity, produce evidence exceeding the top ~0.02% of background clutter.** Every remaining lever breaks one of the two stated constraints: much finer resolution / much greater capacity (breaks ≤40k), or multi-frame temporal evidence (breaks the single-frame dataset). This is the pre-authorized negative result, now quantified three independent ways, and it is the strongest research output of the v23 line — a governing law (D80) plus the measurements that close the appearance-feature branch of the search.
+
+---
+
+## 19. The metric was measuring the wrong task (v24 investigation, D82–D84)
+
+Triggered by an owner directive to abandon the v23 line and rebuild around a
+JEPA-style predictive architecture ("a cell predicts the cells around it, and
+world state embeddings"). Measuring that proposal's premise required slicing
+the eval by object geometry — and the slice invalidated the premise of §18
+itself. **This section corrects §18.5.**
+
+### 19.1 D82 — the decision metric is 100% VisDrone at ≤13.1 px²
+
+`mannequin_recall_smallest_decile` — named in CLAUDE.md as *the* decision
+metric and the key every verdict from D59 to D81 was read off — pools GT
+boxes across both sources before taking the smallest 10% by area. Measured on
+the test split:
+
+| | count | share |
+|---|---|---|
+| mannequin GT boxes | 27,562 | — |
+| …VisDrone | 27,139 | **98.5%** |
+| pooled smallest decile | 2,756 | of which VisDrone: **100.0%** |
+
+| | median GT area | p10 area |
+|---|---|---|
+| synthetic (mission geometry) | 1365.0 px² | 574.2 px² |
+| VisDrone | 59.1 px² | — |
+| **pooled decile cutoff** | — | **13.1 px²** |
+
+13.1 px² is a ~3.6×3.6 px blob. VisDrone frames are oblique urban street
+scenes at ~23× smaller object scale than SUAS mission geometry (mannequins
+and tents at 150 ft AGL nadir), both raw VisDrone person classes remap to
+mannequin, and they outnumber synthetic mannequins 64:1. So the family's
+decision metric selects sub-4-pixel pedestrians from a different task —
+while every mechanism D59–D81 was *designed* from synthetic failure cases.
+Unsliced `mannequin_recall` is likewise 98.5% VisDrone-weighted.
+
+The same pooling drives the per-epoch trainer print and `evaluate_all.py`.
+(`best.pt` selection is unaffected: it keys on `mannequin_synth + 0.5·tent`,
+which is already synthetic-only. `benchmark_paper.py` already computed a
+`..._synthetic` decile, so paper-bench numbers are sound.)
+
+**Fix (shipped):** `metrics._decile_keys()` emits both keys from one place;
+`mannequin_recall_smallest_decile_synthetic` (cutoff ~574 px², genuinely
+small mission objects) is the key to read for flight decisions. The pooled
+key is retained so historical numbers stay comparable, with the caveat in
+its docstring.
+
+### 19.2 D83 — v13's learned features beat §18.5's hand-rolled ones ~1000× on the tail; §18.5 is withdrawn
+
+§18.5 concluded that the background tail is "unmoved by structure, spatial
+aggregation, or colour… four orders of magnitude short," and declared the
+≤40k appearance branch closed. **Every number behind that verdict was
+measured on hand-rolled features** (structure-tensor coherence, chroma) — not
+on what the trained model actually computes. Re-measured on `v13_best`'s own
+head, synthetic val, mission geometry, identical rank-based statistic
+(fraction of background cells out-scoring the median mannequin; negatives
+uniform-random outside a ±3-cell GT exclusion, n=2,121 pos / 240,000 neg):
+
+| feature | tail | bg cells/frame beating the median object |
+|---|---|---|
+| D81 hand-rolled structure | 0.2018 | ~1,046 |
+| D81 chroma | 0.3841 | ~1,991 |
+| **v13 head p, synthetic** | **0.00017** | **~0.2** |
+| v13 head p, synthetic worst decile | 0.00047 | ~0.6 |
+
+That is ~1,200× better than the number the §18.5 verdict rested on. **The
+claim that a mannequin "does not produce evidence exceeding the top ~0.02% of
+background clutter at ≤40k" is false**: v13 already puts it above all but
+~0.017% of background at mission geometry. §18.5's standing verdict is
+withdrawn; D80's *law* (margin is an extreme-value statistic, report the tail
+not the AUC) stands and is reaffirmed — it was the conclusions drawn from
+hand-rolled proxies that were wrong, not the metric.
+
+Method lesson, second occurrence in this line after the §18.3 biased-negative
+incident: **a hand-rolled proxy for a learned feature bounds nothing.** The
+premise probe must run on the model's own representation.
+
+### 19.3 The real defect is sim-to-real object appearance, not the tail
+
+v13 on the 14 preserved 960×540 real web scenes vs synthetic val, same model,
+same threshold (falsifier #5, finally run):
+
+| slice | p at object | bg > 0.30 /frame | bg > 0.50 /frame | bg p99 |
+|---|---|---|---|---|
+| synthetic, frames with objects | 0.570 | 2.64 | 0.39 | 0.146 |
+| synthetic, background-only frames | — | 1.26 | 0.04 | 0.081 |
+| **real web scenes** | **0.482** | **6.8** | **0.7** | **~0.22** |
+
+Objects respond 15% weaker *and* background fires 2.6× more often — degrading
+from both sides, which is what produces the inverted margins that triggered
+§18. The decisive context: **gen2 composites Blender-rendered objects onto
+REAL aerial background photographs** (CLIP-gated OpenAerialMap, 3,053 images
+in `gen-assets/backgrounds/`). The backgrounds are already real. So this is
+not a generic sim-to-real gap — it is specifically **object-appearance**
+generalization, plus the likelihood that Reinhard harmonization and sensor
+sim leave composited objects crisper than their surroundings, giving the
+trunk a sharpness-discontinuity shortcut that real photographs do not carry.
+
+### 19.4 D84 — surround-prediction residuals and world-state conditioning both measure negative
+
+The owner's JEPA proposal, tested as a linear ring→centre predictor on
+`v13_best`'s s20 embeddings (5×5 ring minus inner 3×3, ridge-fit on disjoint
+frames), scored by the D80 tail statistic. `probe(z)` — the same LDA readout
+on the *raw* embedding — is the control that decides it: if the residual does
+not beat it, prediction adds nothing v13's features did not already hold.
+2,000 synthetic train frames, 2,121 positives, 240,000 negatives, 213
+worst-decile positives, bootstrap 95% CIs:
+
+| score | tail (all pos) | 95% CI | tail (worst decile) | 95% CI |
+|---|---|---|---|---|
+| v13 head p (reference) | 0.00017 | [0.00009, 0.00026] | 0.00047 | [0.00030, 0.00125] |
+| **probe(z) — CONTROL** | **0.00084** | [0.00059, 0.00106] | **0.00273** | [0.00107, 0.00435] |
+| probe(r) global — JEPA | 0.00146 | [0.00112, 0.00172] | 0.00202 | [0.00097, 0.00371] |
+| probe(r) **per-frame** — world-state ceiling | 0.00332 | [0.00257, 0.00477] | 0.00265 | [0.00102, 0.00565] |
+| probe([z, r]) | 0.00077 | [0.00055, 0.00106] | 0.00245 | [0.00113, 0.00377] |
+
+- **The residual is 1.7× worse than the raw embedding** on all positives, CIs
+  disjoint. On the worst decile the CIs overlap almost entirely — an earlier
+  n=26 pass showed a 2.2× "win" there that **vanished at n=213**, i.e. it was
+  small-sample noise. Recorded because it was nearly acted on.
+- **World-state conditioning is measured at its ceiling and is worse still.**
+  A *per-frame refit* predictor knows that frame's own background statistics
+  exactly — strictly better than any learned global vector can be — and it is
+  4× worse than the control (CIs disjoint). This is the fourth independent
+  negative for global state in this family, after D31 (head collapsed to a
+  per-frame constant, 0/3,443 mannequin cells), D68 (GAP latent, explicitly
+  "JEPA-style," falsified on its pre-registered axis) and D69-C (fp 2.450).
+- Concatenating residual with embedding is indistinguishable from the
+  embedding alone: the residual is a *lossy linear function of the same
+  ring*, so it adds no information — it only discards.
+
+**Verdict: the JEPA residual as a deploy-time feature, and world-state
+embeddings as conditioning, are both falsified before implementation.** The
+mechanism was not built.
+
+**What survives of the idea.** Prediction as a *training signal* is untested
+and sits in the one category with a positive track record — D69's law
+("bias recalibration and training signals are the only measured positives;
+every additional input/feature-manipulation mechanism has measured zero or
+negative"), and D68's background-model aux head produced fp/img 1.722, the
+family record, −36% vs its matched control. A predict-the-surround objective
+trained on the 3,053 **raw, un-harmonized** real background photos would
+force the trunk to treat real-photograph high-frequency statistics as normal
+background — attacking the D19.3 shortcut directly — with the predictor
+train-only and dropped at export (D46/D68 precedent), so the deploy graph,
+the ≤40k budget and Hailo legality are all untouched by construction.
+
+### 19.5 What this licenses next
+
+1. **Re-read the ladder on the corrected metric before building anything.**
+   Eight revisions were judged on a key that is 100% VisDrone; a mechanism
+   called falsified may simply have been scored on the wrong task.
+2. The measured defect is object-appearance generalization (D19.3), which is
+   a **dataset/compositing** problem before it is an architecture problem.
+   Matching object and background noise/blur/JPEG statistics in gen2 is the
+   most direct attack and costs no parameters.
+3. Any new premise probe runs on the model's own representation, on the
+   synthetic (mission-geometry) slice, with CIs (D83 method lesson).
