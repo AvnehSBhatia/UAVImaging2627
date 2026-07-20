@@ -1071,10 +1071,33 @@ decision metric selects sub-4-pixel pedestrians from a different task —
 while every mechanism D59–D81 was *designed* from synthetic failure cases.
 Unsliced `mannequin_recall` is likewise 98.5% VisDrone-weighted.
 
-The same pooling drives the per-epoch trainer print and `evaluate_all.py`.
-(`best.pt` selection is unaffected: it keys on `mannequin_synth + 0.5·tent`,
-which is already synthetic-only. `benchmark_paper.py` already computed a
-`..._synthetic` decile, so paper-bench numbers are sound.)
+**How bad, and how bad it is *not* — measured, because the first draft of
+this section overclaimed.** Re-scoring `v13_best` on the test split:
+
+| key | v13_best | matches the record? |
+|---|---|---|
+| `mannequin_recall_synthetic` | 0.837 | yes — CONDITIONS.md "synth mann 0.837" |
+| `..._smallest_decile_synthetic` | **0.643** | yes — CONDITIONS.md "v13 0.643" |
+| `..._smallest_decile` (pooled) | **0.000** | — |
+| `mannequin_recall` (pooled) | 0.041 | — |
+| `fp_per_image` (pooled) | 11.98 | consistent with "fp/img pooled 10.75" |
+
+So the blast radius is narrower than "every D59–D81 verdict," and precisely
+this: **the pooled decile is 0.000 for the best model in the family.** It is
+not a noisy metric, it is an *empty* one — no revision can ever move it,
+because 3.6×3.6 px pedestrians are not detectable at this input resolution by
+anything. That key is what `CenterObjectMetrics.summary()` returns, what the
+trainer prints per epoch, and what `evaluate_all.py` tabulates — so per-epoch
+monitoring and every `evaluate_all` comparison were reading a constant zero.
+
+What was **not** damaged: `best.pt` selection keys on
+`mannequin_synth + 0.5·tent` (already synthetic-only), and
+`benchmark_paper.py` already computed a `..._synthetic` decile — which is
+where the §10 flight-decision numbers (v13 0.643 vs YOLO26n 0.857) came from.
+Those are sound. The failure was that CLAUDE.md and the working loop named
+the pooled key as "the decision metric" while the real decisions were quietly
+made on the synthetic one, so the day-to-day signal used to steer eight
+revisions was a constant while the audited numbers were fine.
 
 **Fix (shipped):** `metrics._decile_keys()` emits both keys from one place;
 `mannequin_recall_smallest_decile_synthetic` (cutoff ~574 px², genuinely
@@ -1193,3 +1216,31 @@ the ≤40k budget and Hailo legality are all untouched by construction.
    most direct attack and costs no parameters.
 3. Any new premise probe runs on the model's own representation, on the
    synthetic (mission-geometry) slice, with CIs (D83 method lesson).
+
+### 19.6 Re-reading the ladder on the corrected metric — no revision is rehabilitated
+
+Test split, `peak_thresh` 0.3, all keys from the fixed `_decile_keys()`:
+
+| ckpt | arch | params | mann (pooled) | **synth** | vd | dec (pooled) | **dec (SYNTH)** | fp/img (pooled) |
+|---|---|---|---|---|---|---|---|---|
+| `v13_best` | v13 | 25,212 | 0.041 | **0.837** | 0.029 | **0.000** | **0.643** | 11.98 |
+| `v16_adapter_best` | v16 | 27,012 | 0.040 | 0.832 | 0.028 | 0.000 | 0.571 | 12.09 |
+| `v17_best` | v17 | 26,140 | 0.040 | 0.835 | 0.027 | 0.000 | 0.571 | 11.54 |
+| `v18_best` | v17 | 26,140 | 0.040 | 0.835 | 0.027 | 0.000 | 0.571 | 11.54 |
+
+The synthetic column reproduces the record exactly (0.837 / 0.643 for v13,
+0.571 for v16 and v17 — §16.6's "third consecutive checkpoint at exactly
+0.571"). **So the ladder verdicts were already being made on the right
+numbers**: D82 blinded the per-epoch monitoring loop, it did not overturn any
+falsification. v16 and v17 really are worse than v13 at mission geometry, and
+no shelved revision gets rehabilitated. Recorded because the opposite was the
+motivating hypothesis for running this table.
+
+**Checkpoint-hygiene defect found in passing:** `v18_best.pt` and
+`v17_best.pt` are **byte-identical** (md5 `27d8239f…`, same 138,863 bytes,
+same mtime), and `v18_best.pt` shape-sniffs as v17. The v18 run overwrote or
+copied the v17 artifact, so **the checkpoint behind D68's family fp record
+(1.722) does not exist on disk** and that result cannot currently be
+reproduced or re-scored. Since D68 is the single strongest positive in the
+family and the basis for the surviving "prediction as a training signal"
+direction (§19.4), re-running it is a prerequisite to building on it.
