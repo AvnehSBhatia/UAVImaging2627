@@ -990,3 +990,29 @@ Two compounding causes: (a) at stride-20 a 49×13px person is a **1–2 cell poi
 2. **The frozen 16-channel stem starves the branch** (the design's own pre-registered risk #1): 7,932 params must build a person detector from features trained for v13's objective, against a donor whose 0.795 came from a 25k trunk adapting end-to-end. Pre-registered fallback: unfreeze **stem+down4 only**, keeping every tent-critical downstream layer frozen with stats pinned per D39/§16.1.
 
 **Pre-registered next runs** (one variable each, D69 law): **run-2a** `ANET_POS_W=8` — if soft-p and recall climb, the imbalance was the binding constraint and the mechanism is vindicated. **run-2b** (only if 2a is insufficient) unfreeze stem+down4. Still unmeasured and required before any verdict: worst-decile recall on `best.pt` (falsifier #2, ≥+0.03 over the 0.586–0.643 band), the peak-thresh sweep (falsifier #3), the mechanism autopsy, and — the falsifier that motivated the whole redesign — **falsifier #5: does the anisotropy map visibly separate person from paint/canopy on the 14 preserved `viz_web_scenes` inputs?** A metric win with no qualitative separation would mean the movement came from elsewhere.
+
+### 18.4 Run-2a + the tail measurement — why margin is the wrong thing to optimize with features (D80)
+
+**Run-2a (`ANET_POS_W=8`, early-stop ep31).** Mannequin recall **0.687 → 0.761** (soft-p 0.354 → 0.383) — so hypothesis 1 was real, positives *were* being outvoted 4× harder at s10. But the margin went **+0.012 → −0.037** (back negative) and fp/img **2.05 → 3.89**. Tent stayed byte-constant (0.949/+0.380) for a second run. Verdict: **pos_weight is a recall lever, not a margin lever** — it lifts foreground everywhere, background included. Runs 1 and 2a are two points on ONE operating curve, and v23 has ≈zero margin at either.
+
+**Falsifier #5, measured locally with no checkpoint** (the coherence feature is fixed math — only the 4→8→1 MLP is learned, so the raw statistics bound what any downstream head can do). 168 mannequin centres vs background over 140 synthetic val frames:
+
+| | mannequin | background | AUC |
+|---|---|---|---|
+| trace_fine | 0.246 | 0.080 | **0.731** |
+| gap_fine | 0.062 | 0.018 | 0.693 |
+| **D76 fine/coarse gap ratio** | **2.039** | **1.146** | **0.651** |
+| 4-D logistic probe (ceiling for ANY downstream MLP) | | | **0.797** |
+
+**The D76 premise is CONFIRMED directionally** — people genuinely are more fine-coherent-relative-to-coarse than background (2.04 vs 1.15), in the predicted direction, at AUC 0.65–0.80. (Methodological note, recorded because it nearly produced a false verdict: a first pass selected hard negatives *by* `gap_fine` and so reported AUC≈0.005 — an artifact of selecting on the tested variable. Unbiased random negatives give the table above.)
+
+**D80 — the tail law, and why the mechanism still cannot work.** The margin is `GT-centre − max(background)`, i.e. an **extreme-value** statistic, while AUC is a **per-pair** statistic. Measured on the best single feature:
+
+- **10.03%** of background locations exceed the *median* mannequin → **~13,000 locations per frame** out-score a typical person.
+- Even at the 90th-percentile mannequin, 2.8% of background (~3,600 locations/frame) still scores higher.
+
+A detector competes against the **max over ~130,000 background locations per frame**. To reach ~1 fp/frame the background tail must satisfy P(bg > object) ≲ 1e-5; the measured value is 1e-1 — **four orders of magnitude short**. This is why AUC 0.80 buys recall (run-2a) but zero margin, and it retro-explains the entire feature-mechanism ledger: D61 texture gate, D66 weave, D67 PowerBlend and now D76 all improved *average* separability and all failed to move fp/margin, because none of them touches the tail.
+
+**The corollary is the tent result, inverted.** Tents work precisely because a 5×5-cell object requires many adjacent cells to agree, and requiring k-of-k co-activation suppresses the background tail multiplicatively. A mannequin at s20 is 1–2 cells and at s10 is ~5×1.3 — there is not enough spatial extent to buy the needed tail suppression from agreement alone. **So the binding constraint is not feature quality but evidence VOLUME per object**, and no single-cell feature — however clever, at any capacity ≤40k — can close a 4-order-of-magnitude tail gap. This is the legitimate negative result the redesign brief pre-authorized, now quantified rather than asserted.
+
+**What this licenses next** (in order of evidence): (1) mechanisms that aggregate *multiple independent* evidence sources per object, since that is the only measured tail-suppressor in the family (the tent mechanism); (2) an honest write-up of D80 as the family's governing law — "per-pair separability is the wrong objective for a detector; report the background tail" — which is a stronger research contribution than another falsified module; (3) if the ≤40k envelope is ever reopened, the tail argument, not the AUC argument, is what sets the required capacity.
