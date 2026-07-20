@@ -1344,3 +1344,27 @@ Both remedies are now in place, and neither was for runs 1/1b. §17.5 also state
 Warm start verified against the new baseline: v22 initialized from `d85_best.pt` reproduces the donor's output at **max delta 0.00e+00** with every donor tensor landing, so the D63 identity contract holds from the best checkpoint in the family rather than from the pre-augmentation one. Against that baseline the run is a genuine single variable — capacity — with `ANET_BG_W=0` holding D68's bg-aux mechanism out (§17.4 isolation).
 
 **Pre-registered falsifiers.** (1) Val must not erode: any epoch-over-epoch fall in `mannequin_synth` while train loss falls repeats §17.5 and kills the line — capacity is then not the lever regardless of regularization. (2) Beat `d85_best` on `..._smallest_quartile_synthetic` (the powered key), not the decile. (3) Throughput within ~10% of v13. (4) fp/img must not exceed 1.40 at matched recall.
+
+## 21. Capacity pays once the model is regularized (D86)
+
+v22 (78,717 params), warm-started from `d85_best` at exact identity, `ANET_BG_W=0`, augmentation on. Single variable vs the new baseline: capacity.
+
+**Falsifier 1 did not fire.** Train loss falls monotonically 1.30 → 1.16 with validation *improving* throughout — the exact opposite of §17.5 runs 1 and 1b, where both classes collapsed (mannequin → 0.55–0.67, tent 0.952 → 0.64–0.79, and 0.378 at ep21) while train loss fell. Same architecture, same warm-start contract, same optimizer. **The erosion is gone.**
+
+| | v13 + D85 (25,212) | **v22 + D85 (78,717)** |
+|---|---|---|
+| selection score | 1.846 @ ep67 | **1.884 @ ep16** |
+| mannequin recall (synth) | 0.854 | **0.876** |
+| tent recall | 0.973 | **0.975** |
+| fp/img | 1.48 | 1.41 (→ **1.25** at ep25, recall 0.860) |
+| mannequin margin | +0.255 | **+0.281** (→ +0.298 at ep27) |
+
+v22 beat the 25k model's *final* score in **16 epochs** rather than 67, and was still climbing.
+
+**Attribution — honest limit.** §17.5 left two explanations for the erosion: **(A) capacity-overfit** and **(C) EMA-weights vs live-stats mismatch**. This run had *both* remedies in place (D85 augmentation, D48 `ema_norm_buffers`), so it proves the erosion is fixed but **cannot say which fix did it**. (A) is the more economical reading — a 78k model on an unaugmented renderer-consistent distribution overfitting is the textbook case, and the cure arrived exactly when the erosion vanished — but that is inference, not measurement. `ANET_EMA_BUFFERS=0` on an otherwise identical run isolates it. That is science, not model improvement, so it is optional.
+
+**This run was cut short and its number is not v22's ceiling.** Early stop fired at epoch 28 (`patience=12` from the ep16 peak) with the LR still at 5.7e-4 of its 7.5e-4 peak — the 80-epoch cosine had barely begun annealing. The v13+D85 run took most of its late gain *during* annealing (0.827 @ ep41 → 0.854 @ ep67, +2.7pt). v22 never reached that phase, and its last two epochs were climbing back toward the peak (sel 1.876, 1.881) with margin still rising monotonically. **The patience default is mis-set for a metric that moves in the third decimal**: 12 epochs of sub-0.004 noise reads as a plateau.
+
+**What this reopens.** §16.2 concluded the family *underfits* and that data, distillation and further training were therefore all closed. That verdict was measured on an unregularized 25k model inside a single generator's distribution. With regularization present, 3× the parameters now pays — so the scaling curve (D65/§16.3) is live again, and §16.2's corollaries need re-deriving rather than being cited.
+
+**Next run:** the same configuration with the schedule allowed to complete.
