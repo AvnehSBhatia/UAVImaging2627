@@ -1316,3 +1316,31 @@ The margin comparison is exact: same `CenterObjectMetrics` code, same val split,
 Also note what did **not** happen: no erosion. v22 runs 1 and 1b both eroded val while train loss fell (§17.5); here train loss falls monotonically 2.09 → 1.28 with val improving throughout, which is what an under-regularized model looks like once it is regularized.
 
 **Still unverified, and it is the one that matters.** Falsifier 2 (§20.3) tests what D85 is *for* — the real web-scene profile. A synthetic win with an unchanged web-scene profile would mean the gain came from generic regularization rather than from closing the sharpness tell, and the mechanism's stated rationale would be wrong even though its numbers are right. Also pending: a test-split re-score against `v13_best`'s 0.837 / 0.643 (the epoch log is val), and throughput vs the ~1,132 img/s baseline.
+
+### 20.6 The augmentation recipe needs no change — and the capacity question reopens
+
+**The small-object hypothesis is falsified.** §20.5's decile move (−0.071) and falsifier-2 failure both had one candidate explanation: that blur and additive noise destroy the smallest objects outright, making augmentation label noise at exactly the size the mission metric is defined on. Measured directly on 483 synthetic val objects — each component applied in isolation at its shipped strength, response read at GT centres, split at the worst-decile cut (497 px²):
+
+| variant | p @ SMALL | vs clean | p @ rest | vs clean | small/rest |
+|---|---|---|---|---|---|
+| clean (no aug) | 0.475 | 100% | 0.620 | 100% | 0.766 |
+| blur only `s=−0.5` | 0.464 | 98% | 0.609 | 98% | 0.761 |
+| sharpen only `s=+2.0` | 0.499 | **105%** | 0.630 | 102% | 0.792 |
+| noise only `σ=0.03` | 0.467 | 98% | 0.606 | 98% | 0.772 |
+| brightness / contrast / gamma / WB | 0.472–0.477 | 99–100% | 0.608–0.617 | 98–100% | 0.765–0.776 |
+| ALL (shipped) | 0.464 | 98% | 0.602 | 97% | 0.770 |
+
+**No component costs small objects more than large ones** — `small/rest` is flat at 0.76–0.79 across every variant, and the worst single cost is 2%. Sharpening actually *raises* response (105%), consistent with §20.1's finding that real frames are sharper. So the augmentation is not injecting size-dependent label noise, the recipe needs no retuning, and the §20.5 decile move is confirmed a second time — by mechanism, not just by CI — to be the 3-object sampling noise it looked like.
+
+**Metric power shipped.** `_decile_keys()` now emits `..._n` beside every decile (never quote one without it) plus `mannequin_recall_smallest_quartile_synthetic`, ~2.5× the sample, which is the key to compare revisions on. The decile stays as the headline for continuity with the record.
+
+**Why capacity is a live question again.** §16.2 concluded the 25k model *underfits* from a zero train/test gap; §17.5 then measured v22 (78,717 params) **eroding val while train loss fell** — the overfitting signature, which directly contradicts it. Two hypotheses were left open and neither was ever resolved:
+
+- **(A) capacity-overfit** — whose textbook remedy is regularization, and this pipeline had *none at all* until D85. Runs 1 and 1b were 78k-parameter models trained on an unaugmented, renderer-consistent distribution.
+- **(C) EMA-weights vs live-stats mismatch** — fixed by the D48 amendment (`ema_norm_buffers=True`), shipped in §17.5 and **never re-run**.
+
+Both remedies are now in place, and neither was for runs 1/1b. §17.5 also stated the converse in advance: "a grown model that fits train but not val REOPENS data as a lever." So this is not a re-roll of a falsified experiment — it is the first run in which the two live explanations for its failure are both controlled.
+
+Warm start verified against the new baseline: v22 initialized from `d85_best.pt` reproduces the donor's output at **max delta 0.00e+00** with every donor tensor landing, so the D63 identity contract holds from the best checkpoint in the family rather than from the pre-augmentation one. Against that baseline the run is a genuine single variable — capacity — with `ANET_BG_W=0` holding D68's bg-aux mechanism out (§17.4 isolation).
+
+**Pre-registered falsifiers.** (1) Val must not erode: any epoch-over-epoch fall in `mannequin_synth` while train loss falls repeats §17.5 and kills the line — capacity is then not the lever regardless of regularization. (2) Beat `d85_best` on `..._smallest_quartile_synthetic` (the powered key), not the decile. (3) Throughput within ~10% of v13. (4) fp/img must not exceed 1.40 at matched recall.

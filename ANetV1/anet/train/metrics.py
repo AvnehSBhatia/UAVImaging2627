@@ -36,6 +36,19 @@ def _decile_keys(recs):
     `..._synthetic` slices the decile within the synthetic distribution
     (cutoff ~574 px^2, i.e. genuinely small mission objects) and is the key
     to read for flight decisions.
+
+    D85/§20.5 adds a POWER caveat on top of the task caveat. The synthetic
+    decile holds ~42 objects on the test split, so it cannot resolve the
+    differences the family compares: D85 vs v13 differed by 3 objects
+    (-0.071) with a bootstrap 95% CI of [-0.286, +0.143], straddling zero.
+    That also dissolves §16.6's "three consecutive checkpoints at exactly
+    0.571", which was read as ~8/14 structurally immovable objects and is
+    actually small-n quantization.
+
+    So two companions ship alongside: `..._n` (never quote a decile without
+    it) and `..._smallest_quartile_synthetic`, which has ~2.5x the sample and
+    is the key to compare revisions on. The decile stays as the headline
+    because it is what the historical record uses.
     """
     out = {}
     for suffix, keep in (("", lambda r: True), ("_synthetic", lambda r: not r[3])):
@@ -44,6 +57,13 @@ def _decile_keys(recs):
         out[f"mannequin_recall_smallest_decile{suffix}"] = (
             sum(r[2] for r in d) / len(d) if d else float("nan")
         )
+        out[f"mannequin_recall_smallest_decile{suffix}_n"] = len(d)
+    syn = sorted((r for r in recs if r[0] == 1 and not r[3]), key=lambda r: r[1])
+    q = syn[: max(len(syn) // 4, 1)]
+    out["mannequin_recall_smallest_quartile_synthetic"] = (
+        sum(r[2] for r in q) / len(q) if q else float("nan")
+    )
+    out["mannequin_recall_smallest_quartile_synthetic_n"] = len(q)
     return out
 
 
