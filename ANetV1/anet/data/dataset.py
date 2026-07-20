@@ -22,6 +22,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .augment import flip_sample
 from .rasterize import (
     CANVAS_H,
     CANVAS_W,
@@ -50,7 +51,7 @@ class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
                  vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
                  band_lo=None, cache=False, center=False, center_sigma=1.5,
-                 center_grid=None, center_dual=False):
+                 center_grid=None, center_dual=False, flip=(0.0, 0.0)):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
@@ -76,6 +77,14 @@ class SUASCells(Dataset):
         # sigma is doubled to 3.0 to keep the splat the same ~30px on the
         # ground as v13's 1.5 cells at stride-20.
         self.center_dual = center_dual
+        # flip=(p_h, p_v) — train-time mirroring (D85, augment.py). Applied
+        # BEFORE rasterization so heat/offset/grid/band are regenerated from
+        # the flipped boxes and stay exact. Eval loaders leave it at (0,0).
+        # Draws use torch's RNG, not numpy's: DataLoader reseeds torch per
+        # worker per epoch, while numpy's global RNG is NOT reseeded — the
+        # classic pitfall where every worker emits identical augmentation and
+        # every epoch repeats it.
+        self.flip = tuple(flip)
         # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
         # conversion to the consumer (the Trainer does it on-GPU): 4x less
         # pinned-memory + H2D traffic per image and no fp32 convert in the
@@ -213,16 +222,26 @@ class SUASCells(Dataset):
         if self._cache_files is not None:
             mm = self._maps()
             image_u8 = np.array(mm["images"][i])  # copy out of the memmap page
-            grid = torch.from_numpy(np.array(mm["grids"][i])).long()
-            padded = torch.from_numpy(np.array(mm["boxes"][i]))
-            band = (torch.from_numpy(np.array(mm["bands"][i]))
-                    if self.band_lo is not None else None)
+            grid_np = np.array(mm["grids"][i])
+            boxes_np = np.array(mm["boxes"][i])
+            band_np = (np.array(mm["bands"][i])
+                       if self.band_lo is not None else None)
         else:
             s = self._load_raw(i)
             image_u8 = s["image_u8"]
-            grid = torch.from_numpy(s["grid"]).long()
-            padded = torch.from_numpy(s["boxes"])
-            band = torch.from_numpy(s["band"]) if s["band"] is not None else None
+            grid_np, boxes_np, band_np = s["grid"], s["boxes"], s["band"]
+
+        if self.flip[0] or self.flip[1]:
+            # D85: mirror before rasterization so every target below is built
+            # from the flipped boxes rather than patched afterwards.
+            r = torch.rand(2)
+            image_u8, boxes_np, grid_np, band_np = flip_sample(
+                image_u8, boxes_np, grid_np, band_np,
+                do_h=bool(r[0] < self.flip[0]), do_v=bool(r[1] < self.flip[1]))
+
+        grid = torch.from_numpy(grid_np).long()
+        padded = torch.from_numpy(boxes_np)
+        band = torch.from_numpy(band_np) if band_np is not None else None
 
         if self.uint8:
             tensor = torch.from_numpy(image_u8)

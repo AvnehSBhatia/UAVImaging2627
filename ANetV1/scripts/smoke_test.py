@@ -646,6 +646,59 @@ def v22_checks():
     print("  v22 checks passed")
 
 
+def aug_checks(root):
+    """D85 augmentation. The failure mode that matters is SILENT: a flip that
+    mirrors the image but not the targets trains the model against
+    systematically wrong labels and still runs clean, so every check here is
+    about image/target correspondence, not about the augmentation 'working'."""
+    import numpy as np
+
+    from anet.data.augment import photometric
+    from anet.data.dataset import SUASCells
+    from anet.train.presets import anet_cfg
+
+    # -- photometric: shape/range/no-op contracts -------------------------
+    cfg = anet_cfg().data.aug
+    x = torch.rand(4, 3, 64, 96)
+    y = photometric(x, cfg)
+    assert y.shape == x.shape and y.dtype == x.dtype
+    assert float(y.min()) >= 0.0 and float(y.max()) <= 1.0, "aug left [0,1]"
+    assert not torch.allclose(y, x), "aug is a no-op at default strengths"
+    zero = type(cfg)(**{k: (v if k in ("enabled", "noise_p") else 0.0)
+                        for k, v in vars(cfg).items()})
+    assert torch.allclose(photometric(x, zero), x, atol=0), \
+        "every knob at 0 must be EXACTLY identity (single-variable runs, D69)"
+    print("  D85 photometric: range/identity contracts hold")
+
+    if not Path(root).is_dir():
+        print("  D85 flip checks skipped (no dataset)")
+        return
+
+    # -- flips: image and TARGETS must move together ----------------------
+    plain = SUASCells(root, "val", center=True)
+    i = next(k for k in range(len(plain))
+             if (plain[k]["boxes"][:, 0] >= 0).any())
+    a = plain[i]
+    for (ph, pv), axis in (((1.0, 0.0), 2), ((0.0, 1.0), 1)):
+        f = SUASCells(root, "val", center=True, flip=(ph, pv))
+        b = f[i]
+        assert torch.equal(b["image"], torch.flip(a["image"], [axis])), \
+            "flipped image is not the mirror of the original"
+        # heat is rasterized AFTER the flip: it must equal the mirrored heat
+        # (grid axis = image axis - 1, both are (C,H,W) vs (3,H,W))
+        assert torch.allclose(b["heat"], torch.flip(a["heat"], [axis]),
+                              atol=1e-6), "heat target did not follow the flip"
+        assert torch.equal(b["grid"], torch.flip(a["grid"], [axis - 1])), \
+            "v8/v9 grid target did not follow the flip"
+        n0 = int((a["boxes"][:, 0] >= 0).sum())
+        assert int((b["boxes"][:, 0] >= 0).sum()) == n0, "flip dropped boxes"
+    # p=0 must be bit-identical to no flip at all (eval loaders rely on it)
+    off = SUASCells(root, "val", center=True, flip=(0.0, 0.0))[i]
+    assert torch.equal(off["image"], a["image"]) and \
+        torch.allclose(off["heat"], a["heat"], atol=0), "flip=0 is not identity"
+    print("  D85 flips: image/heat/grid/boxes stay in correspondence")
+
+
 def main():
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
@@ -681,6 +734,7 @@ def main():
 
     root = Path(os.environ.get("ANET_DATA_ROOT")
                 or Path(__file__).parents[2] / "datasets/suas-synth-50k")
+    aug_checks(root)
     if root.is_dir():
         from anet.data.dataset import SUASCells
 

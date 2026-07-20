@@ -20,6 +20,18 @@ IS_CUDA = torch.cuda.is_available()
 IS_ROCM = torch.version.hip is not None  # MI300X presents as cuda but is MIOpen
 
 
+def _fenv(name, default):
+    """Float env knob, ANET_* family protocol."""
+    return float(os.environ[name]) if name in os.environ else default
+
+
+def _flag(name, default):
+    """Boolean env knob; accepts 1/true/yes (and their negations)."""
+    if name not in os.environ:
+        return default
+    return os.environ[name].strip().lower() in ("1", "true", "yes")
+
+
 def _cuda_total_gib():
     if IS_CUDA:
         try:
@@ -467,6 +479,28 @@ def anet_cfg(**overrides):
         # (e.g. tight disk); Mac default off (6k samples/epoch hides decode).
         cache=(os.environ["ANET_CACHE"].strip().lower() in ("1", "true", "yes"))
         if "ANET_CACHE" in os.environ else IS_CUDA,
+        # D85 train-time augmentation (anet/data/augment.py). The pipeline had
+        # NONE until §19.3 measured the sim-to-real gap it exists to close.
+        # Every knob is a half-width, so 0 disables that axis EXACTLY and any
+        # component can be isolated for a single-variable run (D69 law).
+        # Defaults are deliberately mild: this is a distribution-widening
+        # measure against a 15%/2.6x effect, not a heavy-aug recipe, and the
+        # 25k trunk already underfits (§16.2) so over-augmenting trades away
+        # capacity it does not have.
+        aug=SimpleNamespace(
+            enabled=_flag("ANET_AUG", True),
+            flip_h=_fenv("ANET_AUG_HFLIP", 0.5),
+            flip_v=_fenv("ANET_AUG_VFLIP", 0.5),
+            # asymmetric on purpose — real frames are 2.54x sharper (augment.py)
+            sharpen_lo=_fenv("ANET_AUG_SHARPEN_LO", -0.5),
+            sharpen_hi=_fenv("ANET_AUG_SHARPEN_HI", 2.0),
+            noise=_fenv("ANET_AUG_NOISE", 0.03),         # sensor floor
+            noise_p=_fenv("ANET_AUG_NOISE_P", 0.5),
+            brightness=_fenv("ANET_AUG_BRIGHT", 0.20),
+            contrast=_fenv("ANET_AUG_CONTRAST", 0.20),
+            gamma=_fenv("ANET_AUG_GAMMA", 0.20),         # log-space half-width
+            channel_gain=_fenv("ANET_AUG_WB", 0.08),     # white balance
+        ),
     )
     distill = dict(teacher_cache="runs/teacher_cache", kl_weight=0.7, temperature=2.0)
     yolo = dict(weights="yolo26n.pt", imgsz=960)  # shared by teacher cache + eval

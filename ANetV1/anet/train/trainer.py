@@ -50,6 +50,7 @@ class _Heartbeat:
         if self._th is not None:
             self._th.join(timeout=0.2)
 
+from ..data.augment import photometric
 from ..model.norm import DeployNorm, apply_norm_updates
 from .losses import (balanced_tversky_loss, center_focal_loss, distill_kl,
                      focal_loss, focal_norm_loss, focal_tversky_loss,
@@ -570,12 +571,19 @@ class Trainer:
         return torch.autocast(self.device.type, self.amp_dtype,
                               enabled=self.amp_dtype is not None)
 
-    @staticmethod
-    def _prep_img(img):
+    def _prep_img(self, img):
         # uint8 loader path (cfg.data.uint8): normalize on-GPU. Inside the
         # compiled region this fuses straight into the stem's first ops.
         if img.dtype == torch.uint8:
             img = img.float() / 255.0
+        # D85 photometric augmentation — the single choke point for every
+        # image the model sees, so gating on model.training covers the train
+        # step, the overfit gate and the DeployNorm seeding passes (which
+        # SHOULD see the augmented distribution, D39) while leaving all three
+        # _evaluate paths clean: each sets model.eval() before calling here.
+        aug = getattr(self.cfg.data, "aug", None)
+        if aug is not None and aug.enabled and self.model.training:
+            img = photometric(img, aug)
         return img
 
     def _loss(self, batch):

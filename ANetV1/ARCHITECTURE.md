@@ -1245,3 +1245,51 @@ copied the v17 artifact, so **the checkpoint behind D68's family fp record
 reproduced or re-scored. Since D68 is the single strongest positive in the
 family and the basis for the surviving "prediction as a training signal"
 direction (§19.4), re-running it is a prerequisite to building on it.
+
+---
+
+## 20. D85 — the pipeline had no augmentation
+
+Found while looking for the mechanism behind §19.3: **`grep -rn "augment\|jitter\|flip\|noise\|blur" anet/data anet/train` returns nothing.** In 85 decisions and 22 architecture revisions, no train-time augmentation of any kind was ever added — no flips, no photometric jitter, no noise, no blur. `SUASCells.__getitem__` returns the letterboxed frame verbatim, and the trainer's only input op is `img.float()/255`.
+
+That single fact explains §19.3 without any appeal to capacity, tails, or features. A 25k-param model trained on renderer-consistent frames with zero augmentation is *free* to key on renderer statistics — absolute sharpness, noise floor, colour balance — because within the training distribution those are constant and therefore free discriminative signal.
+
+**It also re-scopes §16.2.** That section measured a zero train/test generalization gap and concluded "more data cannot help — there is nothing to generalize better." But both splits come from the same generator, so a zero gap between them measures *consistency within one distribution*, not generalization out of it. §16.2's conclusion is sound for synthetic-to-synthetic and says nothing about synthetic-to-real.
+
+### 20.1 The premise, measured before building
+
+High-frequency energy (mean |Laplacian| of luminance), 64 synthetic val frames vs the 14 real web scenes:
+
+| distribution | p05 | median | p95 |
+|---|---|---|---|
+| synthetic RAW | 0.0117 | 0.0389 | 0.0936 |
+| **REAL web scenes** | **0.0748** | **0.0989** | **0.1535** |
+| synthetic + D85 | 0.0190 | 0.0574 | 0.1437 |
+
+**Real frames carry 2.54× the high-frequency energy of synthetic ones**, and only **43%** of real scenes fall inside the raw synthetic p05–p95 band. The tell is real, large, and exactly the shape §19.3 predicted. With D85 the synthetic distribution covers **86%** of real scenes.
+
+This is why the sharpen axis is **asymmetric** (`U(−0.5, +2.0)`, not `U(−a, +a)`): unsharp masking scales high-frequency content by `(1+s)`, so covering a 2.5× gap needs `s ≈ 1.5`, and a symmetric range would spend half its draws making synthetic frames *smoother* than they already are — the wrong direction. Negative `s` is retained so the model cannot learn "sharp = object" in the other direction either.
+
+### 20.2 Design and placement
+
+Train-only, **zero parameters, zero deploy change** — the exported graph, the ≤40k budget and Hailo legality are untouched by construction, and no D63 identity contract is needed because the model does not change. What does change is the distribution DeployNorm's running stats observe, deliberately: the trainer's seeding passes run through the same choke point, so stats start on the augmented distribution (D39).
+
+| piece | where | why there |
+|---|---|---|
+| flips (h, v) | `SUASCells.__getitem__`, **before rasterization** | heat/offset/grid/band are regenerated from the flipped boxes, so targets are exact array reversals — no resampling, no post-hoc patching |
+| photometric | `Trainer._prep_img`, on-GPU | ROCm runs `num_workers=0` (spawn deadlocks on fork'd MIOpen mutexes), so CPU-side augmentation would serialize into the training loop |
+
+`_prep_img` is the single choke point for every image the model sees, so gating on `self.model.training` covers the train step, the overfit gate and the seeding passes while leaving all three `_evaluate` paths clean — each sets `model.eval()` first. Flips are passed only to the train split; val stays un-augmented or every reported number moves for reasons unrelated to the model.
+
+Both flips are valid for nadir imagery: at 150 ft AGL looking straight down there is no gravity-defined "up", and a flipped sun angle is another time of day. The caveat is VisDrone, whose frames are *oblique* — `ANET_AUG_VFLIP=0` isolates that if a run ever needs it.
+
+**Cost:** 1.77 ms/img for the whole photometric block on MPS at batch 16. The first implementation measured **12.46** ms/img — the noise term drew `torch.randn(x.shape)` on CPU and moved it, ~100 MB per call, which dominated everything else; `randn_like` on-device is 7× faster. MI300X is bandwidth-bound on this block and should be far cheaper still, but that is an estimate — **the run script prints throughput and it must be checked against the ~1,132 img/s v13 baseline**, per the family's throughput-falsifier protocol.
+
+**Every knob is a half-width or an explicit range, so 0 disables that axis exactly** — smoke asserts bit-exact identity with all knobs zeroed, which keeps single-variable component runs available (D69 law).
+
+### 20.3 Falsifiers
+
+1. **Synthetic recall must not regress** — augmentation trades capacity, and §16.2 says the 25k trunk already underfits. `mannequin_recall_synthetic` below ~0.80 (donor 0.837) means the strengths are too high; back off `ANET_AUG_SHARPEN_HI` first.
+2. **The real-scene gap must close** — rerun `webscene_check`: object p should rise from 0.482 toward the synthetic 0.570 and `bg>0.30/frame` fall from 6.8 toward 2.64. This is the only falsifier that tests what D85 is *for*; a synthetic-metric win with an unchanged web-scene profile means the gain came from generic regularization, not from closing the tell.
+3. **Throughput within ~10% of v13** (family protocol).
+4. **Worst-decile synthetic** (`..._smallest_decile_synthetic`, D82) must not regress below v13's 0.643.

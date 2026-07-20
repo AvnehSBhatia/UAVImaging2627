@@ -171,7 +171,13 @@ def build_datasets(cfg, teacher_dir=None):
         # tent s20). Rasterized per item at load time -> no cache rebuild.
         center_dual=getattr(cfg.train, "loss_mode", "") == "center_dual",
     )
-    train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
+    # D85: flips are a TRAIN-split-only argument. val must stay un-augmented
+    # or every reported number moves for reasons unrelated to the model.
+    aug = getattr(cfg.data, "aug", None)
+    flip = ((aug.flip_h, aug.flip_v) if aug is not None and aug.enabled
+            else (0.0, 0.0))
+    train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir,
+                      flip=flip, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)
     return train, val
 
