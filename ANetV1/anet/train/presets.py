@@ -68,7 +68,7 @@ def _auto_batch(arch=None):
     budget = _mem_budget_gib()
     if budget is None:
         return 4  # Mac / CPU
-    if arch in ("v13", "v14", "v16", "v17", "v18", "v19", "v22"):
+    if arch in ("v13", "v14", "v16", "v17", "v18", "v19", "v22", "v23"):
         # v16-v19 = v13 + tiny modules; v22's funnel is a FUSED strided conv
         # (no 800-ch pixel_unshuffle materialization), so its activation
         # footprint is v13's + one 64x27x48 branch map — the light class.
@@ -219,6 +219,12 @@ def anet_cfg(**overrides):
         # — a smoother objective the from-scratch head climbs faster. Wired
         # through SUASCells(center_sigma=...) now (the dataset used to hardcode 0.7).
         center_sigma=1.5,
+        # v23 (D76): weight of the tent term in the dual-grid loss. 0.0 in
+        # run 1 — the donor tent head is FROZEN, so the term has no gradient
+        # to receive and is computed only as a drift trip-wire. Raise it only
+        # for a later joint-tune run (which forfeits the tent-safety proof).
+        v23_tent_w=float(os.environ["ANET_V23_TENT_W"])
+        if "ANET_V23_TENT_W" in os.environ else 0.0,
         # aux deep-supervision probe (D46): DROPPED in v10. Measured (single
         # forward+backward decomposition) it contributes 0.02% of the encoder
         # gradient — the hard-loss path dominates ~4000x even when the head is

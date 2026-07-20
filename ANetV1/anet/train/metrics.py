@@ -141,6 +141,16 @@ class CenterObjectMetrics:
         self.records = []  # (cls, area, found, is_vd) — cls: 1=mannequin, 2=tent
         self.fp_components = 0
         self.images = 0
+        # MARGIN (v23/D76): the diagnostic the viz_web_scenes cases exposed
+        # and that recall/fp structurally hide. Per image and class:
+        #   margin = p(heat at the GT object's own center cell)
+        #          - max p(heat) over cells far from every GT of that class
+        # Measured on the trained family: a clear spread-eagle person scored
+        # 0.10 while empty-corner background scored 0.36 — i.e. margin was
+        # NEGATIVE (~-0.23) on the EASIEST case. Read at the GT centre rather
+        # than at a matched peak on purpose: it stays defined when the object
+        # is missed entirely, which is exactly the interesting case.
+        self._margins = {1: [], 2: []}
 
     @staticmethod
     def _to_numpy(x):
@@ -163,23 +173,37 @@ class CenterObjectMetrics:
         mask = (prob > thresh) & (prob >= local_max)
         return np.where(mask)
 
-    def update(self, heat_prob, offset_prob, boxes, is_vd):
-        """heat_prob/offset_prob (2,H,W) sigmoid probs; boxes (N,5)
+    def update(self, heat_prob, offset_prob, boxes, is_vd, cls_ids=(0, 1),
+               count_image=True):
+        """heat_prob/offset_prob (C,H,W) sigmoid probs; boxes (N,5)
         canvas-normalized [cls,cx,cy,w,h], -1 padded. Grid dims are derived
         from the tensors (27x48 for the v12-v21 stride-20 family; 54x96 for a
         stride-10 readout) — peak matching is point-in-box containment on the
-        canvas, so recall/fp stay apples-to-apples across grid resolutions."""
+        canvas, so recall/fp stay apples-to-apples across grid resolutions.
+
+        cls_ids maps heat channel i -> box class cls_ids[i]. The default
+        (0,1) is the single-tensor two-class contract every arch up to v22
+        uses. v23 (D76) reads its classes on DIFFERENT grids, so it calls
+        this once per class — update(mann_heat(1,54,96), ..., cls_ids=(0,))
+        then update(tent_heat(1,27,48), ..., cls_ids=(1,), count_image=False)
+        — both appending into the same records/fp counters, so summary()'s
+        keys stay identical and the whole v13-v22 ladder stays comparable.
+        count_image=False on the second call keeps fp/img per-frame, not
+        per-(frame,class)."""
         heat_prob = self._to_numpy(heat_prob)
         offset_prob = self._to_numpy(offset_prob)
         grid_h, grid_w = heat_prob.shape[-2:]
-        self.images += 1
-        for c in range(2):  # 0=mannequin, 1=tent
-            rows, cols = self._find_peaks(heat_prob[c], self.peak_thresh)
+        if count_image:
+            self.images += 1
+        for i, c in enumerate(cls_ids):
+            rows, cols = self._find_peaks(heat_prob[i], self.peak_thresh)
             dx = offset_prob[0, rows, cols]
             dy = offset_prob[1, rows, cols]
             cx = (cols + dx) / grid_w
             cy = (rows + dy) / grid_h
             matched = np.zeros(len(rows), dtype=bool)
+            gt_mask = np.zeros((grid_h, grid_w), bool)  # for the margin below
+            true_scores = []
             for box in boxes:
                 if box[0] < 0 or int(box[0]) != c:
                     continue
@@ -189,7 +213,20 @@ class CenterObjectMetrics:
                 found = bool(inside.any())
                 matched |= inside
                 self.records.append((c + 1, bw * bh, found, bool(is_vd)))
+                # margin bookkeeping: this object's own centre cell, and a
+                # generous exclusion zone so "background" never includes the
+                # object's own splat
+                gr = min(max(int(by * grid_h), 0), grid_h - 1)
+                gc = min(max(int(bx * grid_w), 0), grid_w - 1)
+                true_scores.append(float(heat_prob[i, gr, gc]))
+                r0, r1 = max(gr - 3, 0), min(gr + 4, grid_h)
+                c0, c1 = max(gc - 3, 0), min(gc + 4, grid_w)
+                gt_mask[r0:r1, c0:c1] = True
             self.fp_components += int((~matched).sum())
+            if true_scores and not gt_mask.all():
+                bg_max = float(heat_prob[i][~gt_mask].max())
+                self._margins[c + 1].append(
+                    float(np.mean(true_scores)) - bg_max)
 
     def summary(self):
         out = {"fp_per_image": self.fp_components / max(self.images, 1)}
@@ -209,4 +246,10 @@ class CenterObjectMetrics:
         out["mannequin_recall_smallest_decile"] = (
             sum(r[2] for r in decile) / len(decile) if decile else float("nan")
         )
+        # v23/D76: the margin the cases exposed (see __init__). Negative =
+        # background outscores the objects themselves — the measured v13/v22
+        # disease, invisible to every other key in this dict.
+        for k, name in ((1, "mannequin"), (2, "tent")):
+            v = self._margins[k]
+            out[f"{name}_margin"] = float(np.mean(v)) if v else float("nan")
         return out

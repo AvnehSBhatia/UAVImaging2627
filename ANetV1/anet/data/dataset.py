@@ -50,7 +50,7 @@ class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
                  vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
                  band_lo=None, cache=False, center=False, center_sigma=1.5,
-                 center_grid=None):
+                 center_grid=None, center_dual=False):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
@@ -69,6 +69,13 @@ class SUASCells(Dataset):
         self.center = center
         self.center_sigma = center_sigma
         self.center_grid = center_grid
+        # center_dual=True (v23/D76): emit PER-CLASS targets on per-class
+        # grids — mannequin at stride-10 (54x96) where a 49x13px person is
+        # ~5x1.3 cells (elongation representable) and tent at the family
+        # stride-20 (27x48), unchanged. sigma is in CELLS, so the mannequin
+        # sigma is doubled to 3.0 to keep the splat the same ~30px on the
+        # ground as v13's 1.5 cells at stride-20.
+        self.center_dual = center_dual
         # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
         # conversion to the consumer (the Trainer does it on-GPU): 4x less
         # pinned-memory + H2D traffic per image and no fp32 convert in the
@@ -226,7 +233,19 @@ class SUASCells(Dataset):
                "vd": self.is_visdrone(i), "stem": self.items[i].stem}
         if band is not None:
             out["band"] = band
-        if self.center:
+        if self.center_dual:
+            # v23 (D76): one rasterization per class, each on its own grid.
+            # Rasterization is per-item at load time, so the memmap cache is
+            # untouched by the grid change (no rebuild needed).
+            b = padded.numpy()
+            for pre, cls, grid, sig in (("mann", 0, (54, 96), 3.0),
+                                        ("tent", 1, (27, 48), 1.5)):
+                h, o, r = boxes_to_heatmap(b, sigma=sig, grid_hw=grid,
+                                           classes=(cls,))
+                out[f"{pre}_heat"] = torch.from_numpy(h)
+                out[f"{pre}_offset"] = torch.from_numpy(o)
+                out[f"{pre}_reg_mask"] = torch.from_numpy(r)
+        elif self.center:
             # padded is the same canvas-normalized, -1-padded box set already
             # rasterized into `grid` above; boxes_to_heatmap ignores the -1
             # padding rows (their class index isn't 0 or 1).

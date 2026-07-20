@@ -7,7 +7,7 @@ import torch.utils.checkpoint
 
 from .backbone import (V13Backbone, V14Backbone, V15Backbone, V20Backbone,
                        V16Backbone, V17Backbone, V18Backbone,
-                       V19Backbone, V22Backbone)
+                       V19Backbone, V22Backbone, V23Backbone)
 from .blocks import DualQuaternionRGB, EdgeDQStem, EdgeDQStem4
 from .context import SlimContext
 from .encoder import WindowEncoder
@@ -41,7 +41,7 @@ class ANetV1(nn.Module):
         super().__init__()
         self.prior_fg = prior_fg
         if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
-                    "v22"):
+                    "v22", "v23"):
             # v13 (D58): plain multi-scale conv backbone — the window-token
             # encoder, neck, Path A, context and token-stream head are all
             # replaced by backbone.py's conv pyramid ending in the same
@@ -74,7 +74,7 @@ class ANetV1(nn.Module):
                 cls_bb = {"v15": V15Backbone, "v16": V16Backbone,
           "v17": V17Backbone, "v18": V18Backbone,
           "v19": V19Backbone, "v20": V20Backbone,
-          "v22": V22Backbone}.get(arch, V13Backbone)
+          "v22": V22Backbone, "v23": V23Backbone}.get(arch, V13Backbone)
                 kw = dict(head_width=head_width, prior_fg=prior_fg)
                 if channels is not None:
                     kw["channels"] = tuple(channels)
@@ -250,7 +250,15 @@ class ANetV1(nn.Module):
             # v15's D64 SPD projection and v14's D59 noise filter are their
             # unique keys; a bare backbone. prefix is v13. Channel plan and
             # depth are inferred from shapes so D65-scaled checkpoints load.
-            if "backbone.spd_gain" in sd:
+            if "backbone.man_proj.weight" in sd:
+                # v23's unique key (dual-grid mannequin branch). Its channel
+                # plan reads off the trunk, not the branch: man_proj's fan-in
+                # is ch_stem+1 (the anisotropy channel).
+                arch = "v23"
+                channels = (sd["backbone.stem.weight"].shape[0],
+                            sd["backbone.down4.pw.weight"].shape[0],
+                            sd["backbone.tent_head.0.weight"].shape[1])
+            elif "backbone.spd_gain" in sd:
                 # v22's unique key — MUST be sniffed before v15 (v22 reuses
                 # the spd_proj NAME on purpose, to inherit the slow-LR
                 # group, but its funnel is the fused Conv2d(ch_mid, ch_top,
@@ -301,8 +309,10 @@ class ANetV1(nn.Module):
                             sd["backbone.head.0.weight"].shape[1])
             n_blocks = sum(1 for k in sd if k.startswith("backbone.blocks.")
                            and k.endswith(".dw.weight"))
+            hw = (sd["backbone.tent_head.0.weight"].shape[0] if arch == "v23"
+                  else sd["backbone.head.0.weight"].shape[0])
             model = cls(arch=arch,
-                        head_width=sd["backbone.head.0.weight"].shape[0],
+                        head_width=hw,
                         channels=channels,
                         n_blocks=None if arch == "v14" else n_blocks,
                         **kwargs)
@@ -530,6 +540,11 @@ class ANetV1(nn.Module):
         return result
 
     def forward(self, img):
+        if self.arch == "v23":
+            # v23 (D76): dual-grid contract — mannequin at stride-10 (54x96),
+            # tent at stride-20 (27x48). Passed through verbatim; the trainer
+            # and CenterObjectMetrics consume the two grids per class.
+            return self.backbone(img)
         if self.arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19",
                          "v20", "v22"):
             out = self.backbone(img)  # (B, 4, 27, 48); v18/v19/v22 train: (out, bg)
@@ -555,7 +570,7 @@ class ANetV1(nn.Module):
         return self._tail(m16)
 
     def reg_losses(self):
-        if self.arch in ("v18", "v19", "v22"):
+        if self.arch in ("v18", "v19", "v22", "v23"):
             z = next(self.parameters()).sum() * 0.0
             return z, z  # gains/valves are tanh- or sigmoid-bounded; nothing to regularize
         if self.arch in ("v16", "v17"):

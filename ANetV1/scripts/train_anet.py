@@ -147,7 +147,10 @@ cfg = anet_cfg(
     # a 3-conv CNN learns it); the sink was purely the init-prior scale.
     prior_fg=(float(os.environ["ANET_PRIOR_FG"]) or None)
     if "ANET_PRIOR_FG" in os.environ else 0.01,
-    loss_mode=os.environ.get("ANET_LOSS_MODE") or "center",
+    # v23 (D76) reads its two classes on two grids, so it needs the dual-grid
+    # loss/eval branch; every other arch keeps the v12-v22 single-grid one.
+    loss_mode=os.environ.get("ANET_LOSS_MODE")
+    or ("center_dual" if _ARCH == "v23" else "center"),
     checkpoint_dir="runs/anet",
     # init_from="runs/anet/last.pt",   # uncomment to resume, or ANET_INIT_FROM
 )
@@ -164,6 +167,9 @@ def build_datasets(cfg, teacher_dir=None):
         cache=getattr(cfg.data, "cache", False),  # memmap preprocessing cache
         center=True,  # v12: also build heat/offset/reg_mask targets (rasterize.py)
         center_sigma=getattr(cfg.train, "center_sigma", 1.5),  # Gaussian splat width
+        # v23 (D76): per-class targets on per-class grids (mannequin s10,
+        # tent s20). Rasterized per item at load time -> no cache rebuild.
+        center_dual=getattr(cfg.train, "loss_mode", "") == "center_dual",
     )
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)
@@ -203,6 +209,45 @@ def main():
                   f"{len(unexpected)} donor transition tensors dropped, "
                   f"{len(missing)} new tensors at Kaiming init")
             model = m20
+        elif model.arch == "v13" and cfg.train.arch == "v23":
+            # v23 (D76): the trunk transfers by name; the TENT HEAD is
+            # SLICED out of the donor's 4-output head — v13 emits
+            # [mann_heat, tent_heat, dx, dy], v23's tent head emits
+            # [tent_heat, dx, dy], i.e. donor rows [1,2,3]. That makes the
+            # tent path bit-for-bit the donor's, which (with the freeze
+            # below) is what makes tent safety a construction, not a hope.
+            m23 = ANetV1(arch="v23",
+                         use_checkpoint=cfg.train.use_checkpoint,
+                         head_width=cfg.train.head_width,
+                         prior_fg=getattr(cfg.train, "prior_fg", None),
+                         channels=model.backbone.channels,
+                         n_blocks=len(model.backbone.blocks))
+            donor = model.state_dict()
+            sliced = dict(donor)
+            for k in ("head.0.weight", "head.0.bias"):
+                sliced[f"backbone.tent_head.{k.split('.', 1)[1]}"] = \
+                    donor[f"backbone.{k}"]
+            for k in ("head.2.weight", "head.2.bias"):
+                src = donor[f"backbone.{k}"]
+                sliced[f"backbone.tent_head.{k.split('.', 1)[1]}"] = src[[1, 2, 3]]
+            for k in list(sliced):
+                if k.startswith("backbone.head."):
+                    del sliced[k]
+            missing, unexpected = m23.load_state_dict(sliced, strict=False)
+            assert not unexpected, f"v13->v23: unconsumed donor tensors: {unexpected}"
+            new_ok = ("backbone.aniso.", "backbone.man_proj.",
+                      "backbone.man_norm.", "backbone.man_block.",
+                      "backbone.man_head.")
+            stray = [k for k in missing if not k.startswith(new_ok)]
+            assert not stray, f"v13->v23: unexpected new tensors: {stray}"
+            n_p, n_n = m23.backbone.freeze_donor()
+            trainable = sum(p.numel() for p in m23.parameters() if p.requires_grad)
+            print(f"v13 -> v23 dual-grid transfer: trunk by name + tent head "
+                  f"sliced from donor rows [1,2,3]; {n_p} donor tensors and "
+                  f"{n_n} DeployNorm stat sets FROZEN (weights+stats, the "
+                  f"D39/16.1 law); {trainable:,} params train (mannequin "
+                  f"branch only)")
+            model = m23
         elif model.arch == "v13" and cfg.train.arch == "v22":
             # v22 (D72): the family's first FULL-identity capacity growth —
             # every donor tensor (weights AND DeployNorm stat buffers) lands
@@ -373,6 +418,8 @@ def main():
     # 16.3, sanctioned by 16.2's measured underfit). ANET_PARAM_BUDGET pins it.
     # v22's 100k is the pre-registered D65-curve relaxation (§16.2 sanctions
     # capacity; v22 sits at the tier-S point + peak/bias additions).
+    # v23 deliberately stays inside the ORIGINAL <=40k budget (owner's
+    # chosen envelope: fix the margin via readout/features, not capacity).
     budget = int(os.environ.get("ANET_PARAM_BUDGET",
                                 {"v15": 300_000, "v22": 100_000}.get(
                                     cfg.train.arch, 40_000)))

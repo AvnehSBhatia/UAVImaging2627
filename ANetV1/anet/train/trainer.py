@@ -579,6 +579,8 @@ class Trainer:
         return img
 
     def _loss(self, batch):
+        if getattr(self.cfg.train, "loss_mode", "combo") == "center_dual":
+            return self._loss_dual(batch)
         img = batch["image"].to(self.device, non_blocking=True)
         grid = batch["grid"].to(self.device, non_blocking=True)
         teacher = (batch["teacher"].to(self.device, non_blocking=True)
@@ -605,6 +607,31 @@ class Trainer:
             self.model_eval = self.model
             self._compiled = False
             return self._loss_fn(img, grid, teacher, band, heat, offset, reg_mask)
+
+    def _loss_dual(self, batch):
+        """v23 (D76) dual-grid loss: the SAME proven center_focal+offset_l1
+        form (D57 lineage), applied once per class on that class's own grid.
+        No new loss TYPE, no ratio/Tversky, no cross-class normalizer
+        coupling — the D23/D47/D49 one-smooth-term law holds by construction.
+
+        In run 1 the donor (trunk + tent head) is frozen, so the tent terms
+        have no gradient to receive; they are still computed and logged as a
+        drift trip-wire (they must be numerically constant)."""
+        c = self.cfg.train
+        dev = self.device
+        img = self._prep_img(batch["image"].to(dev, non_blocking=True))
+        out = self.model(img)
+        pw = getattr(c, "center_pos_weight", 1.0)
+        loss = img.new_zeros(())
+        for pre, w in (("mann", 1.0), ("tent", getattr(c, "v23_tent_w", 0.0))):
+            h = batch[f"{pre}_heat"].to(dev, non_blocking=True)
+            o = batch[f"{pre}_offset"].to(dev, non_blocking=True)
+            r = batch[f"{pre}_reg_mask"].to(dev, non_blocking=True)
+            term = center_focal_loss(out[f"{pre}_heat"], h, alpha=c.center_alpha,
+                                     beta=c.center_beta, pos_weight=pw) + \
+                c.offset_weight * offset_l1(out[f"{pre}_offset"], o, r)
+            loss = loss + w * term
+        return loss
 
     def _loss_tensors(self, img, grid, teacher=None, band=None,
                        heat=None, offset=None, reg_mask=None):
@@ -959,6 +986,13 @@ class Trainer:
                 print(f"  soft p(fg on gt): mann={stats['soft_mann']:.3f} "
                       f"tent={stats['soft_tent']:.3f} | argmax fg cells={stats['argmax_fg']} "
                       f"(threshold-free — cross ~0.5 to win argmax)", flush=True)
+                if "mannequin_margin" in stats:
+                    # v23/D76 headline: p(at GT centre) - max p(background).
+                    # NEGATIVE means background outscores the objects — the
+                    # measured v13/v22 disease this redesign exists to fix.
+                    print(f"  MARGIN (gt-centre minus best-bg): "
+                          f"mann={stats['mannequin_margin']:+.3f} "
+                          f"tent={stats['tent_margin']:+.3f}", flush=True)
                 state = getattr(self.model, "_orig_mod", self.model).state_dict()
                 torch.save(state, self.out_dir / "last.pt")
                 # never promote a diverged epoch to best.pt (recall 0.0 "beats" the
@@ -1040,7 +1074,45 @@ class Trainer:
         return out
 
     @torch.no_grad()
+    def _evaluate_dual(self, loader, desc="eval"):
+        """v23 eval: two grids, one CenterObjectMetrics. update() is called
+        per class with that class's grid (count_image only on the first, so
+        fp/img stays per-FRAME), which keeps every summary() key — and the
+        whole v13-v22 ladder comparison — identical."""
+        self.model.eval()
+        pt = getattr(self.cfg.train, "peak_thresh", 0.3)
+        obj = CenterObjectMetrics(peak_thresh=pt)
+        soft = {"mann": [0.0, 0], "tent": [0.0, 0]}
+        for batch in tqdm(loader, desc=desc, unit="batch",
+                          dynamic_ncols=True, leave=False):
+            img = self._prep_img(batch["image"].to(self.device, non_blocking=True))
+            with self._autocast():
+                out = self.model_eval(img)
+            probs = {k: torch.sigmoid(out[k]).float() for k in out}
+            for pre in ("mann", "tent"):
+                t = batch[f"{pre}_heat"].to(probs[f"{pre}_heat"].device)
+                m = t == 1.0
+                if m.any():
+                    soft[pre][0] += float(probs[f"{pre}_heat"][m].sum())
+                    soft[pre][1] += int(m.sum())
+            mh = probs["mann_heat"].cpu().numpy()
+            mo = probs["mann_offset"].cpu().numpy()
+            th = probs["tent_heat"].cpu().numpy()
+            to = probs["tent_offset"].cpu().numpy()
+            for i in range(mh.shape[0]):
+                b, vd = batch["boxes"][i].numpy(), bool(batch["vd"][i])
+                obj.update(mh[i], mo[i], b, vd, cls_ids=(0,))
+                obj.update(th[i], to[i], b, vd, cls_ids=(1,), count_image=False)
+        stats = obj.summary()
+        stats["soft_mann"] = soft["mann"][0] / max(soft["mann"][1], 1)
+        stats["soft_tent"] = soft["tent"][0] / max(soft["tent"][1], 1)
+        stats["argmax_fg"] = 0
+        return stats
+
+    @torch.no_grad()
     def evaluate(self, loader, desc="eval"):
+        if getattr(self.cfg.train, "loss_mode", "combo") == "center_dual":
+            return self._evaluate_dual(loader, desc)
         if getattr(self.cfg.train, "loss_mode", "combo") == "center":
             return self._evaluate_center(loader, desc)
         self.model.eval()

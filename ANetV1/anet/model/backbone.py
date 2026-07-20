@@ -900,6 +900,218 @@ class V19Backbone(nn.Module):
         return out
 
 
+class AnisotropyContrast(nn.Module):
+    """v23 (D76): two-scale structure-tensor coherence CONTRAST — the feature
+    the family never had, and the direct answer to "the model scores local
+    contrast, not person" (the viz_web_scenes diagnosis).
+
+    Every prior shape idea in this project was 2-WAY (anisotropic vs
+    isotropic), which structurally cannot separate a person from a painted
+    runway stripe — both are elongated. Measured consequence: v22 fires
+    0.50-0.58 on runway numbers while a clear spread-eagle person on clean
+    dirt scores 0.10 (background corners score 0.36 — the margin is
+    INVERTED). This module is 3-WAY, by comparing coherence at two scales:
+
+        coherent at FINE but not COARSE  -> person (short limb/torso
+                                            segments at several angles)
+        coherent at EVERY scale          -> paint stripe / fence / shadow
+                                            edge (straight for 100s of px)
+        coherent at NO scale             -> canopy / brush (isotropic
+                                            fractal texture)
+
+    Structure tensor from FIXED (non-trainable) luminance + Sobel at s2:
+    J = [[Ix^2, IxIy], [IxIy, Iy^2]], box-averaged at a fine window (~limb
+    width) and a coarse window (~whole-body extent). Per scale we keep
+    trace = Jxx+Jyy (how much gradient energy) and the eigenvalue-gap
+    magnitude sqrt(((Jxx-Jyy)/2)^2 + Jxy^2) (how ORIENTED that energy is).
+    The gap uses the alpha-max-beta-min approximation (max + 0.5*min, ~4%
+    worst case) ON PURPOSE: it needs only abs/max/min/mul/add, so no sqrt
+    and NO DIVIDE enters the deploy graph (division is structurally close
+    to the data-dependent-normalization class the Hailo rules forbid).
+
+    A DeployNorm(4) sits before the tiny MLP: the four J-statistics have
+    wildly different natural scales (squared gradients over two window
+    sizes), and without it the sigmoid saturates at init — the same
+    cold-start reasoning as D39/D58. 4->8->1 with sigmoid gives a bounded
+    A(x,y) in (0,1), 49 params + 8 norm affines.
+
+    Deploy: fixed convs, elementwise mul/abs/max/min (the D61 'energy =
+    elementwise square' precedent), two stride-1 avg_pools (the D6/D7
+    blurred-gate-map precedent), two 1x1 convs, one sigmoid. No new op
+    class, nothing data-dependent, nothing dynamic."""
+
+    LUM = (0.299, 0.587, 0.114)
+
+    def __init__(self, k_fine=5, k_coarse=21, hidden=8):
+        super().__init__()
+        self.k_fine, self.k_coarse = k_fine, k_coarse
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0],
+                                [-2.0, 0.0, 2.0],
+                                [-1.0, 0.0, 1.0]])
+        # register as buffers: fixed by design (a LEARNED pre-filter ahead of
+        # the evidence is the falsified v21.4 attenuator; these never move)
+        self.register_buffer("sobel", torch.stack([sobel_x, sobel_x.t()])
+                             .unsqueeze(1))                 # (2,1,3,3)
+        self.register_buffer("lum_w", torch.tensor(self.LUM).reshape(1, 3, 1, 1))
+        self.norm = DeployNorm(4)
+        self.fc1 = nn.Conv2d(4, hidden, 1)
+        self.fc2 = nn.Conv2d(hidden, 1, 1)
+
+    @staticmethod
+    def _amb(a, b):
+        """alpha-max-beta-min approximation of sqrt(a^2+b^2) — no sqrt, no
+        divide; monotone in both arguments, which is all the head needs."""
+        a, b = a.abs(), b.abs()
+        return torch.maximum(a, b) + 0.5 * torch.minimum(a, b)
+
+    def _stats(self, jxx, jyy, jxy, k):
+        pad = k // 2
+        jxx = F.avg_pool2d(jxx, k, 1, pad)
+        jyy = F.avg_pool2d(jyy, k, 1, pad)
+        jxy = F.avg_pool2d(jxy, k, 1, pad)
+        trace = jxx + jyy                      # total gradient energy
+        gap = self._amb((jxx - jyy) * 0.5, jxy)  # how ORIENTED it is
+        return trace, gap
+
+    def forward(self, img):  # (B,3,540,960) -> (B,1,270,480) in (0,1)
+        lum = F.avg_pool2d((img * self.lum_w.to(img.dtype)).sum(1, keepdim=True), 2)
+        g = F.conv2d(lum, self.sobel.to(lum.dtype), padding=1)   # (B,2,270,480)
+        ix, iy = g[:, 0:1], g[:, 1:2]
+        jxx, jyy, jxy = ix * ix, iy * iy, ix * iy
+        t_f, g_f = self._stats(jxx, jyy, jxy, self.k_fine)
+        t_c, g_c = self._stats(jxx, jyy, jxy, self.k_coarse)
+        z = self.norm(torch.cat([t_f, g_f, t_c, g_c], 1))
+        return torch.sigmoid(self.fc2(F.silu(self.fc1(z))))
+
+
+class V23Backbone(nn.Module):
+    """v23 (D76-D79): frozen-trunk DUAL-GRID anisotropy head — the ground-up
+    answer to the mannequin margin failure, at <=40k params.
+
+    The viz_web_scenes cases proved the disease is not capacity (v22 added a
+    full-rank funnel; its runs eroded, and the class that improved was the
+    one already working). It is that (a) at stride-20 a 49x13px person is a
+    1-2 cell POINT with no spatial support, so a lone bright person-cell and
+    a lone bright bush-cell are the same object to the head, and (b) the
+    only evidence the trunk offers is brightness/edge MAGNITUDE, which paint
+    and canopy win as often as people do. Measured: easy spread-eagle person
+    0.10 vs empty-corner background 0.36 — an INVERTED margin.
+
+    Two structural changes, mannequin-only (tents already work: 0.75-0.93):
+
+      1. PER-CLASS ANISOTROPIC GRID. Mannequin is read at stride-10
+         (54x96), tapped off the stem at s2 BEFORE the s4->s20 funnel that
+         D62/D64 measured as diluting small-object evidence. A 49x13px
+         person goes from ~1 cell to ~5x1.3 cells: elongation becomes
+         representable. Tent keeps v13's proven stride-20 path, untouched.
+      2. ANISOTROPY CONTRAST (above) concatenated onto the stem tap, giving
+         the head a qualitatively new, 3-way degree of freedom that no
+         amount of stacking the existing primitive can express.
+
+    TENT SAFETY BY CONSTRUCTION, not by hope: the shared trunk and the tent
+    head are loaded from v13_best and FROZEN — weights AND DeployNorm stats
+    (freeze_donor(); the D39/16.1 law that frozen weights require frozen
+    stats whenever anything trainable sits upstream). The mannequin branch
+    only READS a tap off the stem and writes a separate output tensor, so
+    the tent forward is bit-for-bit v13_best's, unconditionally. This is
+    strictly stronger than v14's zero-init valve idiom (D63): a valve can
+    drift under gradient pressure; a frozen parameter cannot.
+
+    33,119 params (25,187 frozen + 7,932 trainable) — 17% under the <=40k
+    cap the owner chose. All ops Hailo-legal; the dual-grid output is
+    structurally YOLO's own multi-scale P3/P4 head pattern. The mannequin
+    grid's targets/metrics ride the already-landed plumbing
+    (boxes_to_heatmap(grid_hw=, classes=), SUASCells(center_grid=),
+    shape-derived CenterObjectMetrics)."""
+
+    def __init__(self, head_width=24, prior_fg=None, n_blocks=3,
+                 channels=(16, 32, 64), man_ch=16):
+        super().__init__()
+        ch_stem, ch_mid, ch_top = channels
+        self.channels = tuple(channels)
+        # ---- shared trunk: v13 verbatim (module names preserved so a
+        # v13_best state_dict lands by name) ----
+        self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
+        self.stem_norm = DeployNorm(ch_stem)
+        self.act = nn.SiLU()
+        self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
+        self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
+        self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        self.blocks = nn.Sequential(
+            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+        # ---- tent head: v13's head with the mannequin output row dropped
+        # (3 outputs: tent_heat, dx, dy). Sliced from the donor at load. ----
+        self.tent_head = nn.Sequential(
+            nn.Conv2d(ch_top, head_width, 1),
+            nn.SiLU(),
+            nn.Conv2d(head_width, 3, 1),
+        )
+        # ---- mannequin branch (trainable) ----
+        self.aniso = AnisotropyContrast()
+        # full-rank strided projection (D64: full-rank, not depthwise, at a
+        # funnel) from the s2 tap + anisotropy channel straight to s10.
+        # 270/5=54, 480/5=96 — exact, no padding, no pixel_unshuffle (so v23
+        # is NOT in the v15/v20 ROCm inductor-miscompile family).
+        self.man_proj = nn.Conv2d(ch_stem + 1, man_ch, 5, stride=5, bias=False)
+        self.man_norm = DeployNorm(man_ch)
+        self.man_block = _DWSep(man_ch, man_ch, k=5, stride=1)
+        self.man_head = nn.Sequential(
+            nn.Conv2d(man_ch, man_ch, 1),
+            nn.SiLU(),
+            nn.Conv2d(man_ch, 3, 1),
+        )
+        for mod in self.modules():  # D58: Kaiming is load-bearing under DN
+            if isinstance(mod, nn.Conv2d):
+                nn.init.kaiming_normal_(mod.weight, nonlinearity="relu")
+                if mod.bias is not None:
+                    nn.init.zeros_(mod.bias)
+        with torch.no_grad():  # fixed Sobel must survive the Kaiming sweep
+            pass  # (sobel/lum_w are buffers, not Conv2d — untouched)
+        if prior_fg:
+            b = math.log(prior_fg / max(1.0 - prior_fg, 1e-6))
+            with torch.no_grad():
+                self.tent_head[-1].bias.zero_()
+                self.tent_head[-1].bias[0] = b
+                self.man_head[-1].bias.zero_()
+                self.man_head[-1].bias[0] = b
+
+    # ------------------------------------------------------------- freezing
+    def donor_modules(self):
+        """The v13-derived subgraph: frozen in run 1 (see class docstring)."""
+        return (self.stem, self.stem_norm, self.down4, self.block4,
+                self.down20, self.blocks, self.tent_head)
+
+    def freeze_donor(self):
+        """Freeze donor WEIGHTS and DeployNorm STATS together — the D39/16.1
+        hard law (the v14 adapter collapsed because stats chased an upstream
+        adapter while frozen weights could not follow). Returns (n_params,
+        n_norms) for the caller to log."""
+        n_p = n_n = 0
+        for mod in self.donor_modules():
+            for p in mod.parameters():
+                p.requires_grad_(False)
+                n_p += 1
+            for m in mod.modules():
+                if isinstance(m, DeployNorm):
+                    m.frozen = True
+                    n_n += 1
+        return n_p, n_n
+
+    def forward(self, img):
+        """(B,3,540,960) -> dict of two grids:
+        mann_* on 54x96 (stride 10), tent_* on 27x48 (stride 20)."""
+        x2 = self.act(self.stem_norm(self.stem(img)))          # (B,16,270,480)
+        # tent path — bit-for-bit v13_best while the donor is frozen
+        t = self.blocks(self.down20(self.block4(self.down4(x2))))
+        tent = self.tent_head(t)                                # (B,3,27,48)
+        # mannequin path — fine grid off the undiluted s2 tap + anisotropy
+        a = self.aniso(img)                                     # (B,1,270,480)
+        m = self.act(self.man_norm(self.man_proj(torch.cat([x2, a], 1))))
+        m = self.man_head(self.man_block(m))                    # (B,3,54,96)
+        return {"mann_heat": m[:, 0:1], "mann_offset": m[:, 1:3],
+                "tent_heat": tent[:, 0:1], "tent_offset": tent[:, 1:3]}
+
+
 class V22Backbone(nn.Module):
     """v22 (D72-D75): "grown, not retrained" — peak-augmented full-rank funnel
     growth of v13_best. Three measured facts pin the design:
