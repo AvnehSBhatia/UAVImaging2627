@@ -1293,3 +1293,26 @@ Both flips are valid for nadir imagery: at 150 ft AGL looking straight down ther
 2. **The real-scene gap must close** — rerun `webscene_check`: object p should rise from 0.482 toward the synthetic 0.570 and `bg>0.30/frame` fall from 6.8 toward 2.64. This is the only falsifier that tests what D85 is *for*; a synthetic-metric win with an unchanged web-scene profile means the gain came from generic regularization, not from closing the tell.
 3. **Throughput within ~10% of v13** (family protocol).
 4. **Worst-decile synthetic** (`..._smallest_decile_synthetic`, D82) must not regress below v13's 0.643.
+
+### 20.4 Run 1 — the best result in the family's history, on every axis at once
+
+From-scratch v13 (arch byte-identical to the donor, so augmentation is the single variable). Read at epoch 73; LR has annealed to 3e-5 and every metric has been flat for ~15 epochs, so this is converged, not a snapshot mid-climb.
+
+| val metric | v13 donor | v23 run-1 (§18.3) | **D85 run-1** |
+|---|---|---|---|
+| mannequin recall (synth) | ~0.795 | 0.687 | **0.854** |
+| tent recall | ~0.94 | 0.949 | **0.973** |
+| fp/img | ~2.05 | 2.05 | **1.38–1.48** |
+| **mannequin margin** | **−0.178** | +0.012 | **+0.257** |
+| tent margin | +0.380 | +0.380 | **+0.566** |
+| soft p(fg) at GT | — | 0.354 | **0.611** |
+
+The margin comparison is exact: same `CenterObjectMetrics` code, same val split, and the −0.178 baseline is the one recorded in §18.2's table.
+
+**Every axis moved together.** That has never happened in this family. D80 established that recall and fp are two points on one operating curve and that mechanisms slide along it — v23 run-1 bought +0.19 margin for −11pt recall, run-2a bought back +7pt recall for −0.05 margin and +1.8 fp. D85 gains +6pt recall, −0.6 fp/img and +0.435 margin **simultaneously**, and takes fp below v18's 1.722 family record.
+
+**That signature is the diagnosis.** Adding a feature moves you along the curve; removing a shortcut moves the whole curve. The model was spending capacity on renderer statistics that carry no mission signal, and every one of D59–D81 was trying to out-feature a cue that should simply have been deleted from the training distribution. §18's entire premise — "the margin is zero-to-inverted, fix it through readout structure and feature type" — was treating a symptom of the missing augmentation.
+
+Also note what did **not** happen: no erosion. v22 runs 1 and 1b both eroded val while train loss fell (§17.5); here train loss falls monotonically 2.09 → 1.28 with val improving throughout, which is what an under-regularized model looks like once it is regularized.
+
+**Still unverified, and it is the one that matters.** Falsifier 2 (§20.3) tests what D85 is *for* — the real web-scene profile. A synthetic win with an unchanged web-scene profile would mean the gain came from generic regularization rather than from closing the sharpness tell, and the mechanism's stated rationale would be wrong even though its numbers are right. Also pending: a test-split re-score against `v13_best`'s 0.837 / 0.643 (the epoch log is val), and throughput vs the ~1,132 img/s baseline.
