@@ -948,3 +948,45 @@ Run: `ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v13_best.pt ANET_BG_W=0 python scri
 **Fix record — the D48 amendment (2026-07-19, owner-directed "fix"):** `ModelEMA` now shadows every DeployNorm `running_mean`/`running_var` at the same decay + debias ramp as the parameters; `swap_in`/`swap_out` install/restore them symmetrically, so eval and `best.pt`/`last.pt` are internally consistent (weights and stats from the same ~500-opt-step window) even while the funnel valve shifts the trunk's distribution. `reset_buffers()` re-snapshots the shadows after `_seed_norm_stats` (the EMA is constructed pre-seeding). Preset `ema_norm_buffers=True`, escape hatch `ANET_EMA_BUFFERS=0` (pre-v22 parameters-only behavior); stationary regimes are first-order unaffected, so the family ladder's comparability survives. Validated: mechanics under synthetic valve drift (shadow diverges from live; swap/checkpoint/restore exact; off-switch) + an end-to-end micro-train through the real Trainer (seeding → epoch → eval → EMA-consistent checkpoint → `from_state_dict` round-trip). D48's original "parameters only, deliberately" note is amended in place (trainer.py) with the non-stationarity scope condition.
 
 **Run-1c (the rerun that now discriminates A-vs-C):** same command as run-1b — `ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v13_best.pt ANET_BG_W=0 ANET_LR=4e-4 ANET_SLOW_MULT=1.0 python scripts/train_anet.py` — the fix defaults on. Erosion gone → C was the cause: the capacity/peak verdict (falsifiers 1–4) reopens on clean instrumentation, and the v14-run-2 full-tune reading deserves a retroactive footnote. Erosion persists → A at last measured trustworthily: write falsifiers 1/6, note the §16.2 data-lever reversal, escalate v22.1. The stat-reseed probe on the run-1/1b checkpoints remains the no-retrain shortcut to the same answer.
+
+---
+
+## 18. v23 — dual-grid anisotropy head: the mannequin-margin redesign (D76–D79)
+
+Ground-up redesign inside the owner-chosen **≤40k envelope** (capacity explicitly off the table after v22's §17.5 erosion): fix the mannequin's discriminative margin through readout structure and feature type, not parameters. Driven by `runs/viz_web_scenes` — the trained v13/v22/YOLO26n run on realistic composites.
+
+### 18.1 The diagnosis that forced it
+
+The margin is **zero-to-inverted**. On the *easiest* case (`eval_open_easy_both`: a spread-eagle person on clean bare dirt, limbs plainly resolved, ~4×4 cells — not a resolution-starvation case) the person scores **0.10** while empty-corner background scores **0.33–0.36**. Elsewhere: v22 fires **0.50–0.58 on painted runway numbers** (worse than v13 there); a prone person in brush is missed while sagebrush fires; the raw heatmap never suppresses to zero (a low-level red field across the whole canopy). Tents meanwhile are fine (0.75–0.93, v22 0.93 beating YOLO's 0.47).
+
+Two compounding causes: (a) at stride-20 a 49×13px person is a **1–2 cell point with no spatial support**, so a lone bright person-cell and a lone bright bush-cell are the same object to the head — whereas a tent is a 5×5-cell coherent blob whose neighbours co-activate, which is *exactly why tents work*; (b) the only evidence the trunk offers is brightness/edge **magnitude**, and every shape idea previously proposed is **2-way** (elongated vs round), which structurally cannot separate a person from a painted stripe because both are elongated.
+
+### 18.2 D76–D79 — the design
+
+- **D76 AnisotropyContrast**: two-scale structure-tensor coherence **contrast**, the family's first **3-way** shape feature. Fixed luminance+Sobel at s2 → J=[[Ix²,IxIy],[IxIy,Iy²]] → box-averaged at a limb-width (5) and a body-width (21) window → per scale (trace, eigen-gap). Coherent at fine but **not** coarse = person; coherent at **every** scale = paint/fence/shadow edge; coherent at **no** scale = canopy/brush. Eigen-gap via alpha-max-beta-min so **no sqrt and no divide** enters the deploy graph. DeployNorm(4) before the 4→8→1 MLP (the four J-statistics have wildly different natural scales; without it the sigmoid saturates at init — the D39/D58 cold-start law).
+- **D77 per-class anisotropic grid**: mannequin read at **stride-10 (54×96)** off the s2 stem tap, *before* the s4→s20 funnel D62/D64 measured as diluting small-object evidence — a person becomes ~5×1.3 cells, so elongation is representable. Tent keeps stride-20.
+- **D78 tent safety by construction**: trunk + tent head (**sliced from the donor's output rows [1,2,3]**) load from `v13_best` and freeze — weights **and** DeployNorm stats together (the D39/§16.1 law). Strictly stronger than v14's zero-init valve: a valve can drift under gradient pressure, a frozen parameter cannot.
+- **D79 the margin metric**: `p(at GT centre) − max p(background)`, logged every epoch. Read at the GT centre rather than at a matched peak on purpose — it stays defined when the object is **missed**, which is the interesting case. This is the diagnostic recall/fp structurally hide.
+
+33,119 params (25,187 frozen + 7,932 trainable), **6,881 under the cap**. All ops Hailo-legal; dual-grid output is structurally YOLO's own P3/P4 multi-scale head pattern. No pixel_unshuffle → **not** in the v15/v20 ROCm inductor-miscompile family.
+
+### 18.3 Run record — run-1 (MI300X, early-stopped epoch 46): SPLIT verdict
+
+| | epoch 0 | best | donor v13_best (val) |
+|---|---|---|---|
+| mannequin margin | **−0.178** | **+0.012** | ~−0.23 (easy case) |
+| mannequin recall (synth) | 0.162 | **0.687** | ~0.795 |
+| tent recall | 0.949 | **0.949 (byte-constant ×47 epochs)** | 0.949 |
+| tent margin | +0.380 | **+0.380 (byte-constant)** | +0.380 |
+| fp/img | 1.24 | 2.05 | ~2.15 |
+
+**What passed.** (1) The margin **flipped sign**, monotonically, crossing zero at epoch 26: −0.178 → +0.012 is a **+0.19 improvement**, clearing the pre-registered ≥+0.10 falsifier. The 3-way coherence feature does move the quantity it was built to move. (2) **Tent safety is now measured, not argued**: recall and margin were byte-constant for 47 epochs — freeze-by-construction (D78) works exactly as specified, and this is the first mechanism in the family that provably cannot regress the working class.
+
+**What failed.** Mannequin recall **0.687 vs the donor's ~0.795** — an ~11-point regression on the headline metric — with fp/img unimproved (2.05) and the absolute margin razor-thin (+0.012, versus YOLO's ~0.8 true / ~0 background separation). Directionally right, operationally worse.
+
+**Diagnosis, from the log itself.** Soft p at GT centres saturates at **0.354** while best-background sits at ~0.342: nothing is being pushed *apart*, everything is being pushed *down*. Two causes, both cheap to test:
+
+1. **The finer grid quadrupled the class imbalance.** s10 has 5,184 cells vs s20's 1,296, so the same ~1 positive cell now faces 4× more background in the negative term — while `pos_weight` was left at the family default 3.0. The design's own spec asked for 4.0 and even that is too timid against a 4× ratio change. This is the leading hypothesis and is a one-env-var test.
+2. **The frozen 16-channel stem starves the branch** (the design's own pre-registered risk #1): 7,932 params must build a person detector from features trained for v13's objective, against a donor whose 0.795 came from a 25k trunk adapting end-to-end. Pre-registered fallback: unfreeze **stem+down4 only**, keeping every tent-critical downstream layer frozen with stats pinned per D39/§16.1.
+
+**Pre-registered next runs** (one variable each, D69 law): **run-2a** `ANET_POS_W=8` — if soft-p and recall climb, the imbalance was the binding constraint and the mechanism is vindicated. **run-2b** (only if 2a is insufficient) unfreeze stem+down4. Still unmeasured and required before any verdict: worst-decile recall on `best.pt` (falsifier #2, ≥+0.03 over the 0.586–0.643 band), the peak-thresh sweep (falsifier #3), the mechanism autopsy, and — the falsifier that motivated the whole redesign — **falsifier #5: does the anisotropy map visibly separate person from paint/canopy on the 14 preserved `viz_web_scenes` inputs?** A metric win with no qualitative separation would mean the movement came from elsewhere.
