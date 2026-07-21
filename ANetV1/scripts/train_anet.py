@@ -269,13 +269,20 @@ def main():
             # donor EXACTLY — the same contract that made v22's own growth
             # work, applied to the stage the measurement indicts.
             n_donor = len(model.backbone.blocks)
+            # A donor that was ITSELF grown already carries valves on its own
+            # trailing blocks, so the target needs donor_zg + _GROW of them or
+            # those donor tensors have nowhere to land. Growth only ever
+            # appends and marks the LAST K, so the valved blocks are always a
+            # suffix and the counts simply add. (Generation 1 worked and
+            # generation 2 did not; the smoke check now grows twice.)
+            donor_zg = sum(1 for b in model.backbone.blocks if b.gain is not None)
             m22 = ANetV1(arch="v22",
                          use_checkpoint=cfg.train.use_checkpoint,
                          head_width=cfg.train.head_width,
                          prior_fg=getattr(cfg.train, "prior_fg", None),
                          channels=model.backbone.channels,
                          n_blocks=n_donor + _GROW,
-                         zero_gain_blocks=_GROW)
+                         zero_gain_blocks=donor_zg + _GROW)
             missing, unexpected = m22.load_state_dict(model.state_dict(),
                                                       strict=False)
             assert not unexpected, \

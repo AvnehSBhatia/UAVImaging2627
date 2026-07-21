@@ -687,6 +687,25 @@ def v22_growth_checks():
         with torch.no_grad():
             assert (r(x)["heat"] - g(x)["heat"]).abs().max().item() == 0.0, \
                 "reloaded grown model is not bit-identical"
+    # SECOND-GENERATION growth: a donor that was itself grown already carries
+    # valves, so the target needs donor_zg + grow of them. Generation 1 passed
+    # and generation 2 failed on hardware; this is the check that was missing.
+    gen1 = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01,
+                  n_blocks=n0 + 4, zero_gain_blocks=4)
+    gen1.eval()
+    with torch.no_grad():
+        ref1 = gen1(x)["heat"]
+    zg1 = sum(1 for b in gen1.backbone.blocks if b.gain is not None)
+    gen2 = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01,
+                  n_blocks=n0 + 8, zero_gain_blocks=zg1 + 4)
+    missing, unexpected = gen2.load_state_dict(gen1.state_dict(), strict=False)
+    assert not unexpected, f"gen-2 growth rejects gen-1 tensors: {unexpected}"
+    gen2.eval()
+    with torch.no_grad():
+        d2 = (ref1 - gen2(x)["heat"]).abs().max().item()
+    assert d2 == 0.0, f"second-generation growth is not identity: {d2:.2e}"
+    print(f"  v22 gen-2 growth ({n0}->{n0+4}->{n0+8} blocks): identity {d2:.2e}")
+
     # a from-scratch v22 must be untouched by the new argument
     plain = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
     assert all(b.gain is None for b in plain.backbone.blocks), \
