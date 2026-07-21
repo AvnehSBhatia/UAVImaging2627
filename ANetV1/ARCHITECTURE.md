@@ -1368,3 +1368,25 @@ v22 beat the 25k model's *final* score in **16 epochs** rather than 67, and was 
 **What this reopens.** §16.2 concluded the family *underfits* and that data, distillation and further training were therefore all closed. That verdict was measured on an unregularized 25k model inside a single generator's distribution. With regularization present, 3× the parameters now pays — so the scaling curve (D65/§16.3) is live again, and §16.2's corollaries need re-deriving rather than being cited.
 
 **Next run:** the same configuration with the schedule allowed to complete.
+
+### 21.1 The full schedule buys calibration, not recall — prediction wrong
+
+Same configuration, `ANET_PATIENCE=40`, schedule allowed to complete (80 epochs, LR annealed to 0). §21 predicted this would "land meaningfully above 0.876" on recall. **It did not.**
+
+| | v13 + D85 (25k) | v22 short (ep16) | **v22 full (ep74)** |
+|---|---|---|---|
+| selection score | 1.846 | 1.884 | **1.889** |
+| mannequin recall (synth) | 0.854 | **0.876** | 0.865 |
+| tent recall | 0.973 | 0.975 | 0.973 |
+| **fp/img** | 1.48 | 1.41 | **1.14** |
+| **mannequin margin** | +0.255 | +0.281 | **+0.320** |
+| soft p at GT centre | 0.611 | 0.635 | **0.656** |
+| train loss | 1.27 | 1.16 | **1.03** |
+
+Recall went *down* 1.1pt from the short run's peak. What annealing actually bought was **calibration**: fp/img −19%, margin +0.039, soft p at GT +0.021. The selection score barely moved (1.884 → 1.889) precisely because it is recall-weighted and recall was flat.
+
+The prediction was specific and wrong, in the same way §20.3's was: I named the axis I expected to move and a different one moved. Recorded rather than reframed — that is now four wrong predictions this session against roughly as many correct diagnoses, and the pattern is consistent: **mechanism reasoning predicts *that* something will improve far more reliably than *which* metric will carry it.**
+
+**This makes the peak-threshold sweep the decisive open question, not a nicety.** The two checkpoints sit at different operating points (0.876 @ 1.41 fp vs 0.865 @ 1.14 fp), and a single threshold cannot rank them. A margin that rose +0.039 while fp fell 19% is the signature of a curve that has *moved*, not slid — but that is exactly what §16.6 assumed for v18 and never verified, and D80's whole lesson is that operating-point statistics mislead when read singly. The sweep (`evaluate_all --peak-thresh`) has been flagged unresolved since v18 and now gates the ranking of the family's two best models.
+
+`fp/img 1.14` is, at face value, well under v18's 1.722 "family record" — but that was a test-split number and this is val, so the comparison is not yet apples-to-apples either.
