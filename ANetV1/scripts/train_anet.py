@@ -452,6 +452,26 @@ def main():
             cfg.train.warmup_steps = 600 if cfg.train.arch == "v22" else 100
         if "ANET_LR" not in os.environ:
             cfg.train.lr = min(cfg.train.lr, 1.5e-3)
+        # A REQUESTED structural change that silently did not happen is the
+        # worst failure mode this script has: it trains something valid for
+        # 80 epochs and reports healthy numbers for the wrong model. It has
+        # already cost one MI300X run — a box on an older commit ignored
+        # ANET_FUNNEL_RANK as an unknown env var and simply retrained the
+        # donor. Verify the request against the model that was actually built.
+        if _RANK and getattr(model.backbone, "funnel_rank", None) != min(
+                _RANK, model.backbone.channels[2]):
+            raise SystemExit(
+                f"ANET_FUNNEL_RANK={_RANK} was requested but the model built "
+                f"has funnel_rank="
+                f"{getattr(model.backbone, 'funnel_rank', 'N/A')}. The shrink "
+                f"did NOT apply — refusing to train the wrong model. Most "
+                f"likely this checkout predates D90: run `git pull`.")
+        if _GROW and cfg.train.arch == "v22" and len(model.backbone.blocks) <= 3:
+            raise SystemExit(
+                f"ANET_GROW_BLOCKS={_GROW} was requested but the model has "
+                f"only {len(model.backbone.blocks)} s20 blocks — growth did "
+                f"NOT apply. Refusing to train the wrong model; check that "
+                f"this checkout has the D88 growth path (`git pull`).")
         print(f"RESUMING from {init} (warm start: lr={cfg.train.lr}, "
               f"warmup={cfg.train.warmup_steps})")
     else:
