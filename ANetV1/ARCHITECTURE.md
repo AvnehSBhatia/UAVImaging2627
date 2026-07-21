@@ -1493,3 +1493,29 @@ Against that, the measured parameter budget:
 **The second, independent finding — a "faster" lever, deliberately not run in the same experiment.** If 65% of the parameters produce no measurable gain, a *narrower* funnel should match at far lower cost — 216.7M MACs and 51k weights is a large fraction of the deploy budget for a stage whose only job is lossless preservation. That is a one-variable run of its own (D69), and it is the first efficiency lever this project has had evidence for.
 
 **Test hygiene fixed in passing:** `smoke_test.py` was unseeded while asserting on statistics of a *random* init — v13's "eval forward sits at the fg prior" check fired once at p.mean()=0.267 against a 0.001–0.1 band, then passed 3/3 in isolation. A flaky assert in the repo's only automated check is worse than no assert: it blocks legitimate work, and the tempting fix is to change the model. `torch.manual_seed(0)` now heads `main()`.
+
+### 22.1 D88 result — capacity now buys calibration only; the scaling curve has flattened
+
+Read at epoch 69/80 (LR 3.6e-5, everything flat for ~15 epochs). Best selection 1.912 @ ep63.
+
+| | donor v22 (ep0) | **v22 +4 blocks** | Δ |
+|---|---|---|---|
+| selection score | 1.888 | **1.912** | +0.024 |
+| **mannequin recall (synth)** | **0.865** | **0.868** | **+0.003** |
+| tent recall | 0.970 | 0.977 | +0.007 |
+| fp/img | 1.11 | **0.95–1.02** | **−10%** |
+| mannequin margin | +0.320 | **+0.356** | +0.036 |
+| soft p at GT centre | 0.655 | **0.682** | +0.027 |
+| epoch time | ~16 s | ~16 s | **unchanged** |
+
+**Falsifier 2 (no erosion): passes** — train loss 1.05 → 0.90 with val flat-to-up throughout. **Falsifier 4 (throughput): passes** — +31% parameters at *no measurable cost*, confirming §21.5's reasoning that s20 depth is nearly free because the maps are 27×48. Falsifiers 1 and 3 need the sweep.
+
+**Recall did not move: 0.865 → 0.868.** Every gain is precision-side. That is now the **third consecutive** observation of the same thing — §21.1 (v22's cosine completing), the §22 interim read, and now the full D88 run — so it is a property of this setup, not a coincidence:
+
+> **At ≥78k parameters on this data, synthetic recall is not capacity-bound. Added capacity buys calibration (fp, margin, confidence), not detection.**
+
+That converges with §21.5 from the other direction: post-blocks tail was already 0.00004 and the head read 0.00000, i.e. the synthetic task is essentially solved at 78k. Two independent measurements now say the same thing.
+
+**Scaling verdict.** D86 bought +0.043 selection for +53.5k params; D88 bought +0.024 for +24.1k. The curve has not collapsed, but it has flattened onto a purely precision-side axis while the mission metric — recall on small real objects — sits still. **Further depth or width on this data is not the lever**, and the D65 curve should be considered answered rather than open: it was reopened by D86 (§21) on the strength of capacity paying, and it is closed again here on the strength of capacity paying *only where the task is already solved*.
+
+**What is left is the same thing §20.5 and §21.4 identified and nothing since has moved:** real-scene object appearance. The prone person in brush is missed by every checkpoint in this family; the training objects are Blender renders composited onto real backgrounds; augmentation widened the *background* distribution (D85, and it worked) but cannot make a rendered mannequin look like a photograph of a person. That is gen2 work — object realism — not architecture work, and it is where the next real gain is.
