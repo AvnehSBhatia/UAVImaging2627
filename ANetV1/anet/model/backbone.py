@@ -1189,7 +1189,7 @@ class V22Backbone(nn.Module):
     precedent)."""
 
     def __init__(self, head_width=24, prior_fg=None, n_blocks=3,
-                 channels=(16, 32, 64)):
+                 channels=(16, 32, 64), zero_gain_blocks=0):
         super().__init__()
         ch_stem, ch_mid, ch_top = channels
         self.channels = tuple(channels)
@@ -1199,8 +1199,18 @@ class V22Backbone(nn.Module):
         self.down4 = _DWSep(ch_stem, ch_mid, k=3, stride=2)
         self.block4 = _DWSep(ch_mid, ch_mid, k=3, stride=1)
         self.down20 = _DWSep(ch_mid, ch_top, k=5, stride=5)
+        # D88: the last `zero_gain_blocks` s20 blocks are zero-gamma-valved,
+        # so growing depth over a trained v22 is an EXACT identity at step 0
+        # (D63 contract, the same move that made v22's funnel growth work).
+        # Depth is the measured lever: §21.5 fit linear probes at every stage
+        # of v22_d85_best and the s20 blocks carry the discrimination —
+        # post-funnel tail 0.00444 -> post-blocks 0.00004, a 100x drop — while
+        # the funnel itself adds nothing over its own input (s4 max-pool
+        # 0.00441 -> post-funnel 0.00444) yet holds 65% of the parameters.
         self.blocks = nn.Sequential(
-            *[_DWSep(ch_top, ch_top, k=5, stride=1) for _ in range(n_blocks)])
+            *[_DWSep(ch_top, ch_top, k=5, stride=1,
+                     zero_gain=(i >= n_blocks - zero_gain_blocks))
+              for i in range(n_blocks)])
         self.head = nn.Sequential(
             nn.Conv2d(ch_top, head_width, 1),
             nn.SiLU(),

@@ -646,6 +646,43 @@ def v22_checks():
     print("  v22 checks passed")
 
 
+def v22_growth_checks():
+    """D88 s20 depth growth. §21.5 measured v22's budget as inverted — the
+    funnel holds 65% of the weights and adds nothing over its own input, while
+    the s20 blocks hold 23% and carry the discrimination (tail 0.00444 ->
+    0.00004). Growth must therefore be EXACT identity at step 0, or the run
+    cannot attribute any change to the added depth."""
+    donor = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
+    donor.eval()
+    x = torch.rand(2, 3, 540, 960)
+    with torch.no_grad():
+        ref = donor(x)["heat"]
+    n0 = len(donor.backbone.blocks)
+    for grow in (2, 4, 6):
+        g = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01,
+                   n_blocks=n0 + grow, zero_gain_blocks=grow)
+        missing, unexpected = g.load_state_dict(donor.state_dict(), strict=False)
+        assert not unexpected, f"grown v22 rejects donor tensors: {unexpected}"
+        ok = tuple(f"backbone.blocks.{i}." for i in range(n0, n0 + grow))
+        assert not [k for k in missing if not k.startswith(ok)], \
+            "growth introduced tensors outside the new blocks"
+        g.eval()
+        with torch.no_grad():
+            d = (ref - g(x)["heat"]).abs().max().item()
+        assert d == 0.0, f"+{grow} blocks is not bit-exact identity: {d:.2e}"
+        # the valve must be ALIVE — a zero gain that cannot move is dead weight
+        gains = [b.gain for b in list(g.backbone.blocks)[n0:]]
+        assert all(p is not None and p.requires_grad for p in gains), \
+            "grown blocks have no trainable gain"
+        n = sum(p.numel() for p in g.parameters())
+        print(f"  v22 +{grow} blocks: {n:,} params, identity delta {d:.2e}")
+    # a from-scratch v22 must be untouched by the new argument
+    plain = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
+    assert all(b.gain is None for b in plain.backbone.blocks), \
+        "default v22 gained zero-gain valves — its semantics changed"
+    print("  v22 growth checks passed")
+
+
 def aug_checks(root):
     """D85 augmentation. The failure mode that matters is SILENT: a flip that
     mirrors the image but not the targets trains the model against
@@ -700,6 +737,13 @@ def aug_checks(root):
 
 
 def main():
+    # Deterministic: several checks assert on statistics of a RANDOM init
+    # (e.g. v13's "eval forward at init sits at the fg prior"). Unseeded,
+    # those fire on an unlucky draw — observed once at p.mean()=0.267 against
+    # a 0.001-0.1 band, while the same check passed 3/3 in isolation. A flaky
+    # assert in the repo's ONLY automated check is worse than no assert: it
+    # blocks legitimate work, and the tempting fix is to change the model.
+    torch.manual_seed(0)
     # use_checkpoint=False: smoke should be fast; MI300X training config also disables it
     for stem in ("edge_dq", "highpass"):
         for per_ch in (False, True):
@@ -719,6 +763,7 @@ def main():
     v19_checks()
     v20_checks()
     v22_checks()
+    v22_growth_checks()
     model = ANetV1(use_checkpoint=False, stem="edge_dq")  # training default (D33 + D37)
     assert model.n_win == 5035 and model.nh == 53 and model.nw == 95
 

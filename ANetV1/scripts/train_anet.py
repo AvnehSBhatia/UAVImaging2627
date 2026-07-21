@@ -73,6 +73,8 @@ from anet.train.trainer import Trainer  # noqa: E402
 # encoder layouts differ.
 # --------------------------------------------------------------------------
 _ARCH = os.environ.get("ANET_ARCH") or "v13"
+# D88: number of NEW zero-gain s20 blocks to graft onto a v22 donor.
+_GROW = int(os.environ.get("ANET_GROW_BLOCKS", 0))
 
 cfg = anet_cfg(
     # v9 (region-classification) config — kept available, commented, so v9
@@ -254,6 +256,43 @@ def main():
                   f"D39/16.1 law); {trainable:,} params train (mannequin "
                   f"branch only)")
             model = m23
+        elif model.arch == "v22" and cfg.train.arch == "v22" and _GROW:
+            # D88 depth growth: v22 -> deeper v22. §21.5 fit linear probes at
+            # every stage of v22_d85_best and found the parameter budget
+            # inverted — spd_proj holds 65% of the weights while adding
+            # nothing over its own input (s4 max-pool tail 0.00441 ->
+            # post-funnel 0.00444), whereas the three s20 blocks hold 23% and
+            # carry the discrimination (0.00444 -> 0.00004, a 100x drop). So
+            # the licensed move is depth at s20, not more funnel.
+            #
+            # The added blocks are zero-gamma-valved (D63), so step 0 is the
+            # donor EXACTLY — the same contract that made v22's own growth
+            # work, applied to the stage the measurement indicts.
+            n_donor = len(model.backbone.blocks)
+            m22 = ANetV1(arch="v22",
+                         use_checkpoint=cfg.train.use_checkpoint,
+                         head_width=cfg.train.head_width,
+                         prior_fg=getattr(cfg.train, "prior_fg", None),
+                         channels=model.backbone.channels,
+                         n_blocks=n_donor + _GROW,
+                         zero_gain_blocks=_GROW)
+            missing, unexpected = m22.load_state_dict(model.state_dict(),
+                                                      strict=False)
+            assert not unexpected, \
+                f"v22->v22 growth: donor tensors with nowhere to go: {unexpected}"
+            new_ok = tuple(f"backbone.blocks.{i}." for i in
+                           range(n_donor, n_donor + _GROW))
+            stray = [k for k in missing if not k.startswith(new_ok)]
+            assert not stray, f"v22->v22 growth: unexpected new tensors: {stray}"
+            if os.environ.get("ANET_FREEZE_TRUNK") == "1":
+                raise SystemExit(
+                    "ANET_FREEZE_TRUNK is not supported for v22 depth growth: "
+                    "the fresh blocks sit between frozen stages whose stats "
+                    "would chase them (the 16.1 failure mode).")
+            print(f"v22 -> v22 depth growth: {n_donor} -> {n_donor + _GROW} "
+                  f"s20 blocks, {_GROW} zero-gain-valved (identity at step 0); "
+                  f"{sum(p.numel() for p in m22.parameters()):,} params")
+            model = m22
         elif model.arch == "v13" and cfg.train.arch == "v22":
             # v22 (D72): the family's first FULL-identity capacity growth —
             # every donor tensor (weights AND DeployNorm stat buffers) lands

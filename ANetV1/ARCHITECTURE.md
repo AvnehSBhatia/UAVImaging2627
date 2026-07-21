@@ -1440,3 +1440,56 @@ Re-measured, and separating by **geometry** rather than by score — `web_drygra
 `eval_open_easy_both` — the case §18.1 opened with ("a spread-eagle person on clean bare dirt scores 0.10 while empty-corner background scores 0.33–0.36") — now shows the person as the dominant, tightly-localized blob at 0.58, and v13's spurious peak on the *tent edge* (the mannequin channel firing on a tent) is gone.
 
 **Two failures persist and are visible.** (1) The empty-corner peak in `eval_open_easy_both` survives in both models — background with no structure at all still produces a peak. (2) `eval_runway_scrub_mann` contains a prone person in brush that **neither** model detects, the exact case §18.1 flagged; what changed is that the sagebrush around it no longer fires, not that the person does. The real-scene object-appearance gap (§19.3, §20.5) is unclosed, consistent with falsifier 2 having failed.
+
+## 22. The redesign is a rebalance, not a mechanism (§21.5 → D88)
+
+### 21.5 Where v22+D85 is actually bottlenecked
+
+The family's ledger is unambiguous: **twelve added mechanisms (D59–D81) measured zero or negative**, while the two changes that worked were a training-distribution fix (D85) and capacity *at the right place* (D86). So the redesign question is not "what mechanism" but "where is the constraint" — measured by fitting the best linear readout at every stage of the trained `v22_d85_best` and reading the D80 tail off each (342 synthetic test frames, negatives uniform-random outside a ±3-cell exclusion, probe fit/eval disjoint):
+
+| stage | ch | tail | AUC |
+|---|---|---|---|
+| s2 stem (max-pool) | 16 | 0.01431 | 0.9357 |
+| s4 stage (avg-pool) | 32 | 0.00624 | 0.9414 |
+| **s4 stage (max-pool)** | 32 | **0.00441** | 0.9285 |
+| **s20 post-funnel** | 64 | **0.00444** | 0.9327 |
+| **s20 post-blocks** | 64 | **0.00004** | 0.9893 |
+| head hidden | 24 | 0.00008 | 0.9985 |
+| model head (reference) | — | 0.00000 | 0.9988 |
+
+Two readings, and they invert the parameter budget:
+
+1. **The funnel is no longer lossy — and no longer a lever.** s4-max 0.00441 → post-funnel 0.00444 is *flat*. v22's full-rank + peak branch did exactly its job: the D62/D64 information loss at `down20` is closed. But it adds nothing beyond preserving what s4 already held, so further funnel capacity is unlicensed.
+2. **The s20 residual blocks are the discrimination engine.** 0.00444 → 0.00004 is a **100× drop**, AUC 0.933 → 0.989. Everything that separates object from clutter is built there. The head loses nothing (0.00004 → 0.00008 → 0.00000), so the 64→24→4 readout is not a constraint either.
+
+Against that, the measured parameter budget:
+
+| component | params | share | tail improvement produced |
+|---|---|---|---|
+| **`spd_proj` (funnel)** | **51,200** | **65.0%** | **none** (0.00441 → 0.00444) |
+| **`blocks` (3× s20)** | **17,856** | **22.7%** | **100×** (0.00444 → 0.00004) |
+| `down20` (donor funnel) | 3,040 | 3.9% | — |
+| stem/down4/block4 | 2,656 | 3.4% | — |
+| `peak_proj` | 2,048 | 2.6% | — |
+| head | 1,660 | 2.1% | none lost |
+
+**65% of the model sits in a stage that adds nothing; 23% sits in the stage doing 100× of the work.** That is the redesign, and it is a rebalance — no new mechanism, which is precisely what the 0-for-12 ledger recommends.
+
+### D88 — depth at s20, under the identity contract
+
+`V22Backbone(n_blocks=N, zero_gain_blocks=K)`: the last K s20 blocks carry `_DWSep`'s zero-gamma valve, so a grown model warm-started from `v22_d85_best` is the donor **bit-exactly** at step 0 — verified 0.00e+00 at +2, +4 and +6 blocks with every donor tensor landing and no stray new tensors. Same D63 contract that made v22's own growth work, applied to the stage the measurement indicts rather than the one that is already saturated.
+
+| depth | params | vs v22 |
+|---|---|---|
+| 3 (v22 today) | 78,717 | — |
+| 5 | 90,749 | +12,032 |
+| **7** | **102,781** | **+24,064** |
+| 9 | 114,813 | +36,096 |
+
+`ANET_GROW_BLOCKS=K` selects it; from-scratch v22 construction is untouched (smoke asserts the default still has no valves, so v22's shapes and semantics are unchanged).
+
+**Pre-registered falsifiers.** (1) Beat `v22_d85_best` on `..._smallest_quartile_synthetic` (the powered key), not the decile. (2) No erosion — any epoch where `mannequin_synth` falls while train loss falls repeats §17.5. (3) Operating-curve **dominance** over `v22_d85_best` on the §21.2 sweep, not a single-threshold win; D80's law is that single points mislead. (4) Throughput within ~10% — depth at s20 is cheap (27×48 maps) but must be measured, not assumed.
+
+**The second, independent finding — a "faster" lever, deliberately not run in the same experiment.** If 65% of the parameters produce no measurable gain, a *narrower* funnel should match at far lower cost — 216.7M MACs and 51k weights is a large fraction of the deploy budget for a stage whose only job is lossless preservation. That is a one-variable run of its own (D69), and it is the first efficiency lever this project has had evidence for.
+
+**Test hygiene fixed in passing:** `smoke_test.py` was unseeded while asserting on statistics of a *random* init — v13's "eval forward sits at the fg prior" check fired once at p.mean()=0.267 against a 0.001–0.1 band, then passed 3/3 in isolation. A flaky assert in the repo's only automated check is worse than no assert: it blocks legitimate work, and the tempting fix is to change the model. `torch.manual_seed(0)` now heads `main()`.

@@ -37,7 +37,7 @@ class ANetV1(nn.Module):
     def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
                  path_a_per_channel=True, prior_fg=None, arch="v8", h1=48,
                  neck_rounds=2, head_width=24, aux_head=False, head_proto=True,
-                 channels=None, n_blocks=None):
+                 channels=None, n_blocks=None, zero_gain_blocks=0):
         super().__init__()
         self.prior_fg = prior_fg
         if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
@@ -80,6 +80,11 @@ class ANetV1(nn.Module):
                     kw["channels"] = tuple(channels)
                 if n_blocks is not None:
                     kw["n_blocks"] = n_blocks
+                # D88 depth growth: only v22 accepts it, and only a warm-start
+                # caller sets it (ANET_ZG_BLOCKS) — from-scratch construction
+                # leaves it 0 so v22's shapes and semantics are unchanged.
+                if zero_gain_blocks and arch == "v22":
+                    kw["zero_gain_blocks"] = zero_gain_blocks
                 self.backbone = cls_bb(**kw)
             return
         if arch == "v12":
