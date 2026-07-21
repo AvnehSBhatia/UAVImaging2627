@@ -1711,3 +1711,22 @@ Mechanically: training to convergence spreads information across more singular d
 **This is the §22.5 training-budget law generalizing beyond capacity comparisons: an under-trained model mis-reports its own compressibility too.** Any measurement that asks "how much of this model is needed" must be run on a converged model, for the same reason any capacity comparison must be.
 
 **Revised D90 target: rank 32** — `spd_proj` 51,200 → 27,648 weights (−46%), model 102,781 → **79,229 params (−23%)**, funnel MACs 66.4M → 33.2M (−50%), at a measured truncation floor of −0.006 median recall that training starts from and should close.
+
+### 23.2 Real scenes, final model — the false-positive side did transfer
+
+`v22g_r2_best` vs `v13_best` on the 14 preserved real web scenes (`runs/viz_scenes_final/`, mannequin channel, `peak_thresh=0.30`):
+
+| | v13 | **v22g_r2** | |
+|---|---|---|---|
+| peaks > 0.30, all 14 | 48 | **21** | **−56%** |
+| peaks > 0.30, nadir 12 | 28 | **10** | **−64%** |
+| background p99 (median) | 0.215 | **0.135** | **−37%** |
+| nadir scenes with ZERO mannequin peaks | 1 | **5** | — |
+
+Per-scene highlights: `eval_runway_scrub_mann` goes **5 peaks → 0** (§18.1's "fires 0.50–0.58 on painted runway numbers" is gone entirely); `eval_open_easy_both` 3 → 1 with the object response rising 0.47 → 0.55; `scene_tent_trees_clearing` 0.52 → 0.80; `eval_clearing_blue_tent` 0.82 → 0.88 at 3 → 1 peaks.
+
+**Reading the falling maxima correctly.** Five scenes show a lower max, and the §21.4 caution applies doubly here: the overlay is the **mannequin** channel, so `eval_tent_only_open` (0.44 → 0.26, 2 → 0 peaks) and `eval_dirt_redtent_camo` (0.54 → 0.33) are *tent-only* scenes where a quiet mannequin channel is the **correct** answer. v13's peaks there were false positives; their disappearance is the win, not a loss.
+
+**The one genuinely unresolved case is unchanged.** `eval_mann_only_brush` — a person in dense brush — reads max 0.22 with zero peaks, versus v13's 0.33 with one. Inspected at full resolution, the frame is uniform brush with no visually locatable person and no structured response anywhere; given v13 put 5/5 of its peaks on bare asphalt in the runway scene, its 0.33 here was most likely brush too. **So this is not a measured regression — it is the same object neither model has ever detected** (§21.4), and it remains the standing real-scene failure.
+
+**Net for the session on real imagery:** §20.5's falsifier 2 asked for improved object/background *separation* and got a flat answer at the 78k tier. At the final model the background side has moved decisively (−64% spurious peaks on nadir frames, −38% background p99) while object responses on scenes with visible targets rose. Separation improved because the background collapsed, not because objects got brighter — which is consistent with everything measured: **the false-positive half of the real-scene gap closed; the object-appearance half did not.** That remains gen2 work.
