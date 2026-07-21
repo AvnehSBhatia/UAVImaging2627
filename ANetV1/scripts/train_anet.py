@@ -78,6 +78,21 @@ _GROW = int(os.environ.get("ANET_GROW_BLOCKS", 0))
 # D90: factorize spd_proj to this rank, SVD-warm-started from the donor.
 _RANK = int(os.environ.get("ANET_FUNNEL_RANK", 0))
 
+
+def _svd_no_lapack(M):
+    """SVD that survives the MI300X torch build (no CPU LAPACK). Try the GPU
+    linalg path first (rocSOLVER, no LAPACK needed); fall back to numpy on
+    the host. Both return U, S, Vh with M ~= (U * S) @ Vh."""
+    if torch.cuda.is_available():
+        try:
+            U, S, Vh = torch.linalg.svd(M.cuda(), full_matrices=False)
+            return U.cpu(), S.cpu(), Vh.cpu()
+        except Exception:  # noqa: BLE001 — fall through to numpy
+            pass
+    import numpy as _np
+    U, S, Vh = _np.linalg.svd(M.cpu().numpy(), full_matrices=False)
+    return (torch.from_numpy(U), torch.from_numpy(S), torch.from_numpy(Vh))
+
 cfg = anet_cfg(
     # v9 (region-classification) config — kept available, commented, so v9
     # can still be run by swapping the two blocks below:
@@ -271,7 +286,7 @@ def main():
             bb = model.backbone
             W = bb.spd_proj.weight.data.float()            # (ch_top, ch_mid, 5, 5)
             co, ci, k, _ = W.shape
-            U, S, Vh = torch.linalg.svd(W.reshape(co, -1), full_matrices=False)
+            U, S, Vh = _svd_no_lapack(W.reshape(co, -1))
             r = min(_RANK, S.numel())
             m22 = ANetV1(arch="v22",
                          use_checkpoint=cfg.train.use_checkpoint,

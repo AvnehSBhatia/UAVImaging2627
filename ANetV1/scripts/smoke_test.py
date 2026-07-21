@@ -713,9 +713,13 @@ def v22_growth_checks():
     # random re-roll.
     full = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01, n_blocks=n0 + 4,
                   zero_gain_blocks=4)
+    import numpy as np  # torch.linalg.svd needs LAPACK, absent on MI300X torch
     W = full.backbone.spd_proj.weight.data.float()
     co, ci, kk, _ = W.shape
-    U, S, Vh = torch.linalg.svd(W.reshape(co, -1), full_matrices=False)
+    # numpy SVD, not torch.linalg — the MI300X torch build has no CPU LAPACK
+    # and torch.linalg.svd raises there (the D90 shrink hit this on hardware).
+    _U, _S, _Vh = np.linalg.svd(W.reshape(co, -1).numpy(), full_matrices=False)
+    U, S, Vh = torch.from_numpy(_U), torch.from_numpy(_S), torch.from_numpy(_Vh)
     for r in (32, 16):
         lo = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01,
                     n_blocks=n0 + 4, zero_gain_blocks=4, funnel_rank=r)
