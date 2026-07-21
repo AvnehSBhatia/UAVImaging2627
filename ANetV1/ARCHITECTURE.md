@@ -1669,3 +1669,26 @@ The clean experiment, never run: train each tier to convergence — repeated cos
 **New best model: `runs/anet/v22g_r2_best.pt`** (102,781 params).
 
 **What this licenses next, in order.** (1) A *third* cosine cycle from `r2` — nearly free, and it establishes whether cycling has converged before anything else is concluded. (2) Only then the D90 funnel shrink, warm-started from the converged donor rather than an under-trained one. (3) Re-run the capacity comparison at convergence if the scaling question still matters.
+
+### 22.5 Cycling converges at cycle 2; the checkpoint selector is sound
+
+Third cosine cycle from `v22g_r2`. Val print said sel 1.932 → 1.940 (+0.008). The sweep says it gained **nothing**:
+
+| synth fp | r2 (cycle 2) | r3 best | r3 last |
+|---|---|---|---|
+| **mannequin** 0.10 | 0.806 | 0.806 | 0.790 |
+| 0.50 | 0.881 | 0.881 | 0.869 |
+| 1.00 | 0.906 | 0.907 | 0.904 |
+| **quartile** 0.10 | **0.703** | 0.685 | 0.671 |
+| 0.50 | 0.791 | 0.790 | 0.783 |
+| **decile** 0.50 | 0.714 | 0.714 | 0.690 |
+
+`r3_best` vs `r2`: min −0.005, median −0.001, max +0.005 — indistinguishable. **Cycling converged at cycle 2**: cycle 1→2 was a large real gain (§22.4), cycle 2→3 is nothing, and the val print's +0.008 was noise. Fourth instance of the per-epoch selection score misreporting a comparison — this time by *over*stating.
+
+**The checkpoint-selector hypothesis is falsified, and that matters.** §22.4's log showed sel plateauing at ep23 while fp fell 0.94 → 0.82 and margin rose +0.394 → +0.404 through ep63, so `best.pt` (ep23) looked like it might be losing to the later, better-calibrated weights. It is not: `r3_last` is **worse** than `r3_best` at every operating point (min −0.016, median −0.009). The recall-weighted selection score is blind to calibration *within* a run, but the calibration drift it ignores does not translate into operating-curve gains. `best.pt` selection needs no change — a good outcome, since it would have invalidated every checkpoint in the record.
+
+**Final model: `runs/anet/v22g_r2_best.pt`** (102,781 params), tied with `r3_best` and marginally ahead at the low-fp end (quartile 0.703 vs 0.685 at 0.10 fp).
+
+**§22.3 remains confounded, and the run that settles it is now well-defined.** Convergence takes ~2 cycles; D88 (103k) and D89 (127k) each received one. So the scaling comparison was run one cycle short *at every tier*. The clean experiment is a **second cycle on the 127k model** — if it gains what 103k's second cycle gained, capacity was never exhausted and §22.3 is simply wrong; if it converges below 103k-cycle-2, the curve genuinely bends and §22.3 stands for the right reason. One run either way.
+
+**The training-budget law this session produced.** *A capacity comparison run at fixed epoch budget measures the interaction of capacity and training, not capacity.* Every tier must be trained to convergence — defined as a cosine cycle that produces no sweep-measurable gain — before its parameter count means anything. Neither §21 nor §22 did this, which is why §22.3's verdict had to be withdrawn and cannot yet be reinstated.
