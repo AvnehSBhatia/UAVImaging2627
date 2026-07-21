@@ -199,6 +199,12 @@ class CenterObjectMetrics:
         # than at a matched peak on purpose: it stays defined when the object
         # is missed entirely, which is exactly the interesting case.
         self._margins = {1: [], 2: []}
+        # D87: fp sliced by source. `fp_per_image` pools all frames, and the
+        # test split is 1,267 VisDrone vs 449 synthetic — so the number the
+        # family has always quoted is ~74% VisDrone-driven, the same defect
+        # D82 found in recall. Mission fp is the synthetic-only figure.
+        self.fp_synth = 0
+        self.images_synth = 0
 
     @staticmethod
     def _to_numpy(x):
@@ -243,6 +249,8 @@ class CenterObjectMetrics:
         grid_h, grid_w = heat_prob.shape[-2:]
         if count_image:
             self.images += 1
+            if not is_vd:
+                self.images_synth += 1
         for i, c in enumerate(cls_ids):
             rows, cols = self._find_peaks(heat_prob[i], self.peak_thresh)
             dx = offset_prob[0, rows, cols]
@@ -270,14 +278,18 @@ class CenterObjectMetrics:
                 r0, r1 = max(gr - 3, 0), min(gr + 4, grid_h)
                 c0, c1 = max(gc - 3, 0), min(gc + 4, grid_w)
                 gt_mask[r0:r1, c0:c1] = True
-            self.fp_components += int((~matched).sum())
+            n_fp = int((~matched).sum())
+            self.fp_components += n_fp
+            if not is_vd:
+                self.fp_synth += n_fp
             if true_scores and not gt_mask.all():
                 bg_max = float(heat_prob[i][~gt_mask].max())
                 self._margins[c + 1].append(
                     float(np.mean(true_scores)) - bg_max)
 
     def summary(self):
-        out = {"fp_per_image": self.fp_components / max(self.images, 1)}
+        out = {"fp_per_image": self.fp_components / max(self.images, 1),
+               "fp_per_image_synthetic": self.fp_synth / max(self.images_synth, 1)}
         recs = self.records
         for k, name in ((1, "mannequin"), (2, "tent")):
             sub = [r for r in recs if r[0] == k]
