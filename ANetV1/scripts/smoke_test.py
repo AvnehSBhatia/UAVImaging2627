@@ -706,10 +706,46 @@ def v22_growth_checks():
     assert d2 == 0.0, f"second-generation growth is not identity: {d2:.2e}"
     print(f"  v22 gen-2 growth ({n0}->{n0+4}->{n0+8} blocks): identity {d2:.2e}")
 
+    # D90 low-rank funnel: shapes, reload round-trip, and the property the
+    # whole shrink rests on — an SVD warm start must reproduce truncating the
+    # full-rank weight in place, because that is the operating point measured
+    # offline and the reason the run starts from a known cost rather than a
+    # random re-roll.
+    full = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01, n_blocks=n0 + 4,
+                  zero_gain_blocks=4)
+    W = full.backbone.spd_proj.weight.data.float()
+    co, ci, kk, _ = W.shape
+    U, S, Vh = torch.linalg.svd(W.reshape(co, -1), full_matrices=False)
+    for r in (32, 16):
+        lo = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01,
+                    n_blocks=n0 + 4, zero_gain_blocks=4, funnel_rank=r)
+        lo.load_state_dict({k2: v for k2, v in full.state_dict().items()
+                            if k2 != "backbone.spd_proj.weight"}, strict=False)
+        with torch.no_grad():
+            lo.backbone.spd_proj_a.weight.copy_(Vh[:r].reshape(r, ci, kk, kk))
+            lo.backbone.spd_proj_b.weight.copy_((U[:, :r] * S[:r]).reshape(co, r, 1, 1))
+        trunc = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01,
+                       n_blocks=n0 + 4, zero_gain_blocks=4)
+        tsd = dict(full.state_dict())
+        tsd["backbone.spd_proj.weight"] = ((U[:, :r] * S[:r]) @ Vh[:r]).reshape(co, ci, kk, kk)
+        trunc.load_state_dict(tsd)
+        lo.eval(); trunc.eval()
+        with torch.no_grad():
+            d = (lo(x)["heat"] - trunc(x)["heat"]).abs().max().item()
+        assert d < 1e-3, f"rank-{r} SVD warm start != in-place truncation: {d:.2e}"
+        back = ANetV1.from_state_dict(lo.state_dict())
+        assert back.backbone.funnel_rank == r, "reload lost the funnel rank"
+        n = sum(p.numel() for p in lo.parameters())
+        print(f"  v22 funnel rank {r}: {n:,} params "
+              f"({n / sum(p.numel() for p in full.parameters()) * 100:.0f}%), "
+              f"SVD-vs-truncation {d:.1e}")
+
     # a from-scratch v22 must be untouched by the new argument
     plain = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
     assert all(b.gain is None for b in plain.backbone.blocks), \
         "default v22 gained zero-gain valves — its semantics changed"
+    assert plain.backbone.funnel_rank is None and hasattr(plain.backbone, "spd_proj"), \
+        "default v22 lost its full-rank funnel — its semantics changed"
     print("  v22 growth checks passed")
 
 

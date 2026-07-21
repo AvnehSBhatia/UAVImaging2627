@@ -1189,10 +1189,11 @@ class V22Backbone(nn.Module):
     precedent)."""
 
     def __init__(self, head_width=24, prior_fg=None, n_blocks=3,
-                 channels=(16, 32, 64), zero_gain_blocks=0):
+                 channels=(16, 32, 64), zero_gain_blocks=0, funnel_rank=None):
         super().__init__()
         ch_stem, ch_mid, ch_top = channels
         self.channels = tuple(channels)
+        self.funnel_rank = funnel_rank
         self.stem = nn.Conv2d(3, ch_stem, 3, 2, 1, bias=False)
         self.stem_norm = DeployNorm(ch_stem)
         self.act = nn.SiLU()
@@ -1222,7 +1223,24 @@ class V22Backbone(nn.Module):
         # matrix. spd_proj keeps its NAME for the trainer's 0.2x slow-LR
         # group (fan-in 800-equivalent); peak_proj (fan-in ch_mid) trains
         # at full LR — the tiny new mechanism should not be slowed.
-        self.spd_proj = nn.Conv2d(ch_mid, ch_top, 5, stride=5, bias=False)
+        # D90: optional low-rank funnel. `spd_proj` is 51,200 weights (65% of
+        # v22g) and 66.4M MACs (31% of the model) for a stage §21.5 measured
+        # as adding NOTHING over its own input — its job is preservation. The
+        # SVD of the TRAINED weight is nearly flat (cumulative energy 0.689 at
+        # rank 32, sigma_64/sigma_1 = 0.23), so the layer does use its rank
+        # and the compression is not free; but truncating it in place costs
+        # only -0.012 to -0.020 median recall at matched fp down to rank 24,
+        # and that is truncation WITHOUT retraining, i.e. a lower bound on
+        # what a trained factorization reaches.
+        #     rank 16:  13,824 params (-73%),  17.9M MACs (-73%)
+        # Factorized as (5x5 stride-5 -> r) then (1x1 r -> ch_top); both keep
+        # `spd_proj` in their NAME so the trainer's 0.2x slow-LR group still
+        # matches them.
+        if funnel_rank:
+            self.spd_proj_a = nn.Conv2d(ch_mid, funnel_rank, 5, stride=5, bias=False)
+            self.spd_proj_b = nn.Conv2d(funnel_rank, ch_top, 1, bias=False)
+        else:
+            self.spd_proj = nn.Conv2d(ch_mid, ch_top, 5, stride=5, bias=False)
         self.peak_proj = nn.Conv2d(ch_mid, ch_top, 1, bias=False)
         self.spd_norm = DeployNorm(ch_top)
         # tanh-bounded valve (x2): zero-init identity, range (-2, 2) — the
@@ -1245,7 +1263,9 @@ class V22Backbone(nn.Module):
     def forward(self, img):  # (B, 3, 540, 960) -> (B, 4, 27, 48)
         x = self.act(self.stem_norm(self.stem(img)))
         x_s4 = self.block4(self.down4(x))
-        z = self.spd_proj(x_s4) + self.peak_proj(F.max_pool2d(x_s4, 5, 5))
+        spd = (self.spd_proj_b(self.spd_proj_a(x_s4)) if self.funnel_rank
+               else self.spd_proj(x_s4))
+        z = spd + self.peak_proj(F.max_pool2d(x_s4, 5, 5))
         branch = self.act(self.spd_norm(z))
         x = self.down20(x_s4) + 2.0 * torch.tanh(self.spd_gain) * branch
         y = self.blocks(x)

@@ -75,6 +75,8 @@ from anet.train.trainer import Trainer  # noqa: E402
 _ARCH = os.environ.get("ANET_ARCH") or "v13"
 # D88: number of NEW zero-gain s20 blocks to graft onto a v22 donor.
 _GROW = int(os.environ.get("ANET_GROW_BLOCKS", 0))
+# D90: factorize spd_proj to this rank, SVD-warm-started from the donor.
+_RANK = int(os.environ.get("ANET_FUNNEL_RANK", 0))
 
 cfg = anet_cfg(
     # v9 (region-classification) config — kept available, commented, so v9
@@ -256,6 +258,53 @@ def main():
                   f"D39/16.1 law); {trainable:,} params train (mannequin "
                   f"branch only)")
             model = m23
+        elif (model.arch == "v22" and cfg.train.arch == "v22" and _RANK
+              and getattr(model.backbone, "funnel_rank", None) is None):
+            # D90 funnel shrink: full-rank spd_proj -> a rank-r factorization,
+            # warm-started from the donor's own SVD. Rank-r truncation is the
+            # BEST rank-r approximation of the trained weight (Eckart-Young),
+            # so step 0 is exactly the truncation point that was measured
+            # offline (-0.012 to -0.020 median recall at matched fp for
+            # r=24-32, WITHOUT retraining) rather than a random re-roll — the
+            # same "start from the proven point" discipline as the D63 growth
+            # contract, applied to a shrink. Everything else transfers by name.
+            bb = model.backbone
+            W = bb.spd_proj.weight.data.float()            # (ch_top, ch_mid, 5, 5)
+            co, ci, k, _ = W.shape
+            U, S, Vh = torch.linalg.svd(W.reshape(co, -1), full_matrices=False)
+            r = min(_RANK, S.numel())
+            m22 = ANetV1(arch="v22",
+                         use_checkpoint=cfg.train.use_checkpoint,
+                         head_width=cfg.train.head_width,
+                         prior_fg=getattr(cfg.train, "prior_fg", None),
+                         channels=bb.channels,
+                         n_blocks=len(bb.blocks),
+                         zero_gain_blocks=sum(1 for b in bb.blocks
+                                              if b.gain is not None),
+                         funnel_rank=r)
+            donor = {k2: v for k2, v in model.state_dict().items()
+                     if k2 != "backbone.spd_proj.weight"}
+            missing, unexpected = m22.load_state_dict(donor, strict=False)
+            assert not unexpected, f"v22 shrink: donor tensors stranded: {unexpected}"
+            stray = [k2 for k2 in missing
+                     if not k2.startswith(("backbone.spd_proj_a.",
+                                           "backbone.spd_proj_b."))]
+            assert not stray, f"v22 shrink: unexpected new tensors: {stray}"
+            with torch.no_grad():
+                m22.backbone.spd_proj_a.weight.copy_(
+                    Vh[:r].reshape(r, ci, k, k))
+                m22.backbone.spd_proj_b.weight.copy_(
+                    (U[:, :r] * S[:r]).reshape(co, r, 1, 1))
+            energy = float((S[:r] ** 2).sum() / (S ** 2).sum())
+            n_old = W.numel()
+            n_new = m22.backbone.spd_proj_a.weight.numel() + \
+                m22.backbone.spd_proj_b.weight.numel()
+            print(f"v22 funnel shrink: spd_proj rank {S.numel()} -> {r} via SVD "
+                  f"warm start; {n_old:,} -> {n_new:,} weights "
+                  f"({n_new / n_old * 100:.0f}%), {energy:.3f} of spectral "
+                  f"energy retained; {sum(p.numel() for p in m22.parameters()):,} "
+                  f"params total")
+            model = m22
         elif model.arch == "v22" and cfg.train.arch == "v22" and _GROW:
             # D88 depth growth: v22 -> deeper v22. §21.5 fit linear probes at
             # every stage of v22_d85_best and found the parameter budget

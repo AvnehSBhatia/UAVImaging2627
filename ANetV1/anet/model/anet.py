@@ -37,7 +37,8 @@ class ANetV1(nn.Module):
     def __init__(self, use_checkpoint=True, dense=True, hidden=16, stem="highpass",
                  path_a_per_channel=True, prior_fg=None, arch="v8", h1=48,
                  neck_rounds=2, head_width=24, aux_head=False, head_proto=True,
-                 channels=None, n_blocks=None, zero_gain_blocks=0):
+                 channels=None, n_blocks=None, zero_gain_blocks=0,
+                 funnel_rank=None):
         super().__init__()
         self.prior_fg = prior_fg
         if arch in ("v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
@@ -85,6 +86,8 @@ class ANetV1(nn.Module):
                 # leaves it 0 so v22's shapes and semantics are unchanged.
                 if zero_gain_blocks and arch == "v22":
                     kw["zero_gain_blocks"] = zero_gain_blocks
+                if funnel_rank and arch == "v22":
+                    kw["funnel_rank"] = funnel_rank
                 self.backbone = cls_bb(**kw)
             return
         if arch == "v12":
@@ -255,6 +258,10 @@ class ANetV1(nn.Module):
             # v15's D64 SPD projection and v14's D59 noise filter are their
             # unique keys; a bare backbone. prefix is v13. Channel plan and
             # depth are inferred from shapes so D65-scaled checkpoints load.
+            # D90: a low-rank funnel replaces spd_proj with an a/b pair, so
+            # sniff it before anything keyed on spd_proj's presence.
+            fr = (sd["backbone.spd_proj_a.weight"].shape[0]
+                  if "backbone.spd_proj_a.weight" in sd else None)
             if "backbone.man_proj.weight" in sd:
                 # v23's unique key (dual-grid mannequin branch). Its channel
                 # plan reads off the trunk, not the branch: man_proj's fan-in
@@ -263,15 +270,19 @@ class ANetV1(nn.Module):
                 channels = (sd["backbone.stem.weight"].shape[0],
                             sd["backbone.down4.pw.weight"].shape[0],
                             sd["backbone.tent_head.0.weight"].shape[1])
-            elif "backbone.spd_gain" in sd:
+            elif "backbone.spd_gain" in sd:  # v22 (incl. D90 low-rank funnel)
                 # v22's unique key — MUST be sniffed before v15 (v22 reuses
                 # the spd_proj NAME on purpose, to inherit the slow-LR
                 # group, but its funnel is the fused Conv2d(ch_mid, ch_top,
                 # 5, stride=5), so in_channels IS ch_mid directly).
                 arch = "v22"
-                w = sd["backbone.spd_proj.weight"]
-                channels = (sd["backbone.stem.weight"].shape[0],
-                            w.shape[1], w.shape[0])
+                w = sd.get("backbone.spd_proj.weight")
+                channels = ((sd["backbone.stem.weight"].shape[0],
+                             sd["backbone.spd_proj_a.weight"].shape[1],
+                             sd["backbone.spd_proj_b.weight"].shape[0])
+                            if w is None else
+                            (sd["backbone.stem.weight"].shape[0],
+                             w.shape[1], w.shape[0]))
             elif "backbone.unembed1.weight" in sd:
                 # v20's unique key — MUST be sniffed before v15: both archs
                 # carry a spd_proj (v20 reuses the name to inherit the
@@ -328,6 +339,7 @@ class ANetV1(nn.Module):
                         channels=channels,
                         n_blocks=None if arch == "v14" else n_blocks,
                         zero_gain_blocks=zg,
+                        funnel_rank=fr,
                         **kwargs)
             model.load_state_dict(sd, strict=True)
             return model

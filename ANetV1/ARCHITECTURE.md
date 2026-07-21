@@ -1594,3 +1594,45 @@ Recall at matched **synthetic** fp, three tiers:
 | v22g11 (D89) | 126,845 | 0.865 | 0.756 | 0.624 |
 
 \*at 0.10 fp for the 25k tier where its curve is comparable.
+
+## 23. D90 — the funnel shrink, measured before it was built
+
+§21.5's other finding was never acted on: `spd_proj` is **51,200 weights (65% of v22g) and 66.4M MACs (31% of the model)** for a stage measured as adding *nothing* over its own input (s4 max-pool tail 0.00441 → post-funnel 0.00444). Its job is preservation. So how much of it is actually needed?
+
+**The trained weight answers this for free.** It is a 64×800 matrix; SVD it and truncate in place. Rank-r truncation is the *best* rank-r approximation (Eckart–Young), so truncation is a **lower bound** on what a trained factorization achieves — and it costs one eval instead of one MI300X run per candidate rank.
+
+**The spectrum is nearly flat**, which is itself the answer to a standing question:
+
+| rank | cumulative energy | factorized params | vs full |
+|---|---|---|---|
+| 64 | 1.0000 | 55,296 | 108% |
+| 32 | 0.6889 | 27,648 | 54% |
+| 24 | 0.5791 | 20,736 | 40% |
+| 16 | 0.4533 | 13,824 | 27% |
+| 8 | 0.3052 | 6,912 | 14% |
+
+σ₆₄/σ₁ = 0.23 — **the layer genuinely uses its rank**. That vindicates D64's original indictment of v13's depthwise+pointwise funnel as rank-constrained: the full-rank map is not decoration, it is doing a full-rank job. "Adds no discrimination" and "uses its rank" are compatible, and both are true here: it is a full-rank *preservation* map.
+
+**Task effect at matched synthetic fp** (test split; matched fp because §22.2), recall delta vs the untouched rank-64 layer:
+
+| rank | params | % of full | min | median | max |
+|---|---|---|---|---|---|
+| 32 | 27,648 | 50% | −0.022 | **−0.012** | −0.004 |
+| **24** | **20,736** | **38%** | −0.020 | **−0.013** | +0.000 |
+| 16 | 13,824 | 25% | −0.035 | −0.020 | −0.002 |
+| 8 | 6,912 | 12% | −0.103 | **−0.033** | −0.026 |
+
+Graceful to rank 24, then a cliff at 8. Worst-quartile is flat to rank 16 within its noise (0.772 → 0.778 at 0.5 fp).
+
+**So the shrink is licensed but not free**, and the honest framing is that a *trained* factorization has to re-learn a compressed map rather than inherit one — the flat spectrum says there is no redundancy to harvest, only a rate/​accuracy trade to re-optimize. Truncation's −0.013 median at rank 24 is the floor training starts from, not the expected result.
+
+**Implementation.** `funnel_rank=r` factorizes `spd_proj` into `spd_proj_a` (5×5 stride-5, ch_mid→r) and `spd_proj_b` (1×1, r→ch_top); both keep `spd_proj` in the name so the trainer's 0.2× slow-LR group still matches. `ANET_FUNNEL_RANK=r` converts a trained full-rank donor **via its own SVD**, so step 0 is exactly the measured truncation point rather than a random re-roll — the D63 "start from the proven point" discipline applied to a shrink instead of a growth. Smoke asserts the SVD warm start equals in-place truncation bit-exactly, that the rank survives a `from_state_dict` round-trip, and that a default v22 still has its full-rank funnel.
+
+| model | params | vs v22g | funnel MACs |
+|---|---|---|---|
+| v22g (full rank) | 102,781 | — | 66.4M |
+| rank 32 | 79,229 | −23% | 33.2M |
+| **rank 24** | **72,317** | **−30%** | **24.9M** |
+| rank 16 | 65,405 | −36% | 17.9M |
+
+**Falsifiers.** (1) Match `v22g` on the §21.2 sweep at matched fp — this is a *no-regression* test, not an improvement test; the win is the parameter and MAC reduction. (2) Recover the truncation loss: run-1 starts at −0.013 median recall by construction, so anything that does not close most of that has failed. (3) Throughput must actually improve — a 30% MAC cut that does not show up in wall-clock means the layer was never the bottleneck and the shrink buys only model size.
