@@ -1411,3 +1411,32 @@ Re-measured, and separating by **geometry** rather than by score — `web_drygra
 | **nadir 12** separation | 0.276 | 0.241 | 0.267 | −3% |
 
 **The verdict does not flip.** On nadir frames the real-scene background is measurably quieter (bg p99 −20%, cells>0.30 −14%, both well-powered), but object/background **separation is still not improved** (−3%, i.e. flat) — and separation is what falsifier 2 asked for. §20.5's conclusion stands: the synthetic gains are not demonstrably the sharpness-tell closing. What changes is the severity — the "+55% high-confidence background" claim was an artifact of counting, and the background genuinely did get quieter.
+
+### 21.4 Full-resolution real-scene run — and why "max" is not a quality metric here
+
+`scripts/visualize_scenes.py --per-scene runs/viz_scenes_v22` writes the 960×540 overlays (the 0.5× 4-up contact sheet is unreadable for judging individual detections). v13 vs v22+D85, `peak_thresh=0.30`:
+
+| scene | v13 max / peaks / bg p99 | v22+D85 max / peaks / bg p99 |
+|---|---|---|
+| eval_clearing_blue_tent | 0.82 / 3 / 0.24 | **0.93 / 1 / 0.16** |
+| eval_dirt_redtent_camo | 0.54 / 2 / 0.21 | 0.36 / 2 / 0.18 |
+| eval_forest_edge_shade | 0.31 / 1 / 0.22 | 0.26 / **0** / 0.15 |
+| eval_long_shadows | 0.23 / 0 / 0.18 | 0.30 / 1 / 0.18 |
+| eval_mann_only_brush | 0.33 / 1 / 0.17 | 0.32 / 1 / 0.15 |
+| eval_open_easy_both | 0.47 / 3 / 0.17 | **0.58 / 2** / 0.16 |
+| eval_overcast_lowcontrast | 0.62 / 1 / 0.21 | 0.63 / 1 / **0.11** |
+| eval_runway_scrub_mann | 0.53 / 5 / 0.26 | 0.30 / **1** / 0.18 |
+| eval_tent_only_open | 0.44 / 2 / 0.16 | 0.31 / 1 / 0.13 |
+| scene_brush_occlusion | 0.47 / 4 / 0.25 | **0.56** / 3 / 0.21 |
+| scene_runway_drygrass | 0.49 / 4 / 0.22 | **0.60 / 2** / 0.24 |
+| scene_tent_trees_clearing | 0.52 / 2 / 0.21 | **0.67** / 2 / 0.18 |
+| *web_dryfield_brush* (oblique) | 0.59 / 5 / 0.33 | 0.42 / 1 / 0.21 |
+| *web_drygrass_runwayish* (oblique) | 0.46 / 15 / 0.34 | 0.74 / 14 / 0.47 |
+
+**Peaks above threshold — all 14: 48 → 32 (−33%). Nadir 12: 28 → 17 (−39%)**, fewer in 7 scenes, equal in 4, more in 1. `bg p99` is lower in 12 of 14.
+
+**"max" fell in 5 scenes, and in the ones inspected that is a FIX, not a regression.** `eval_runway_scrub_mann` at full resolution: v13's 5 peaks are **all on the asphalt**, none on any object — its 0.53 "max" was a false positive on runway surface, with a heavy red wash over the whole strip and the threshold markings. v22 leaves **1** peak, beside the painted "34", at 0.30. §18.1's specific complaint — "fires 0.50–0.58 on painted runway numbers" — is measurably suppressed. On unlabeled frames the per-frame **maximum is whatever scores highest, object or not**, so a falling max on a scene whose peak count collapses is the false positive weakening. The peak count and `bg p99` are the interpretable columns; `max` is not.
+
+`eval_open_easy_both` — the case §18.1 opened with ("a spread-eagle person on clean bare dirt scores 0.10 while empty-corner background scores 0.33–0.36") — now shows the person as the dominant, tightly-localized blob at 0.58, and v13's spurious peak on the *tent edge* (the mannequin channel firing on a tent) is gone.
+
+**Two failures persist and are visible.** (1) The empty-corner peak in `eval_open_easy_both` survives in both models — background with no structure at all still produces a peak. (2) `eval_runway_scrub_mann` contains a prone person in brush that **neither** model detects, the exact case §18.1 flagged; what changed is that the sagebrush around it no longer fires, not that the person does. The real-scene object-appearance gap (§19.3, §20.5) is unclosed, consistent with falsifier 2 having failed.

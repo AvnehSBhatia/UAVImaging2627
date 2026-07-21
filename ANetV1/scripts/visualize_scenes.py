@@ -76,6 +76,11 @@ def main():
     ap.add_argument("--scenes", default="runs/viz_web_scenes/infer")
     ap.add_argument("--peak-thresh", type=float, default=0.30)
     ap.add_argument("--out", default="runs/viz_scenes_compare.png")
+    ap.add_argument("--per-scene", metavar="DIR",
+                    help="also write FULL-RESOLUTION 960x540 overlays, one PNG "
+                         "per (scene, checkpoint), into DIR. The contact sheet "
+                         "is 0.5x and 4-up, which is unreadable for judging "
+                         "individual detections.")
     args = ap.parse_args()
 
     device = pick_device()
@@ -97,6 +102,13 @@ def main():
     for j, lab in enumerate(["input"] + names):
         dr.text((PAD + j * (pw + PAD) + 4, 6), lab, fill=(235, 235, 235))
 
+    per = Path(args.per_scene) if args.per_scene else None
+    if per:
+        per.mkdir(parents=True, exist_ok=True)
+    print(f"\n{'scene':<28}" + "".join(f"{n[:13]:>26}" for n in names))
+    print(f"{'':<28}" + "".join(f"{'max / pk / bgp99':>26}" for _ in names))
+    print("-" * (28 + 26 * len(names)))
+
     for i, sp in enumerate(scenes):
         img = Image.open(sp).convert("RGB")
         if img.size != (W, H):
@@ -106,16 +118,21 @@ def main():
         y0 = PAD + CAP + i * (ph + CAP + PAD)
         sheet.paste(img.resize((pw, ph)), (PAD, y0))
         dr.text((PAD + 4, y0 + ph + 5), sp.parent.name[:34], fill=(200, 200, 200))
+        row = f"{sp.parent.name[:27]:<28}"
         for j, m in enumerate(models):
             with torch.no_grad():
                 prob = torch.sigmoid(m(x)["heat"])[0, 0].cpu().numpy()
-            panel = overlay(img, prob, args.peak_thresh).resize((pw, ph))
-            sheet.paste(panel, (PAD + (j + 1) * (pw + PAD), y0))
+            full = overlay(img, prob, args.peak_thresh)
+            sheet.paste(full.resize((pw, ph)), (PAD + (j + 1) * (pw + PAD), y0))
             n_pk = len(peaks(prob, args.peak_thresh))
+            p99 = float(np.quantile(prob, .99))
             dr.text((PAD + (j + 1) * (pw + PAD) + 4, y0 + ph + 5),
                     f"max {prob.max():.2f}  peaks>{args.peak_thresh:g}: {n_pk}"
-                    f"  bg p99 {np.quantile(prob, .99):.2f}",
-                    fill=(200, 200, 200))
+                    f"  bg p99 {p99:.2f}", fill=(200, 200, 200))
+            row += f"{prob.max():>10.2f}{n_pk:>7d}{p99:>9.2f}"
+            if per:
+                full.save(per / f"{sp.parent.name}__{names[j]}.png")
+        print(row, flush=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     sheet.save(args.out)
     print(f"-> {args.out}  ({sheet.size[0]}x{sheet.size[1]})")
