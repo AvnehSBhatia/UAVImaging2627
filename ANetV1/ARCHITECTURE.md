@@ -1636,3 +1636,36 @@ Graceful to rank 24, then a cliff at 8. Worst-quartile is flat to rank 16 within
 | rank 16 | 65,405 | −36% | 17.9M |
 
 **Falsifiers.** (1) Match `v22g` on the §21.2 sweep at matched fp — this is a *no-regression* test, not an improvement test; the win is the parameter and MAC reduction. (2) Recover the truncation loss: run-1 starts at −0.013 median recall by construction, so anything that does not close most of that has failed. (3) Throughput must actually improve — a 30% MAC cut that does not show up in wall-clock means the layer was never the bottleneck and the shrink buys only model size.
+
+### 22.4 More training beat more parameters — and §22.3's verdict is confounded
+
+The accidental run (§D90 tooling failure: a stale checkout ignored `ANET_FUNNEL_RANK` and simply re-annealed `v22g`) is **a second 80-epoch cosine cycle at identical architecture and identical parameter count.** It is the best model in the family. Test split, matched synthetic fp:
+
+| synth fp | v22g (103k) | **v22g_r2 (103k)** | v22g11 (127k) | r2 − v22g |
+|---|---|---|---|---|
+| **mannequin recall** | | | | |
+| 0.10 | 0.774 | **0.806** | 0.792 | **+0.032** |
+| 0.50 | 0.868 | **0.881** | 0.865 | +0.013 |
+| 1.00 | 0.895 | **0.906** | 0.896 | +0.012 |
+| **worst-QUARTILE** | | | | |
+| 0.10 | 0.654 | **0.703** | 0.674 | **+0.050** |
+| 0.25 | 0.709 | **0.755** | 0.716 | **+0.046** |
+| 0.50 | 0.772 | **0.791** | 0.756 | +0.020 |
+| **worst-DECILE** | | | | |
+| 0.25 | 0.530 | **0.670** | 0.573 | **+0.140** |
+| 0.50 | 0.619 | **0.714** | 0.624 | **+0.095** |
+| 2.00 | 0.712 | **0.810** | 0.733 | **+0.098** |
+
+`r2` is better at every listed operating point on all three keys (dominance test: min −0.001, median +0.002, max +0.040 — effectively dominant, one interpolation grid point marginally under). **And it beats the 127k model on everything**, at 24k fewer parameters.
+
+**A second cosine cycle at fixed capacity gained more than the entire D89 capacity increase did.**
+
+**This confounds §22.3.** That section concluded "the D65 scaling curve is answered at ~103k" from D88 (+24k params, big gain) versus D89 (+24k params, no dominance). But **each tier received exactly one 80-epoch cosine from its donor**, and this run shows one cosine does not reach convergence. So D89's flat result conflates two causes — diminishing capacity returns, and insufficient training — and the measurement cannot separate them. §22.3's verdict is **downgraded from "answered" to "confounded, unresolved"**; the honest statement is *at equal (and insufficient) training budget, 127k did not beat 103k.*
+
+The clean experiment, never run: train each tier to convergence — repeated cosine cycles until a cycle stops gaining — and only then compare. Every capacity comparison in §21–§22 shares this defect.
+
+**Why this was nearly missed.** The run was written off as a tooling failure and the checkpoint was almost not kept. It was preserved only because the val print showed sel 1.912 → 1.932 and a second seed seemed worth sweeping. Two of this session's largest findings — D82's empty metric and this one — came from measuring something that was not the intended experiment.
+
+**New best model: `runs/anet/v22g_r2_best.pt`** (102,781 params).
+
+**What this licenses next, in order.** (1) A *third* cosine cycle from `r2` — nearly free, and it establishes whether cycling has converged before anything else is concluded. (2) Only then the D90 funnel shrink, warm-started from the converged donor rather than an under-trained one. (3) Re-run the capacity comparison at convergence if the scaling question still matters.
