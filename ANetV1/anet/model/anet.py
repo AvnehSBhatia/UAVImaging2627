@@ -314,12 +314,20 @@ class ANetV1(nn.Module):
                             sd["backbone.head.0.weight"].shape[1])
             n_blocks = sum(1 for k in sd if k.startswith("backbone.blocks.")
                            and k.endswith(".dw.weight"))
+            # D88: a depth-grown v22 carries a zero-gamma `gain` on each ADDED
+            # block. Without sniffing it the rebuilt model has no such
+            # parameter and load_state_dict rejects the checkpoint outright —
+            # so every consumer (evaluate_all, the sweep, visualize,
+            # export_onnx) would fail to open a grown run's best.pt.
+            zg = sum(1 for k in sd if k.startswith("backbone.blocks.")
+                     and k.endswith(".gain"))
             hw = (sd["backbone.tent_head.0.weight"].shape[0] if arch == "v23"
                   else sd["backbone.head.0.weight"].shape[0])
             model = cls(arch=arch,
                         head_width=hw,
                         channels=channels,
                         n_blocks=None if arch == "v14" else n_blocks,
+                        zero_gain_blocks=zg,
                         **kwargs)
             model.load_state_dict(sd, strict=True)
             return model

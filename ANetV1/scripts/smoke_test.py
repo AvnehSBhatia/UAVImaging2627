@@ -676,6 +676,17 @@ def v22_growth_checks():
             "grown blocks have no trainable gain"
         n = sum(p.numel() for p in g.parameters())
         print(f"  v22 +{grow} blocks: {n:,} params, identity delta {d:.2e}")
+        # a grown checkpoint must RELOAD — from_state_dict has to sniff the
+        # valves, or evaluate_all/the sweep/visualize/export_onnx all reject a
+        # grown run's best.pt (caught only when a real checkpoint came back).
+        r = ANetV1.from_state_dict(g.state_dict())
+        assert len(r.backbone.blocks) == n0 + grow, "reload lost the added depth"
+        assert sum(b.gain is not None for b in r.backbone.blocks) == grow, \
+            "reload lost the zero-gain valves"
+        r.eval()
+        with torch.no_grad():
+            assert (r(x)["heat"] - g(x)["heat"]).abs().max().item() == 0.0, \
+                "reloaded grown model is not bit-identical"
     # a from-scratch v22 must be untouched by the new argument
     plain = ANetV1(arch="v22", use_checkpoint=False, prior_fg=0.01)
     assert all(b.gain is None for b in plain.backbone.blocks), \

@@ -1519,3 +1519,32 @@ That converges with §21.5 from the other direction: post-blocks tail was alread
 **Scaling verdict.** D86 bought +0.043 selection for +53.5k params; D88 bought +0.024 for +24.1k. The curve has not collapsed, but it has flattened onto a purely precision-side axis while the mission metric — recall on small real objects — sits still. **Further depth or width on this data is not the lever**, and the D65 curve should be considered answered rather than open: it was reopened by D86 (§21) on the strength of capacity paying, and it is closed again here on the strength of capacity paying *only where the task is already solved*.
 
 **What is left is the same thing §20.5 and §21.4 identified and nothing since has moved:** real-scene object appearance. The prone person in brush is missed by every checkpoint in this family; the training objects are Blender renders composited onto real backgrounds; augmentation widened the *background* distribution (D85, and it worked) but cannot make a rendered mannequin look like a photograph of a person. That is gen2 work — object realism — not architecture work, and it is where the next real gain is.
+
+### 22.2 CORRECTION — §22.1 is withdrawn. Capacity does buy recall, at the operating points that matter
+
+§22.1 concluded "at ≥78k parameters synthetic recall is not capacity-bound; added capacity buys calibration, not detection," and used it to declare the D65 scaling curve answered. **That conclusion was read off a single threshold — the val per-epoch print at `peak_thresh=0.3` — and it is wrong.** The sweep, test split, synthetic fp:
+
+| synthetic fp/img | v22 (78k) | **v22g (103k)** | Δ |
+|---|---|---|---|
+| **mannequin recall** | | | |
+| 0.10 | 0.730 | **0.774** | **+0.044** |
+| 0.25 | 0.802 | **0.830** | +0.028 |
+| 0.50 | 0.842 | **0.868** | +0.025 |
+| 1.00 | 0.886 | 0.895 | +0.009 |
+| **worst-QUARTILE** (the powered mission key) | | | |
+| 0.10 | 0.559 | **0.654** | **+0.095** |
+| 0.50 | 0.688 | **0.772** | **+0.084** |
+| 1.00 | 0.789 | 0.807 | +0.018 |
+| **worst-DECILE** | | | |
+| 0.10 | 0.373 | **0.462** | **+0.089** |
+| 0.50 | 0.550 | **0.619** | **+0.070** |
+| **tent** | | | |
+| 0.50 | 0.938 | **0.959** | +0.021 |
+
+**All four pre-registered falsifiers pass.** (1) Quartile beaten at every fp, by +0.018 to +0.095. (2) No erosion. (3) **Dominance confirmed** — min +0.004, median +0.005, max +0.038 at matched fp. (4) Throughput unchanged.
+
+**Why the single-threshold read fails, mechanically.** At `peak_thresh=0.3` the model already detects nearly everything it can; added capacity mostly raises confidence on *marginal* objects, which only converts into recall when the threshold is **high enough that those objects would otherwise fall below it**. So the val default is the *least* sensitive place in the whole operating range to measure a capacity gain — and the gain is largest at 0.10 fp/img, which is where a deployment would actually sit.
+
+**What this withdraws.** §22.1's verdict; the "three consecutive observations" pattern named there (all three were single-threshold reads of the same blind spot, so they are one observation, not three); and its recommendation to stop scaling. **The D65 curve is reopened: the next tier is licensed and the evidence says the gain concentrates at low fp.**
+
+**The methodological point, stated plainly because it is the fifth wrong call this session and the most consequential.** D80's law is that single operating points mislead. Two messages before writing §22.1 I told the owner the falsifier had to be "operating-curve dominance, not a single-threshold win." I then wrote the verdict off a single threshold anyway, because it was the number printing every epoch. **A metric that is convenient and continuously visible will be used as though it were the decision metric, whatever the record says.** The per-epoch `mannequin_r` is a val-split point estimate at one threshold; it is a training-progress indicator, not a model-comparison statistic, and §21.2's sweep is the only thing that ranks checkpoints here.
