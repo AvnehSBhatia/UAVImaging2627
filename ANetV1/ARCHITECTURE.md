@@ -1548,3 +1548,49 @@ That converges with §21.5 from the other direction: post-blocks tail was alread
 **What this withdraws.** §22.1's verdict; the "three consecutive observations" pattern named there (all three were single-threshold reads of the same blind spot, so they are one observation, not three); and its recommendation to stop scaling. **The D65 curve is reopened: the next tier is licensed and the evidence says the gain concentrates at low fp.**
 
 **The methodological point, stated plainly because it is the fifth wrong call this session and the most consequential.** D80's law is that single operating points mislead. Two messages before writing §22.1 I told the owner the falsifier had to be "operating-curve dominance, not a single-threshold win." I then wrote the verdict off a single threshold anyway, because it was the number printing every epoch. **A metric that is convenient and continuously visible will be used as though it were the decision metric, whatever the record says.** The per-epoch `mannequin_r` is a val-split point estimate at one threshold; it is a training-progress indicator, not a model-comparison statistic, and §21.2's sweep is the only thing that ranks checkpoints here.
+
+### 22.3 D89 — the scaling curve bends at ~103k; v22g stays the best model
+
+Third tier: v22g grown 7 → 11 s20 blocks (126,845 params), identity warm start from `v22g_best`, same protocol. Val print showed the familiar "flat recall, better calibration" shape (sel 1.912 → 1.927, fp 0.99 → 0.90, margin +0.355 → +0.387) — which is exactly what D88 looked like before its sweep revealed +0.095 quartile at low fp, so the verdict was withheld until the sweep ran. **The sweep says the curve has bent.**
+
+Recall at matched **synthetic** fp, three tiers:
+
+| synth fp | 78k | 103k | 127k | 103→127 | 78→127 |
+|---|---|---|---|---|---|
+| **mannequin recall** | | | | | |
+| 0.10 | 0.730 | 0.774 | **0.792** | +0.018 | +0.062 |
+| 0.25 | 0.802 | 0.830 | 0.838 | +0.008 | +0.036 |
+| 0.50 | 0.842 | **0.868** | 0.865 | **−0.003** | +0.023 |
+| 1.00 | 0.886 | 0.895 | 0.896 | +0.001 | +0.010 |
+| **worst-QUARTILE** (n≈105, the powered key) | | | | | |
+| 0.10 | 0.559 | 0.654 | **0.674** | +0.020 | +0.115 |
+| 0.50 | 0.688 | **0.772** | 0.756 | **−0.016** | +0.068 |
+| 2.00 | 0.821 | **0.856** | 0.851 | **−0.005** | +0.029 |
+| **worst-DECILE** (n≈42, CI ±0.15 — read with care) | | | | | |
+| 0.10 | 0.373 | 0.462 | **0.517** | +0.055 | +0.144 |
+| 1.00 | 0.633 | 0.664 | **0.714** | +0.050 | +0.082 |
+
+**`v22g11` does NOT dominate `v22g`**: recall delta at matched fp is min **−0.004**, median **−0.000**, max +0.022. It trades along the curve rather than shifting it.
+
+**Two equal parameter increments, one order of magnitude apart in effect:**
+
+| step | Δparams | quartile @ 0.10 fp | quartile @ 0.50 fp | dominance |
+|---|---|---|---|---|
+| 78k → 103k (D88) | +24.1k | **+0.095** | **+0.084** | **yes** |
+| 103k → 127k (D89) | +24.1k | +0.020 | **−0.016** | **no** |
+
+**Verdict: the D65 scaling curve is answered at ~103k on this data.** `v22g` (102,781 params) stays the best model — 127k costs 23% more parameters and MACs for no dominance and a mid-range regression. The worst-*decile* does keep improving (+0.055 at 0.10 fp), but that key holds ~42 objects with a ±0.15 CI (§20.6), so it cannot carry a verdict the powered quartile contradicts.
+
+**Why this verdict is trustworthy where §22.1's was not.** §22.1 closed the curve from the val per-epoch print at one threshold and was wrong. This closes it from the operating-curve sweep at matched fp, on the powered key, with a pairwise dominance test — the exact instrument that overturned §22.1. The measurement that catches the error is the one that gets to make the call.
+
+**The full curve, for the record** (test split, 0.5 synthetic fp/img):
+
+| model | params | mannequin | quartile | decile |
+|---|---|---|---|---|
+| v13 (pre-session) | 25,212 | 0.715* | — | — |
+| v13 + D85 | 25,212 | 0.817* | — | — |
+| v22 + D85 | 78,717 | 0.842 | 0.688 | 0.550 |
+| **v22g (D88)** | **102,781** | **0.868** | **0.772** | **0.619** |
+| v22g11 (D89) | 126,845 | 0.865 | 0.756 | 0.624 |
+
+\*at 0.10 fp for the 25k tier where its curve is comparable.
