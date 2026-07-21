@@ -1390,3 +1390,24 @@ The prediction was specific and wrong, in the same way §20.3's was: I named the
 **This makes the peak-threshold sweep the decisive open question, not a nicety.** The two checkpoints sit at different operating points (0.876 @ 1.41 fp vs 0.865 @ 1.14 fp), and a single threshold cannot rank them. A margin that rose +0.039 while fp fell 19% is the signature of a curve that has *moved*, not slid — but that is exactly what §16.6 assumed for v18 and never verified, and D80's whole lesson is that operating-point statistics mislead when read singly. The sweep (`evaluate_all --peak-thresh`) has been flagged unresolved since v18 and now gates the ranking of the family's two best models.
 
 `fp/img 1.14` is, at face value, well under v18's 1.722 "family record" — but that was a test-split number and this is val, so the comparison is not yet apples-to-apples either.
+
+### 21.3 Visualization, the D75 valve autopsy, and a correction to §20.5's reporting
+
+`scripts/visualize_scenes.py` (new) dumps N checkpoints' mannequin heatmaps side by side on the 14 preserved real web scenes — the comparison that shows whether a change transfers off the renderer, which `visualize.py`'s dataset-frame stage dump cannot. `runs/viz_scenes_compare.png` (v13 / d85 / v22+D85) and `runs/viz_v22_d85/` (24 test frames, full stage dump + contact sheet).
+
+**D75 answered — the valve opened and the branch is load-bearing.** §17 pre-registered a post-training autopsy of `spd_gain`, the tanh-bounded scalar gating 68% of v22's new capacity. Measured across the dump: `mean = 0.0117`, `|g|_mean = 0.1549`, `max|g| = 0.4908`, **branch/donor magnitude ratio 1.22–1.79**. The near-zero *mean* against a 0.15 *magnitude* mean means the per-channel gains spread both signs — the branch is not a uniform scale on the donor path, it is doing differentiated work — and it contributes more magnitude than v13's original `down20`. The capacity was used, not merely allocated.
+
+**Correction to §20.5's reporting.** That section quoted "cells > 0.50 /frame: 0.79 → 1.21, **+55%**" as evidence against D85. On 14 frames those are **11 vs 17 cells** — a 6-cell difference reported as a percentage. That is the §20.6 decile mistake repeated in the same session: a ratio computed on a count too small to carry one. The well-powered statistics on these frames are the distribution ones (`bg p99` is a quantile over 14 × 1296 = 18,144 cells); the >0.50 counts are not.
+
+Re-measured, and separating by **geometry** rather than by score — `web_drygrass_runwayish` and `web_dryfield_brush` contain a horizon and sky, i.e. they are oblique landscape photographs, not nadir frames at 150 ft AGL, so they are outside the mission spec (criterion stated before scoring):
+
+| | v13 | d85 | v22 | v22 vs v13 |
+|---|---|---|---|---|
+| **all 14** bg p99 | 0.216 | 0.181 | 0.177 | **−18%** |
+| **all 14** cells>0.30 /frame | 6.79 | 6.50 | 6.07 | **−11%** |
+| **all 14** separation | 0.270 | 0.241 | 0.238 | −12% |
+| **nadir 12** bg p99 | 0.210 | 0.164 | 0.168 | **−20%** |
+| **nadir 12** cells>0.30 /frame | 4.25 | 4.17 | 3.67 | **−14%** |
+| **nadir 12** separation | 0.276 | 0.241 | 0.267 | −3% |
+
+**The verdict does not flip.** On nadir frames the real-scene background is measurably quieter (bg p99 −20%, cells>0.30 −14%, both well-powered), but object/background **separation is still not improved** (−3%, i.e. flat) — and separation is what falsifier 2 asked for. §20.5's conclusion stands: the synthetic gains are not demonstrably the sharpness-tell closing. What changes is the severity — the "+55% high-confidence background" claim was an artifact of counting, and the background genuinely did get quieter.
