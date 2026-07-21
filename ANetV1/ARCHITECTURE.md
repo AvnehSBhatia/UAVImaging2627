@@ -1692,3 +1692,22 @@ Third cosine cycle from `v22g_r2`. Val print said sel 1.932 → 1.940 (+0.008). 
 **§22.3 remains confounded, and the run that settles it is now well-defined.** Convergence takes ~2 cycles; D88 (103k) and D89 (127k) each received one. So the scaling comparison was run one cycle short *at every tier*. The clean experiment is a **second cycle on the 127k model** — if it gains what 103k's second cycle gained, capacity was never exhausted and §22.3 is simply wrong; if it converges below 103k-cycle-2, the curve genuinely bends and §22.3 stands for the right reason. One run either way.
 
 **The training-budget law this session produced.** *A capacity comparison run at fixed epoch budget measures the interaction of capacity and training, not capacity.* Every tier must be trained to convergence — defined as a cosine cycle that produces no sweep-measurable gain — before its parameter count means anything. Neither §21 nor §22 did this, which is why §22.3's verdict had to be withdrawn and cannot yet be reinstated.
+
+### 23.1 The compressible rank depends on the donor — an under-trained model mis-reports its own compressibility
+
+D90's rank was chosen by truncating `v22g` (cycle 1). Re-measured on `v22g_r2` (cycle 2, converged), recall delta vs untouched at matched synthetic fp:
+
+| rank | params | **v22g (cycle 1)** | **v22g_r2 (converged)** |
+|---|---|---|---|
+| 32 | 27,648 | −0.012 | **−0.006** (min −0.009) |
+| 24 | 20,736 | −0.013 | −0.017 (min −0.034) |
+| 16 | 13,824 | −0.020 | −0.025 (min −0.075) |
+| 8 | 6,912 | −0.033 | −0.046 |
+
+**The cliff moved up.** On the under-trained donor, ranks 32 and 24 were indistinguishable (−0.012 vs −0.013), so D90 recommended the cheaper rank 24. On the converged donor rank 32 costs **3× less** than rank 24 (−0.006 vs −0.017) and rank 24 has a −0.034 worst point. **The recommendation flips to rank 32.**
+
+Mechanically: training to convergence spreads information across more singular directions, so a converged model is *less* compressible at aggressive ranks and *more* nearly lossless at moderate ones. An under-trained model understates the cost of aggressive compression because it has not yet used the capacity it is being asked to give up.
+
+**This is the §22.5 training-budget law generalizing beyond capacity comparisons: an under-trained model mis-reports its own compressibility too.** Any measurement that asks "how much of this model is needed" must be run on a converged model, for the same reason any capacity comparison must be.
+
+**Revised D90 target: rank 32** — `spd_proj` 51,200 → 27,648 weights (−46%), model 102,781 → **79,229 params (−23%)**, funnel MACs 66.4M → 33.2M (−50%), at a measured truncation floor of −0.006 median recall that training starts from and should close.
