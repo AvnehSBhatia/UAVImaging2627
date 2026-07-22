@@ -1730,3 +1730,31 @@ Per-scene highlights: `eval_runway_scrub_mann` goes **5 peaks → 0** (§18.1's 
 **The one genuinely unresolved case is unchanged.** `eval_mann_only_brush` — a person in dense brush — reads max 0.22 with zero peaks, versus v13's 0.33 with one. Inspected at full resolution, the frame is uniform brush with no visually locatable person and no structured response anywhere; given v13 put 5/5 of its peaks on bare asphalt in the runway scene, its 0.33 here was most likely brush too. **So this is not a measured regression — it is the same object neither model has ever detected** (§21.4), and it remains the standing real-scene failure.
 
 **Net for the session on real imagery:** §20.5's falsifier 2 asked for improved object/background *separation* and got a flat answer at the 78k tier. At the final model the background side has moved decisively (−64% spurious peaks on nadir frames, −38% background p99) while object responses on scenes with visible targets rose. Separation improved because the background collapsed, not because objects got brighter — which is consistent with everything measured: **the false-positive half of the real-scene gap closed; the object-appearance half did not.** That remains gen2 work.
+
+### 23.3 D91 — the funnel shrink trades; the val sel that ranked it best sampled the fp region where it wins
+
+`v22g_r2_fr32` (rank 32, 79,229 params) reached val **sel 1.951** — above the full-rank `v22g_r2`'s 1.940 — so the per-epoch metric ranked the *shrunk* model first. The sweep says it does **not** dominate; it trades:
+
+| synth fp | full 103k | **fr32 79k** | Δ |
+|---|---|---|---|
+| **mannequin recall** | | | |
+| 0.10 | 0.806 | 0.790 | **−0.015** |
+| 0.25 | 0.847 | 0.853 | +0.006 |
+| 1.00 | 0.906 | 0.911 | +0.005 |
+| **worst-QUARTILE** | | | |
+| **0.10** | **0.703** | **0.657** | **−0.046** |
+| 0.25 | 0.755 | 0.771 | +0.016 |
+| 1.00 | 0.820 | 0.840 | **+0.020** |
+| **worst-DECILE** | | | |
+| 0.10 | 0.554 | 0.527 | −0.027 |
+| 1.00 | 0.740 | 0.790 | **+0.050** |
+
+Dominance test: min −0.017, median −0.004, max +0.004. **The pattern is a crossover: the shrink loses at low fp (0.10) and wins at mid fp (0.25–1.0).**
+
+**Why the val sel was wrong, precisely — and this is the sharpest instance of the §22.2 failure.** `peak_thresh=0.3` puts these models at ~1 synthetic fp/img, which is **exactly the region where the shrink wins** (mannequin +0.005, quartile +0.020, decile +0.050). The val metric did not misread noise this time — it correctly measured a real gain **at the one operating point it happens to sample**, and that point is the wrong one for a low-false-positive mission. A single-threshold metric is not just noisy; it is an *operating-point-specific* verdict masquerading as a global one. Fifth confirmation that only the matched-fp sweep ranks checkpoints here.
+
+**Verdict.** At the low-fp end a UAV detector actually flies (≈0.1 fp/frame), the full-rank **`v22g_r2` (103k) remains the accuracy choice** — the shrink costs −0.046 worst-quartile there. At ~1 fp/frame the 79k model is slightly better *and* 23% smaller. So D90 is a genuine **size/accuracy trade at the deployment operating point, not a free win**, and which model to ship is an operating-point decision, not an accuracy ranking.
+
+**Latency reality check.** Batch-1 MPS latency is identical (2.72 vs 2.74 ms) — the factorization adds a kernel dispatch that cancels the MAC saving on a launch-bound backend. The shrink's −50% funnel MACs / −23% params only convert to speed on a MAC-bound single-graph backend (the Hailo INT8 target), which is the expected regime but is **unmeasured until the DFC compile**. So the shrink's on-device value is: smaller weights, lower MAC budget, latency benefit pending — against a measured low-fp accuracy cost.
+
+**The architecture line, closed.** `v13 (25k) → +D85 augmentation → +D86 capacity (78k) → +D88 depth (103k) → +convergence (2 cosine cycles) → −D90 funnel (79k, optional size trade)`. Every step ranked by the matched-fp sweep, never the val print. Final accuracy model: **`v22g_r2_best.pt`**, 102,781 params, test synthetic recall 0.806 @ 0.1 fp / 0.881 @ 0.5 fp, worst-quartile 0.703, margin +0.404 — from a v13 baseline of −0.178 margin and 2.76 fp/img to reach the same recall this hits at ~0.4.
