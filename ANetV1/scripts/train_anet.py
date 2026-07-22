@@ -568,6 +568,32 @@ def main():
         f"param budget exceeded: {n_params:,} >= {budget:,} (ANET_PARAM_BUDGET overrides)"
     Trainer(model, train_ds, val_ds, cfg).train()
 
+    # Auto-archive best.pt under a config-unique name. best.pt is a shared,
+    # every-run-clobbered path, and this session lost two finished checkpoints
+    # (a funnel-shrink and, historically, D68's fp record) to the NEXT run
+    # overwriting it before anyone copied it. A descriptive name derived from
+    # the architecture + the knobs that change its shape means every completed
+    # run leaves a durable artifact with zero operator discipline. Nothing
+    # reads these names; they exist so a good model is never one forgotten
+    # `cp` away from being erased.
+    import shutil
+    bb = model.backbone
+    bits = [cfg.train.arch]
+    if hasattr(bb, "blocks"):
+        bits.append(f"b{len(bb.blocks)}")
+    if getattr(bb, "funnel_rank", None):
+        bits.append(f"fr{bb.funnel_rank}")
+    if _RANK or _GROW or os.environ.get("ANET_INIT_FROM"):
+        bits.append("ft")               # warm-started, not from scratch
+    bits.append(f"{n_params // 1000}k")
+    tag = "_".join(bits)
+    best = Path(cfg.train.checkpoint_dir) / "best.pt"
+    if best.exists():
+        dst = Path(cfg.train.checkpoint_dir) / f"auto_{tag}.pt"
+        shutil.copy2(best, dst)
+        print(f"auto-archived best.pt -> {dst} "
+              f"(durable copy; best.pt itself is overwritten by the next run)")
+
 
 if __name__ == "__main__":
     main()
