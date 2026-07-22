@@ -805,6 +805,41 @@ def aug_checks(root):
         torch.allclose(off["heat"], a["heat"], atol=0), "flip=0 is not identity"
     print("  D85 flips: image/heat/grid/boxes stay in correspondence")
 
+    # -- D92 camo: recolours object pixels ONLY, targets/boxes stay exact -----
+    # The silent failure here mirrors the flip one: a recolour that bled outside
+    # the box, or that shifted a target, trains against wrong labels and still
+    # runs clean. So the checks are (1) targets/boxes bit-exact, (2) change is
+    # confined to class-0 bboxes, (3) p=0 is exact identity.
+    im = next((k for k in range(len(plain))
+               if (plain[k]["boxes"][:, 0] == 0).any()), None)
+    if im is None:
+        print("  D92 camo checks skipped (no mannequin frame in val)")
+        return
+    am = plain[im]
+    torch.manual_seed(0)
+    c = SUASCells(root, "val", center=True,
+                  camo={"p": 1.0, "a_lo": 0.6, "a_hi": 0.6, "classes": (0,)})[im]
+    assert c["image"].shape == am["image"].shape and \
+        c["image"].dtype == am["image"].dtype, "camo changed image shape/dtype"
+    assert torch.equal(c["boxes"], am["boxes"]), "camo changed boxes"
+    assert torch.equal(c["grid"], am["grid"]) and \
+        torch.allclose(c["heat"], am["heat"], atol=0), "camo moved a target"
+    assert not torch.equal(c["image"], am["image"]), "camo did nothing on a mann frame"
+    diff = (c["image"].to(torch.int16) - am["image"].to(torch.int16)).abs().sum(0)
+    Hc, Wc = diff.shape
+    objmask = torch.zeros(Hc, Wc, dtype=torch.bool)
+    for row in am["boxes"].tolist():
+        cls, cx, cy, bw, bh = row
+        if int(cls) != 0:
+            continue
+        x0, x1 = int((cx - bw / 2) * Wc), int(np.ceil((cx + bw / 2) * Wc))
+        y0, y1 = int((cy - bh / 2) * Hc), int(np.ceil((cy + bh / 2) * Hc))
+        objmask[max(0, y0):min(Hc, y1), max(0, x0):min(Wc, x1)] = True
+    assert int(diff[~objmask].max()) == 0, "camo changed pixels OUTSIDE object boxes"
+    off2 = SUASCells(root, "val", center=True, camo={"p": 0.0})[im]
+    assert torch.equal(off2["image"], am["image"]), "camo p=0 is not identity"
+    print("  D92 camo: recolours in-box only, targets/boxes exact, p=0 identity")
+
 
 def main():
     # Deterministic: several checks assert on statistics of a RANDOM init

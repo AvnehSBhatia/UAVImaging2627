@@ -195,8 +195,16 @@ def build_datasets(cfg, teacher_dir=None):
     aug = getattr(cfg.data, "aug", None)
     flip = ((aug.flip_h, aug.flip_v) if aug is not None and aug.enabled
             else (0.0, 0.0))
+    # D92: earth-tone object recolour is TRAIN-split-only, like flips. Mannequin
+    # only (class 0) — the real-scene failure is camouflaged people; tents
+    # already transfer (webscene_check tent max 0.85-0.94 on real frames).
+    camo = None
+    if (aug is not None and aug.enabled
+            and getattr(aug, "camo_p", 0.0) > 0.0):
+        camo = {"p": aug.camo_p, "a_lo": aug.camo_lo, "a_hi": aug.camo_hi,
+                "classes": (0,)}
     train = SUASCells(cfg.data.root, "train", teacher_dir=teacher_dir,
-                      flip=flip, **kwargs)
+                      flip=flip, camo=camo, **kwargs)
     val = SUASCells(cfg.data.root, "val", **kwargs)
     return train, val
 

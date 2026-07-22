@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .augment import flip_sample
+from .augment import camouflage_objects, flip_sample
 from .rasterize import (
     CANVAS_H,
     CANVAS_W,
@@ -51,7 +51,8 @@ class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
                  vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
                  band_lo=None, cache=False, center=False, center_sigma=1.5,
-                 center_grid=None, center_dual=False, flip=(0.0, 0.0)):
+                 center_grid=None, center_dual=False, flip=(0.0, 0.0),
+                 camo=None):
         self.root = Path(root)
         self.split = split
         self.coverage_thresh = coverage_thresh
@@ -85,6 +86,11 @@ class SUASCells(Dataset):
         # classic pitfall where every worker emits identical augmentation and
         # every epoch repeats it.
         self.flip = tuple(flip)
+        # camo=dict(p, a_lo, a_hi) — D92 earth-tone/low-contrast object recolour
+        # (augment.camouflage_objects), applied AFTER flip on the object regions
+        # of the flipped boxes. Only the train loader is constructed with it;
+        # p<=0 (or None) is bit-exact the pre-D92 path with no RNG draw.
+        self.camo = camo
         # uint8=True ships images as (3,H,W) uint8 and leaves the /255 float
         # conversion to the consumer (the Trainer does it on-GPU): 4x less
         # pinned-memory + H2D traffic per image and no fp32 convert in the
@@ -238,6 +244,12 @@ class SUASCells(Dataset):
             image_u8, boxes_np, grid_np, band_np = flip_sample(
                 image_u8, boxes_np, grid_np, band_np,
                 do_h=bool(r[0] < self.flip[0]), do_v=bool(r[1] < self.flip[1]))
+
+        if self.camo is not None and self.camo.get("p", 0.0) > 0.0:
+            # D92: recolour object regions toward earth-tone camouflage. Uses
+            # the (possibly flipped) boxes; changes pixels only, so grid/heat/
+            # offset targets built below are unaffected.
+            image_u8 = camouflage_objects(image_u8, boxes_np, **self.camo)
 
         grid = torch.from_numpy(grid_np).long()
         padded = torch.from_numpy(boxes_np)

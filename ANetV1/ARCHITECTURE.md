@@ -1758,3 +1758,115 @@ Dominance test: min −0.017, median −0.004, max +0.004. **The pattern is a cr
 **Latency reality check.** Batch-1 MPS latency is identical (2.72 vs 2.74 ms) — the factorization adds a kernel dispatch that cancels the MAC saving on a launch-bound backend. The shrink's −50% funnel MACs / −23% params only convert to speed on a MAC-bound single-graph backend (the Hailo INT8 target), which is the expected regime but is **unmeasured until the DFC compile**. So the shrink's on-device value is: smaller weights, lower MAC budget, latency benefit pending — against a measured low-fp accuracy cost.
 
 **The architecture line, closed.** `v13 (25k) → +D85 augmentation → +D86 capacity (78k) → +D88 depth (103k) → +convergence (2 cosine cycles) → −D90 funnel (79k, optional size trade)`. Every step ranked by the matched-fp sweep, never the val print. Final accuracy model: **`v22g_r2_best.pt`**, 102,781 params, test synthetic recall 0.806 @ 0.1 fp / 0.881 @ 0.5 fp, worst-quartile 0.703, margin +0.404 — from a v13 baseline of −0.178 margin and 2.76 fp/img to reach the same recall this hits at ~0.4.
+
+## 24. D92 — the object gap is a camouflage distribution-edge failure (data, not architecture)
+
+The architecture line (§23.3) closed pointing at "object-appearance sim-to-real"
+as the one open defect, and every prior number for it was measured on **v13**.
+The first act here was to re-measure on the *current best model* — and it
+overturns the record's framing.
+
+### 24.1 The real-scene object gap roughly HALVED, and localized
+
+`webscene_check` (14 preserved 960×540 real frames, mannequin peak per scene,
+median across scenes) vs the synthetic reference of 0.612:
+
+| model | real-scene peak | gap to synth |
+|---|---|---|
+| v13 (§19.3 baseline) | 0.482 | −0.130 (−21%) |
+| d85 (aug only) | 0.435 | −0.177 (**worse**) |
+| **v22g_r2 (current best)** | **0.553** | **−0.059 (−10%)** |
+
+So §20.5's falsifier-2 failure was real *for d85 alone* — augmentation by
+itself HURT real-scene object response (0.482→0.435). But **capacity + two
+cosine cycles on top recovered it to 0.553**, halving the gap v13 had. That was
+never cleanly measured; the record carried the stale d85 number as "the object
+gap is wide open." It is not wide open — it is narrow and, crucially, *localized*.
+v22g_r2 per scene splits bimodally: near-synthetic on `drygrass_runwayish`
+0.819 / `tent_trees_clearing` 0.795 / `overcast` 0.692, and collapsed on
+`eval_mann_only_brush` 0.221 / `runway_scrub_mann` 0.208 / `brush_occlusion`
+0.253 / `tent_only_open` 0.256. The failures cluster on **occluded / low-contrast
+mannequins in brush** — and background is quiet there (0 peaks), so it is the
+object genuinely not firing, not clutter drowning it. This is the SUAS
+search-and-rescue case: a downed person in dry vegetation.
+
+### 24.2 The diagnosis, seen and then measured
+
+**Seen.** A 20-sample montage of synthetic composited mannequins is
+overwhelmingly **saturated clothing** — red, blue, purple, magenta, white, teal
+shirts — bright high-contrast blobs that POP off the terrain. The two failing
+real frames are the opposite: a person in **earth-toned clothing lying prone in
+dry sagebrush**, near-zero contrast. The generator is *structurally* biased this
+way: Reinhard harmonize is damped (0.50–0.75) with chroma **halved**
+(`harmonize.py:44`), explicitly tuned to keep objects visible, so a bright shirt
+stays bright. The generator never produces the camouflaged case.
+
+**Measured (`contrast_probe`, v22g_r2, 240 synthetic val objects).** Push each
+object toward earth-tone camouflage — desaturate, hue→tan, luminance→local-bg —
+at strength α, read response at GT:
+
+| α | median p | frac < 0.30 |
+|---|---|---|
+| 0.00 | **0.777** | 13% |
+| 0.35 | 0.485 | 35% |
+| 0.70 | **0.167** | 66% |
+| 1.00 | 0.074 | 88% |
+
+The perturbation reproduces the **exact** real-scene failure magnitude (~0.21 at
+α≈0.65). And the *natural* synthetic contrast bins barely move (0.70 lowest →
+0.79 highest) — because even the generator's lowest-contrast objects never reach
+the camouflaged regime. **This is a distribution-EDGE covariate shift, not a
+background/tail one** (contrast §19.2/§19.3, which were about the tail): real
+camouflaged objects live *beyond the edge* of the synthetic object-appearance
+distribution, and the model has zero learned invariance there because it has zero
+training examples there.
+
+### 24.3 The fix — earth-tone object augmentation (D92), and why it is data not architecture
+
+Widen the training object-appearance distribution INTO the camouflaged regime,
+keeping object **geometry** intact so the model learns "earth-tone person-*shape*",
+not "earth-tone blob". `augment.camouflage_objects` recolours a fraction (`camo_p`,
+per object, class 0 only) of object regions with the *exact* transform
+`contrast_probe` measured the response curve on, strength α∼U(0.2,0.6) — capped
+below invisibility so the label stays honest (α=0.6 → the object still fires ~0.25,
+hard-but-present; a careful human, and the mission, still find it). Train-split
+only, applied after flips in `SUASCells.__getitem__` on the flipped boxes; zero
+parameters, zero deploy change, Hailo-legal by construction (nothing changes at
+deploy). `camo_p=0` is a bit-exact no-draw identity, so it is a clean
+single-variable run over v22g_r2. Seeding sees it (`_seed_norm_stats` iterates the
+train loader), so DeployNorm stats calibrate on the augmented distribution (D39).
+
+This is deliberately the *training* delivery of a *generator* fix, for the same
+reason D85 was: it is one MI300X run instead of a 15k-frame regenerate, and it
+isolates the mechanism. The bbox-rectangle recolour is cruder than the true alpha
+mask a generator would use (it lightly tints in-box terrain too — visually
+negligible since that terrain is already terrain-coloured, and it softens the
+object/background sharpness discontinuity §19.3 flagged as a secondary tell). If
+the run confirms the mechanism, the validated transform ports into
+`gen2/harmonize.py` as a camouflage tier (alpha-masked, pre-sensor-sim) — which
+is the higher-value fix because it also reaches the **YOLO26n flight model**
+(§10), which trains on the generated frames and almost certainly carries the same
+gap.
+
+### 24.4 Falsifiers for the pending run (v22g_r2 + camo, `ANET_AUG_CAMO_P=0.3`)
+
+1. **The brush scenes must rise.** `webscene_check` mannequin peak on
+   `eval_mann_only_brush` / `runway_scrub_mann` / `brush_occlusion` should climb
+   from ~0.21 toward the non-camo real scenes (~0.5+). This is the only falsifier
+   that tests what D92 is *for*; a synthetic-metric change with an unmoved brush
+   profile means it regularized generically rather than closing the camouflage
+   edge.
+2. **Synthetic recall/fp must not pay for it.** The matched-fp sweep
+   (`thresh_sweep`) vs v22g_r2: `mannequin_recall_synthetic` @ 0.1 fp must not
+   regress below ~0.79, and `fp_per_image_synthetic` must not inflate — teaching
+   response to low-contrast earth-tone shapes is exactly the change that could
+   raise fp, so this is the guard, measured at the operating point (§23.3 law),
+   never the val print.
+3. **Worst-quartile synthetic** (`..._smallest_quartile_synthetic`) must not fall
+   below v22g_r2's 0.703 @ 0.1 fp.
+4. **Throughput within ~10%** of the v22 baseline (family protocol) — camo is a
+   small per-object HSV op on CPU (num_workers=0 on ROCm), so this should be free,
+   but it is measured not assumed.
+
+Run: `ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v22g_r2_best.pt ANET_BG_W=0
+ANET_AUG_CAMO_P=0.3 ANET_PATIENCE=40 ANET_PARAM_BUDGET=150000 ./run_anet_mi300x.sh`

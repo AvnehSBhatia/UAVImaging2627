@@ -500,6 +500,16 @@ def anet_cfg(**overrides):
             contrast=_fenv("ANET_AUG_CONTRAST", 0.20),
             gamma=_fenv("ANET_AUG_GAMMA", 0.20),         # log-space half-width
             channel_gain=_fenv("ANET_AUG_WB", 0.08),     # white balance
+            # D92 earth-tone/low-contrast object recolour (augment.camouflage_
+            # objects). OFF by default (bit-exact old path) until validated:
+            # the offline probe proved v22g_r2 collapses 0.78->0.17 under this
+            # transform exactly as it does on real camouflaged people, but
+            # whether TRAINING on it closes the real gap without inflating fp
+            # needs a run. camo_p is the per-object master switch; a in
+            # [lo, hi] is the camouflage strength, hi capped below invisibility.
+            camo_p=_fenv("ANET_AUG_CAMO_P", 0.0),
+            camo_lo=_fenv("ANET_AUG_CAMO_LO", 0.20),
+            camo_hi=_fenv("ANET_AUG_CAMO_HI", 0.60),
         ),
     )
     distill = dict(teacher_cache="runs/teacher_cache", kl_weight=0.7, temperature=2.0)

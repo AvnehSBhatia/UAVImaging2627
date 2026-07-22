@@ -94,6 +94,101 @@ def flip_sample(image_u8, boxes, grid=None, band=None, do_h=False, do_v=False):
             None if band is None else np.ascontiguousarray(band))
 
 
+def _rgb2hsv_np(rgb):
+    """(...,3) float 0-1 -> (h, s, v), each (...) — colorsys-order hue in 0-1."""
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx = rgb.max(-1)
+    mn = rgb.min(-1)
+    d = mx - mn
+    de = d + 1e-12
+    s = np.where(mx > 1e-12, d / (mx + 1e-12), 0.0)
+    rc, gc, bc = (mx - r) / de, (mx - g) / de, (mx - b) / de
+    h = np.where(mx == r, bc - gc, np.where(mx == g, 2.0 + rc - bc, 4.0 + gc - rc))
+    h = np.where(d > 1e-12, (h / 6.0) % 1.0, 0.0)
+    return h, s, mx
+
+
+def _hsv2rgb_np(h, s, v):
+    """Inverse of _rgb2hsv_np — (h,s,v) each (...) 0-1 -> (...,3) float."""
+    i = np.floor(h * 6.0).astype(np.int64) % 6
+    f = h * 6.0 - np.floor(h * 6.0)
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    r = np.choose(i, [v, q, p, p, t, v])
+    g = np.choose(i, [t, v, v, q, p, p])
+    b = np.choose(i, [p, p, t, v, v, q])
+    return np.stack([r, g, b], -1)
+
+
+def camouflage_objects(image_u8, boxes, p=0.0, a_lo=0.2, a_hi=0.6,
+                       hue=0.09, sat_drop=0.85, lum_pull=0.7, classes=(0,)):
+    """Push a fraction of object regions toward earth-tone / low-contrast
+    camouflage, IN the composited uint8 frame, BEFORE the model sees it (D92).
+
+    WHY. The gen2 object palette is saturated and high-contrast — bright
+    clothing renders that POP off the terrain (measured: 20-sample montage is
+    red/blue/purple/white/teal). So v22g_r2 fires median 0.78 on a synthetic
+    mannequin but collapses to 0.17 once that same object is desaturated,
+    hue-shifted to earth-tone and luminance-matched to its surround — which is
+    exactly the 0.21 it fires on a REAL person lying prone in dry brush
+    (webscene_check: eval_mann_only_brush 0.221, runway_scrub_mann 0.208). The
+    generator NEVER produces the camouflaged case (Reinhard harmonize is
+    damped 0.50-0.75 with chroma HALVED, explicitly to keep objects visible),
+    so the model has no learned contrast-invariance in that regime — a
+    distribution-EDGE covariate shift, not a background/tail one.
+
+    This widens the training object-appearance distribution into that regime
+    while keeping object GEOMETRY intact — only the COLOUR of pixels inside the
+    box changes, the silhouette/limb structure is untouched — so the model
+    learns "earth-tone person-SHAPE", not "earth-tone blob". The transform is
+    the exact one contrast_probe measured the 0.78->0.17 response curve on;
+    a_hi is capped well below invisibility (a=0.6 -> the object still fires
+    ~0.25, hard-but-present, so the label stays honest — a careful human finds
+    it, and the mission requires finding it).
+
+    image_u8 (3,H,W) uint8 | boxes (N,5) [cls,cx,cy,w,h] canvas-normalized,
+    -1-padded. Draws use torch's global RNG (per-worker reseeded like flips,
+    NOT numpy's global RNG which DataLoader never reseeds). p<=0 returns the
+    input untouched with NO draw, so a disabled run is bit-exact the old path.
+    """
+    if p <= 0.0:
+        return image_u8
+    C, H, W = image_u8.shape
+    hw = np.ascontiguousarray(
+        image_u8.transpose(1, 2, 0).astype(np.float32) / 255.0)   # (H,W,3)
+    changed = False
+    for j in range(len(boxes)):
+        cls = boxes[j, 0]
+        if cls < 0 or int(cls) not in classes:
+            continue
+        if float(torch.rand(1)) >= p:
+            continue
+        a = float(torch.empty(1).uniform_(a_lo, a_hi))
+        _, cx, cy, bw, bh = boxes[j]
+        x0, x1 = int((cx - bw / 2) * W), int(np.ceil((cx + bw / 2) * W))
+        y0, y1 = int((cy - bh / 2) * H), int(np.ceil((cy + bh / 2) * H))
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        # luminance target from a context ring (1.75x box); object is a small
+        # fraction of it, so the mean reads the local terrain it must blend to.
+        pxw, pxh = int((x1 - x0) * 0.75), int((y1 - y0) * 0.75)
+        cx0, cy0 = max(0, x0 - pxw), max(0, y0 - pxh)
+        cx1, cy1 = min(W, x1 + pxw), min(H, y1 + pxh)
+        bg_v = float(hw[cy0:cy1, cx0:cx1].mean())
+        obj = hw[y0:y1, x0:x1]
+        h_, s_, v_ = _rgb2hsv_np(obj)
+        s2 = s_ * (1.0 - sat_drop * a)
+        h2 = h_ * (1.0 - a) + hue * a
+        v2 = v_ * (1.0 - lum_pull * a) + bg_v * (lum_pull * a)
+        hw[y0:y1, x0:x1] = _hsv2rgb_np(h2, s2, v2)
+        changed = True
+    if not changed:
+        return image_u8
+    out = np.clip(hw, 0.0, 1.0).transpose(2, 0, 1)
+    return np.ascontiguousarray((out * 255.0 + 0.5).astype(np.uint8))
+
+
 def photometric(x, cfg, gen=None):
     """(B,3,H,W) float in [0,1] -> augmented, same shape/dtype/device.
 
