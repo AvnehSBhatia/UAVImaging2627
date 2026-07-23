@@ -1926,3 +1926,43 @@ list ahead of the peak.
 
 **Verdict: best model stays `v22g_r2_best.pt` (§23.3).** The real object gap is open,
 and now better characterized: not colour — realism.
+
+## 25. D93 — the first real labeled eval set, and what real recall says
+
+§24.5 showed the label-free scene peak is background and misranks. The fix is a
+yardstick: the 14 preserved web frames, hand-labeled (`runs/viz_web_scenes/
+labels.json`, centres verified by zoom — the record's "these frames are
+unlabeled" is superseded). **8 mannequins spanning easy→camouflaged, 13 tents.**
+`scripts/eval_real_scenes.py` reports, per object, response AT the GT centre
+(threshold-free) and recall/fp by peak-matching within 2 cells. Rank real-scene
+changes on THIS, never on a scene peak.
+
+**Finding 1 — the camouflage gap is real, binary, and open across the whole
+family.** Response at GT, mannequins by difficulty:
+
+| slice | v13 | v22g_r2 | +camo |
+|---|---|---|---|
+| hard / camouflaged (median, n4) | 0.073 | 0.068 | 0.066 |
+| easy+medium (median, n4) | 0.394 | 0.553 | 0.620 |
+
+Every hard case — prone in brush 0.06, earth-tone in scrub 0.07, shaded at forest
+edge 0.04, long-shadow 0.07 — is undetectable in **all three** models. The model
+detects clear/high-contrast people (0.5–0.8) and completely misses camouflaged
+ones (~0.06). It is not a gradient; it is a cliff, on the camouflage axis.
+
+**Finding 2 — camo (D92) confirmed falsified on real *recall*, not just peaks.**
+Real mannequin recall @0.30: v22g_r2 3/8 @ **0.58** fp/frame, camo 3/8 @ **1.25**
+fp/frame — identical recall, double the false positives. The §24.5 verdict now
+holds on the metric that matters. v22g_r2 also dominates v13 at matched fp (t=0.40:
+3/8 @ 0.42 fp vs v13 2/8 @ 0.83 fp), consistent with the synthetic sweep.
+
+**Finding 3 — tents are effectively solved on real frames.** v22g_r2 tent recall
+10/11 @ 0.08 fp, camo 10/11 @ 0.00 fp — vs v13 9/11 @ 0.17. The open problem is
+mannequins, specifically camouflaged ones; tents transfer.
+
+**What this yardstick unblocks.** Any gen2 object-realism change (the §24.5
+direction) can now be validated as real recall on the hard-mannequin slice, not
+guessed at. The target is unambiguous and currently 0/4: make a camouflaged person
+fire above ~0.3 without inflating the 0.58 fp/frame floor. Best model stays
+`v22g_r2_best.pt`; the eval set + script are the deliverable that makes the next
+data-side attempt measurable instead of self-deceiving.
