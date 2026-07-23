@@ -593,6 +593,11 @@ def main():
         bits.append(f"fr{bb.funnel_rank}")
     if _RANK or _GROW or os.environ.get("ANET_INIT_FROM"):
         bits.append("ft")               # warm-started, not from scratch
+    _camo = getattr(getattr(cfg.data, "aug", None), "camo_p", 0.0)
+    if getattr(cfg.data, "aug", None) and getattr(cfg.data.aug, "enabled", False) \
+            and _camo > 0.0:
+        bits.append("camo")             # D92: aug config must be in the tag or
+                                        # a plain v22 ft run clobbers this file
     bits.append(f"{n_params // 1000}k")
     tag = "_".join(bits)
     best = Path(cfg.train.checkpoint_dir) / "best.pt"

@@ -1870,3 +1870,59 @@ gap.
 
 Run: `ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v22g_r2_best.pt ANET_BG_W=0
 ANET_AUG_CAMO_P=0.3 ANET_PATIENCE=40 ANET_PARAM_BUDGET=150000 ./run_anet_mi300x.sh`
+
+
+### 24.5 Run 1 — D92 FALSIFIED as a training augmentation, and how the label-free peak metric nearly hid it
+
+`v22g_r2` + camo (`ANET_AUG_CAMO_P=0.3`, one 80-epoch cosine, converged clean —
+no erosion, loss stable 0.81). Checkpoint `runs/anet/auto_v22_b7_ft_102k.pt`.
+**It does not close the real camouflage gap. The mechanism is falsified as tested,
+`v22g_r2` remains the best model, and the way the first read went wrong is the
+transferable part.**
+
+**The trap.** `webscene_check` mannequin *peak* rose on the brush scenes exactly
+as pre-registered — `eval_mann_only_brush` 0.221→0.426, `brush_occlusion`
+0.253→0.445, median +0.157. Read as falsifier-1 passing. It is not. These frames
+are **label-free**, so "peak" is the strongest response *anywhere*, and the
+strongest response is **background**: the argmax sits at x≈0.91 (the right edge) on
+three different scenes in *both* models — a fixed image-position artifact, not
+object content. The person in `mann_only_brush` is at center (~x=0.44).
+
+**Measured at the actual object, the gap did not move.** Response in a 3×3 window
+at the person: `mann_only_brush` **0.056→0.060**, `runway_scrub_mann`
+**0.080→0.071**. The camouflaged person fires at ~0.06 — undetectable — in both
+models; camo left it there. What camo *did* change is the background: the s20
+heatmap is visibly noisier on real brush (person/globalmax ratio fell 0.25→0.14),
+i.e. it raised earth-tone background response without making the object detectable.
+On real brush that is a mild FP regression; on synthetic it is neutral (§24.5 sweep:
+mannequin recall median −0.003, fp unchanged — because the synthetic *test* has no
+camouflaged objects, so nothing there exercises the change either way).
+
+**Why the offline probe over-promised — the methodological correction (2nd of its
+kind after §19.2).** `contrast_probe` proved the model's response *is brittle* to
+color/contrast (0.78→0.17 under recolour). True, and it licensed testing the axis.
+But **brittleness to axis X does not imply the sim-to-real gap is dominated by X.**
+The recolour keeps the synthetic mannequin's clean rendered geometry, pose and
+texture and only mutes its colour, so training on it teaches "muted-colour
+*synthetic-mannequin-shape*". The real person is prone, vegetation-broken, real
+fabric — its shape/texture never matched, so removing colour as a cue left nothing
+to match on. The tell was in the probe itself and I missed it: the real person
+fires at 0.056, *below* even the α=1.0 recolour (0.074) — real objects are further
+out-of-distribution than the colour axis reaches. §19.2 said a hand-rolled proxy
+bounds nothing; §24.5 adds: **an offline perturbation proves an axis is used, not
+that closing it closes the real gap.** Only the on-object real measurement decides,
+and it must be at the object, never at a label-free peak.
+
+**What survives.** (1) The diagnosis narrows, usefully: the object gap is NOT
+primarily colour/contrast — it is appearance/texture/occlusion/pose, i.e. a
+*rendering-realism* problem, which points harder at gen2 object realism (and at
+real object crops) than at any recolour. (2) The D92 code stays (defaults OFF,
+bit-exact identity, smoke-covered) as a falsified-but-runnable component per the
+D69 protocol; `ANET_AUG_CAMO_P` is retained for the record, not recommended. (3)
+The metric fix that matters ships regardless: **never rank on a label-free scene
+peak** — `webscene_check` peaks are background on these frames; the on-object probe
+(`person_resp`, argmax-location check) is the real read, and belongs in the falsifier
+list ahead of the peak.
+
+**Verdict: best model stays `v22g_r2_best.pt` (§23.3).** The real object gap is open,
+and now better characterized: not colour — realism.
