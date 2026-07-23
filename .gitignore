@@ -58,3 +58,4 @@ datasets/gen-assets/
 .anet_cache/
 ANetV1/logs/
 ANetV1/.torchinductor/
+datasets/heridal/

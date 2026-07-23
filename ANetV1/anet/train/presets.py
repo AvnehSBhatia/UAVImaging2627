@@ -461,7 +461,8 @@ def anet_cfg(**overrides):
         root=os.environ.get("DATA_ROOT", str(REPO_ROOT / "datasets/suas-synth-50k")),
         coverage_thresh=0.3,
         # VisDrone downweighting (no-ops if vd_* files were stashed out)
-        vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0,
+        vd_weight=0.4, hd_weight=_fenv("ANET_HD_WEIGHT", 1.0),
+        mannequin_weight=4.0, tent_weight=2.0,
         # ship uint8 frames from the loader, normalize on-GPU (trainer): 4x less
         # H2D + pin_memory traffic. Only the Trainer handles this; eval scripts
         # build their own SUASCells without it and still get floats.

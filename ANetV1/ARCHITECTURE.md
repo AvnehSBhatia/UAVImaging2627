@@ -1998,3 +1998,48 @@ from realistic examples — real object crops or a genuine rendering-realism jum
 gen2, validated on the D93 hard-mannequin slice (currently 0/4). The architecture
 and the FP side are done; the remaining problem is training data, and it is now
 measured, bounded, and un-fakeable.
+
+## 26. D94 — real people (HERIDAL) as training data for the appearance gap
+
+D93.1 established the camouflage gap is a representation ABSENCE — no test-time
+trick recovers it, only realistic examples. So the licensed move is to source real
+aerial people. I searched the SAR/aerial-person dataset landscape; one source
+matches every constraint at once — **HERIDAL** (IPSAR / University of Split): real
+drone imagery of people in Mediterranean **wilderness at 40–65 m** (the 150 ft
+mission floor), **CC BY-3.0** (permissive, unlike the non-commercial alternatives
+SARD/ForestPersons/Semantic-Drone/Okutama), directly downloadable from **Zenodo**
+(DOI 10.5281/zenodo.5662351, 8.3 GB, MD5-verified). ~1,650 full 4000×3000 frames,
+3,229 person boxes, near-nadir (verified by eye), with real occlusion, shadow and
+terrain — the exact appearance gen2's rendered mannequins lack.
+
+**Integration** (`scripts/prepare_heridal.py`, committed — the dataset is gitignored
+so the SCRIPT is how HERIDAL reaches the MI300X box). A whole 4000×3000 frame
+downscaled to 960×540 shrinks a person to ~17 px (sub-decile, VisDrone-like), so
+instead it crops a mission-scale WINDOW around each person (native ~71 px median,
+GSD ~2.4 cm/px) and resizes THAT to 960×540, sampling output person size in 28–90 px
+with position jitter — real people at mission scale on real wilderness background,
+**no compositing, no synthetic**. Output: **3,229 `hd_*.jpg` + YOLO tiles, 8,686
+person instances (class 0)**, mirroring the `vd_` convention; `hd_weight`
+(`ANET_HD_WEIGHT`) tunes their share. Deterministic per (frame, person, scale), so a
+fresh checkout regenerates byte-identical tiles. Train split → 13,501 synth + 5,684
+vd + 3,229 hd.
+
+**Run (box):** pull → `python scripts/prepare_heridal.py` → delete `.anet_cache` →
+`ANET_ARCH=v22 ANET_INIT_FROM=runs/anet/v22g_r2_best.pt ANET_BG_W=0 ANET_HD_WEIGHT=1
+ANET_PATIENCE=40 ANET_PARAM_BUDGET=150000 ./run_anet_mi300x.sh`.
+
+**Falsifiers — on the D93 yardstick (`eval_real_scenes.py`), a fair transfer test
+since HERIDAL is a different source than the web frames:**
+1. **Real hard-mannequin recall must move off 0/4** — the point. Response at the D93
+   GT camouflaged slice should rise from ~0.06.
+2. **Synthetic must not pay** — matched-fp sweep recall within noise, fp not inflated.
+3. **Real mann fp/frame must not blow up** — 8,686 new mission-scale positives could
+   raise background firing; guard on the 0.58 fp/frame floor.
+4. **Tents unaffected** — hd_ has no tents; tent recall should hold 10/11.
+
+**Pre-registered caveat (not a promised win):** many HERIDAL actors are bright-clothed
+and visible, not extreme-camouflage, so this may lift real-person appearance broadly
+while the earth-tone-prone-in-brush extreme stays hard. If falsifier 1 only partly
+moves, next is route 2 (composite HERIDAL person crops onto gen2 backgrounds) or
+selecting the low-visibility HERIDAL subset. This is the experiment D93.1 licensed;
+its verdict is whatever `eval_real_scenes.py` reports, not the training log.

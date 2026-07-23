@@ -179,6 +179,7 @@ def build_datasets(cfg, teacher_dir=None):
     kwargs = dict(
         coverage_thresh=cfg.data.coverage_thresh,
         vd_weight=cfg.data.vd_weight,
+        hd_weight=getattr(cfg.data, "hd_weight", 1.0),  # D93 HERIDAL real-person tiles
         mannequin_weight=cfg.data.mannequin_weight,
         tent_weight=cfg.data.tent_weight,
         uint8=getattr(cfg.data, "uint8", False),  # Trainer normalizes on-GPU

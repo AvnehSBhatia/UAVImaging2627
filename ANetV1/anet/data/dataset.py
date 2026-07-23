@@ -49,7 +49,7 @@ def _read_label(path):
 
 class SUASCells(Dataset):
     def __init__(self, root, split, coverage_thresh=0.3, teacher_dir=None,
-                 vd_weight=0.4, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
+                 vd_weight=0.4, hd_weight=1.0, mannequin_weight=4.0, tent_weight=2.0, uint8=False,
                  band_lo=None, cache=False, center=False, center_sigma=1.5,
                  center_grid=None, center_dual=False, flip=(0.0, 0.0),
                  camo=None):
@@ -116,6 +116,11 @@ class SUASCells(Dataset):
             w = 1.0 + mannequin_weight * has_m + tent_weight * has_t
             if p.stem.startswith("vd_"):
                 w *= vd_weight
+            elif p.stem.startswith("hd_"):
+                # D93: HERIDAL real-person tiles (prepare_heridal.py). Real
+                # wilderness people at mission scale — the appearance gen2's
+                # rendered mannequins lack (D93.1). Weight tunes their share.
+                w *= hd_weight
             self._weights[i] = w
 
         # per-process memmap handles (opened lazily; never pickled to workers)
