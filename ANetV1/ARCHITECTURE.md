@@ -1966,3 +1966,35 @@ guessed at. The target is unambiguous and currently 0/4: make a camouflaged pers
 fire above ~0.3 without inflating the 0.58 fp/frame floor. Best model stays
 `v22g_r2_best.pt`; the eval set + script are the deliverable that makes the next
 data-side attempt measurable instead of self-deceiving.
+
+### 25.1 The camouflage signal is absent, not contrast-suppressed — cheap fixes ruled out
+
+Before any expensive gen2 work, the cheapest hypothesis: the camouflaged person
+is *there* in the pixels, just low-contrast, so a contrast normalizer at deploy
+(or a contrast aug) would recover it. Tested directly on the REAL frames (not a
+synthetic proxy — §24.5), v22g_r2, response measured at the D93 GT with two
+guards: it must lift the hard slice AND not break the easy slice (OOD control).
+
+| transform | hard median | easy median (control) | mann fp/frame |
+|---|---|---|---|
+| baseline | 0.068 | 0.382 | 0.58 |
+| CLAHE c2 t8 | 0.068 | 0.101 | 0.42 |
+| CLAHE c4 t8 | 0.051 | 0.098 | 0.50 |
+| CLAHE c4 t16 | 0.040 | 0.106 | 0.75 |
+| local-standardize | 0.019 | 0.222 | 0.33 |
+
+**Every transform fails both guards.** None lifts the camouflaged person (0.068 is
+the ceiling, stronger normalization is worse), and all of them *collapse the easy
+mannequins* the model detects fine at baseline (0.382→~0.10) — the OOD signature:
+CLAHE degrades response everywhere because the model was trained on gen2's specific
+tone/contrast statistics, so a normalized input is off-distribution.
+
+**Conclusion: the signal is not suppressed, it is absent from the representation.**
+The model's learned features do not encode an earth-tone, low-contrast, prone/
+occluded person, and no test-time trick recovers what was never learned. This rules
+out preprocessing and contrast-only augmentation (consistent with D92's failure)
+and leaves exactly one path: the model must LEARN camouflaged-person appearance
+from realistic examples — real object crops or a genuine rendering-realism jump in
+gen2, validated on the D93 hard-mannequin slice (currently 0/4). The architecture
+and the FP side are done; the remaining problem is training data, and it is now
+measured, bounded, and un-fakeable.
