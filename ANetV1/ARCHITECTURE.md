@@ -2043,3 +2043,36 @@ while the earth-tone-prone-in-brush extreme stays hard. If falsifier 1 only part
 moves, next is route 2 (composite HERIDAL person crops onto gen2 backgrounds) or
 selecting the low-visibility HERIDAL subset. This is the experiment D93.1 licensed;
 its verdict is whatever `eval_real_scenes.py` reports, not the training log.
+
+### 26.1 D94 result — real people lift real mannequins at zero fp cost, but not the camouflage extreme, and tents regress
+
+`v22g_r2` + HERIDAL (`ANET_HD_WEIGHT=1`, converged; synthetic val neutral, mann
+0.871). Measured on the D93 yardstick (`eval_real_scenes.py`) — HERIDAL is a
+different source than the web frames, so this is a fair transfer test. All four
+§26 falsifiers:
+
+1. **Hard-mannequin recall off 0/4 — PARTIAL.** Real mannequin recall 3/8 → **4/8**
+   @0.30 at the SAME **0.58 fp/frame**; easy/medium real-person response **+0.232**
+   median (open_easy 0.55→0.87, overcast 0.69→0.80, drygrass 0.21→0.39). But the
+   three extreme-camouflage cases stayed missed (mann_only_brush 0.038, forest_edge
+   0.027, runway_scrub 0.118; hard median 0.068→0.078, flat). Exactly the
+   pre-registered caveat: real people broadly, not the earth-tone-prone extreme.
+2. **Synthetic no regression — PASS.** Matched-fp sweep median **+0.002**, synthetic
+   fp unchanged.
+3. **Real fp not inflated — PASS.** 0.58 fp/frame held. Camo cost +0.67 fp for
+   nothing; HERIDAL is **the first change in the record to raise real recall at zero
+   fp cost** — real data moves the curve where a recolour trick only slid along it.
+4. **Tents unaffected — FAIL.** Tent recall 10/11 → 9/11, median 0.855→0.835, some
+   drop hard (brush_occlusion 0.31→0.02, runway_drygrass 0.94→0.55). Cause: 3,229
+   mannequin-only tiles (no tents) dilute the tent-positive proportion under the D48
+   sampler.
+
+**Verdict: the direction is validated** — real person data raises real mannequin
+recall at zero fp cost, confirming D93.1 (the gap is closable by real examples), not
+a recolour (D92) which added fp for nothing. But it is a partial win with a tent
+cost, and the camouflage extreme remains open. Next, in order: (1) `ANET_HD_WEIGHT=0.5`
+to restore the tent-positive proportion — recovers tents while keeping most of the
+mannequin gain, one run, tiles already generated; (2) for the camouflage extreme,
+HERIDAL's find-me actors do not cover it — select its low-contrast subset, or route 2
+(composite HERIDAL crops onto gen2 backgrounds at the hard end). Best model stays
+`v22g_r2` until a tuned HERIDAL run beats it on BOTH real classes.
