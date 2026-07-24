@@ -599,6 +599,10 @@ def main():
             and _camo > 0.0:
         bits.append("camo")             # D92: aug config must be in the tag or
                                         # a plain v22 ft run clobbers this file
+    # D94: same hazard — a HERIDAL run and a plain ft run both produce
+    # v22_b7_ft_102k and collide. Tag by whether hd_ tiles are actually present.
+    if list((Path(cfg.data.root) / "images" / "train").glob("hd_*.jpg"))[:1]:
+        bits.append("hd")
     bits.append(f"{n_params // 1000}k")
     tag = "_".join(bits)
     best = Path(cfg.train.checkpoint_dir) / "best.pt"
